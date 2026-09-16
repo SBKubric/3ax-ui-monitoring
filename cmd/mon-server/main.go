@@ -39,6 +39,10 @@ const (
 	exitUsage = 2
 )
 
+// envAdminPassword lets `admin set` run without a terminal, which is how the
+// Docker image and the e2e compose seed their administrator.
+const envAdminPassword = "MON_ADMIN_PASSWORD"
+
 const usage = `mon-server — monitoring server for 3AX-UI
 
 Usage:
@@ -48,7 +52,9 @@ Usage:
   mon-server admin set <user> [-config <path>]
         Set the admin UI login and password. The password is asked twice on
         the terminal and stored as a bcrypt hash. A repeat call replaces both
-        the login and the password.
+        the login and the password. When MON_ADMIN_PASSWORD is set the value
+        is taken from it and nothing is asked, which is how a container seeds
+        its administrator.
   mon-server version
         Print the version.
 
@@ -198,20 +204,32 @@ func adminCommand(args []string, stdin io.Reader, stdout, stderr io.Writer) int 
 	}
 	defer st.Close()
 
-	prompt := newPrompter(stdin, stderr)
-	password, err := prompt.password(fmt.Sprintf("Password for %s: ", user))
-	if err != nil {
-		fmt.Fprintf(stderr, "mon-server: %v\n", err)
-		return exitError
-	}
-	again, err := prompt.password("Repeat password: ")
-	if err != nil {
-		fmt.Fprintf(stderr, "mon-server: %v\n", err)
-		return exitError
-	}
-	if password != again {
-		fmt.Fprintln(stderr, "mon-server: the passwords do not match, nothing was changed")
-		return exitError
+	password, ok := os.LookupEnv(envAdminPassword)
+	if ok {
+		// Non-interactive path, for a container or an installer that has no
+		// terminal to prompt on. It is deliberately the only way to set the
+		// password without typing it twice.
+		if password == "" {
+			fmt.Fprintf(stderr, "mon-server: %s is set but empty, nothing was changed\n", envAdminPassword)
+			return exitError
+		}
+	} else {
+		prompt := newPrompter(stdin, stderr)
+		typed, err := prompt.password(fmt.Sprintf("Password for %s: ", user))
+		if err != nil {
+			fmt.Fprintf(stderr, "mon-server: %v\n", err)
+			return exitError
+		}
+		again, err := prompt.password("Repeat password: ")
+		if err != nil {
+			fmt.Fprintf(stderr, "mon-server: %v\n", err)
+			return exitError
+		}
+		if typed != again {
+			fmt.Fprintln(stderr, "mon-server: the passwords do not match, nothing was changed")
+			return exitError
+		}
+		password = typed
 	}
 	if err := st.SetAdmin(user, password); err != nil {
 		fmt.Fprintf(stderr, "mon-server: %v\n", err)
