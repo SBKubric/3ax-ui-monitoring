@@ -47,6 +47,9 @@ type PendingRequest struct {
 	// CreatedAt and ExpiresAt are ms UTC; the UI counts the deadline down.
 	CreatedAt int64
 	ExpiresAt int64
+	// Attempt is how many requests this box has filed, this one included:
+	// the "attempt N" the Requests page shows beside the hostname (§9.2).
+	Attempt int
 	// Matches are the existing mon-clients this request looks like, so the UI
 	// can offer "same hostname as msk-1: replacement?". It is a hint only:
 	// the administrator picks the mode explicitly.
@@ -248,6 +251,10 @@ func (r *Registry) Pending(ctx context.Context) ([]PendingRequest, error) {
 	}
 	out := make([]PendingRequest, 0, len(rows))
 	for _, row := range rows {
+		attempt, err := r.attemptNumber(ctx, row)
+		if err != nil {
+			return nil, err
+		}
 		out = append(out, PendingRequest{
 			RequestID:   row.RequestID,
 			PairingCode: row.PairingCode,
@@ -257,10 +264,43 @@ func (r *Registry) Pending(ctx context.Context) ([]PendingRequest, error) {
 			RemoteIP:    row.RemoteIP,
 			CreatedAt:   row.CreatedAt,
 			ExpiresAt:   row.ExpiresAt,
+			Attempt:     attempt,
 			Matches:     index.match(row),
 		})
 	}
 	return out, nil
+}
+
+// PendingCount is the number behind the badge on the admin UI's Requests menu
+// item (spec §9.2). Requests whose five minutes have run out are swept first,
+// so the badge never counts a request nobody can act on any more.
+func (r *Registry) PendingCount(ctx context.Context) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if err := r.expireStale(ctx, r.nowMS()); err != nil {
+		return 0, err
+	}
+	var count int64
+	err := r.st.DB().WithContext(ctx).Model(&store.RegistrationRequest{}).
+		Where("status = ?", store.RequestPending).Count(&count).Error
+	if err != nil {
+		return 0, fmt.Errorf("registry: count pending requests: %w", err)
+	}
+	return int(count), nil
+}
+
+// attemptNumber counts how often this box — the same address filing under the
+// same hostname — has asked to join, up to and including this request.
+func (r *Registry) attemptNumber(ctx context.Context, row store.RegistrationRequest) (int, error) {
+	var count int64
+	err := r.st.DB().WithContext(ctx).Model(&store.RegistrationRequest{}).
+		Where("remote_ip = ? AND hostname = ? AND created_at <= ?", row.RemoteIP, row.Hostname, row.CreatedAt).
+		Count(&count).Error
+	if err != nil {
+		return 0, fmt.Errorf("registry: count requests of %s: %w", row.RemoteIP, err)
+	}
+	return int(count), nil
 }
 
 // decideRequest records the administrator's decision on a request. For an

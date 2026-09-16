@@ -119,12 +119,11 @@ func TestApproveDerivesAUniqueIDFromTheName(t *testing.T) {
 	reg, _, fake := newTestRegistry(t)
 
 	var ids []string
-	for i := range 3 {
+	for range 3 {
 		res := submit(t, reg, "203.0.113.5", "7K3F9Q")
 		out := approve(t, reg, res.RequestID, ApproveInput{Name: "AMS 1"})
 		ids = append(ids, out.MonClientID)
 		fake.Advance(61 * time.Second)
-		_ = i
 	}
 	want := []string{"ams-1", "ams-1-2", "ams-1-3"}
 	for i, id := range ids {
@@ -387,6 +386,12 @@ func TestPendingListsWaitingRequestsNewestFirst(t *testing.T) {
 	if got[0].ExpiresAt != got[0].CreatedAt+RequestTTL.Milliseconds() {
 		t.Errorf("expiresAt = %d, want created_at + 5m", got[0].ExpiresAt)
 	}
+	if got[0].Attempt != 1 {
+		t.Errorf("attempt = %d, want the box's first request", got[0].Attempt)
+	}
+	if n, err := reg.PendingCount(ctx); err != nil || n != 2 {
+		t.Errorf("PendingCount = %d, %v, want 2", n, err)
+	}
 	if len(got[0].Matches) != 0 {
 		t.Errorf("matches = %+v, want none while the registry is empty", got[0].Matches)
 	}
@@ -399,6 +404,38 @@ func TestPendingListsWaitingRequestsNewestFirst(t *testing.T) {
 	}
 	if len(rest) != 0 {
 		t.Fatalf("Pending returned %d expired requests, want none", len(rest))
+	}
+	if n, err := reg.PendingCount(ctx); err != nil || n != 0 {
+		t.Errorf("PendingCount = %d, %v, want 0", n, err)
+	}
+}
+
+func TestPendingCountsTheAttemptsOfABox(t *testing.T) {
+	reg, _, fake := newTestRegistry(t)
+	ctx := context.Background()
+
+	// The same box keeps asking: its request expires, it files a new one.
+	for range 3 {
+		submitFrom(t, reg, "vps-ams-1", "203.0.113.5", "203.0.113.5")
+		fake.Advance(RequestTTL + time.Second)
+	}
+	submitFrom(t, reg, "vps-ams-1", "203.0.113.5", "203.0.113.5")
+	// A different box is on its first attempt.
+	submitFrom(t, reg, "vps-fra-1", "203.0.113.6", "203.0.113.6")
+
+	got, err := reg.Pending(ctx)
+	if err != nil {
+		t.Fatalf("Pending: %v", err)
+	}
+	attempts := map[string]int{}
+	for _, req := range got {
+		attempts[req.Hostname] = req.Attempt
+	}
+	if attempts["vps-ams-1"] != 4 {
+		t.Errorf("attempt of the repeating box = %d, want 4", attempts["vps-ams-1"])
+	}
+	if attempts["vps-fra-1"] != 1 {
+		t.Errorf("attempt of the new box = %d, want 1", attempts["vps-fra-1"])
 	}
 }
 

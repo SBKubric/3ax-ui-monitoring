@@ -118,16 +118,17 @@ func (r *Registry) Disable(ctx context.Context, id string) error {
 	now := r.nowMS()
 	db := r.st.DB().WithContext(ctx)
 
+	// The targets are read and moved in one transaction, so the states the
+	// events report are the ones that were actually replaced.
 	var targets []store.Target
-	err := db.Where("mon_client_id = ? AND state <> ?", id, store.TargetUnknown).
-		Order("id ASC").Find(&targets).Error
-	if err != nil {
-		return fmt.Errorf("registry: list targets of %s: %w", id, err)
-	}
-
-	err = db.Transaction(func(tx *gorm.DB) error {
+	err := db.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Model(&store.MonClient{}).Where("id = ?", id).Update("enabled", false).Error; err != nil {
 			return fmt.Errorf("registry: disable mon-client %s: %w", id, err)
+		}
+		err := tx.Where("mon_client_id = ? AND state <> ?", id, store.TargetUnknown).
+			Order("id ASC").Find(&targets).Error
+		if err != nil {
+			return fmt.Errorf("registry: list targets of %s: %w", id, err)
 		}
 		if len(targets) == 0 {
 			return nil
@@ -139,7 +140,7 @@ func (r *Registry) Disable(ctx context.Context, id string) error {
 			"consecutive_fail": 0,
 			"consecutive_ok":   0,
 		}
-		err := tx.Model(&store.Target{}).
+		err = tx.Model(&store.Target{}).
 			Where("mon_client_id = ? AND state <> ?", id, store.TargetUnknown).
 			Updates(updates).Error
 		if err != nil {
