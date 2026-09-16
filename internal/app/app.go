@@ -188,6 +188,13 @@ func (a *App) newAdmin() (*admin.Server, error) {
 		Configs:  rebuildPort{cfg: a.configs, log: a.log},
 		Clock:    a.clk,
 		Log:      a.log,
+		// The Requests page prints these in its header, so they have to be
+		// the limits the registry actually enforces, not a second copy.
+		RateLimits: admin.RateLimits{
+			PerIPPerMinute: 1,
+			PendingPerIP:   registry.MaxPendingPerIP,
+			PendingGlobal:  registry.MaxPendingTotal,
+		},
 		Server: admin.ServerInfo{
 			PublicIP:     a.cfg.PublicIP,
 			Version:      a.version,

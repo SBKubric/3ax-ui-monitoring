@@ -31,7 +31,7 @@ type registryPort struct {
 func (p registryPort) PendingRequests(ctx context.Context) ([]admin.PendingRequest, error) {
 	pending, err := p.reg.Pending(ctx)
 	if err != nil {
-		return nil, err
+		return nil, adminError(err)
 	}
 	out := make([]admin.PendingRequest, 0, len(pending))
 	for _, r := range pending {
@@ -67,7 +67,10 @@ func (p registryPort) PendingRequests(ctx context.Context) ([]admin.PendingReque
 }
 
 // PendingCount implements admin.Registry.
-func (p registryPort) PendingCount(ctx context.Context) (int, error) { return p.reg.PendingCount(ctx) }
+func (p registryPort) PendingCount(ctx context.Context) (int, error) {
+	n, err := p.reg.PendingCount(ctx)
+	return n, adminError(err)
+}
 
 // Approve implements admin.Registry. The admin UI has already validated the
 // shape; which of the two approval paths runs is the owner's explicit choice.
@@ -86,25 +89,25 @@ func (p registryPort) Approve(ctx context.Context, a admin.Approval) (admin.Clie
 		})
 	}
 	if err != nil {
-		return admin.Client{}, err
+		return admin.Client{}, adminError(err)
 	}
 	row, err := p.reg.Get(ctx, res.MonClientID)
 	if err != nil {
-		return admin.Client{}, err
+		return admin.Client{}, adminError(err)
 	}
 	return p.client(ctx, row), nil
 }
 
 // Reject implements admin.Registry.
 func (p registryPort) Reject(ctx context.Context, requestID string) error {
-	return p.reg.Reject(ctx, requestID)
+	return adminError(p.reg.Reject(ctx, requestID))
 }
 
 // Clients implements admin.Registry.
 func (p registryPort) Clients(ctx context.Context) ([]admin.Client, error) {
 	rows, err := p.reg.List(ctx)
 	if err != nil {
-		return nil, err
+		return nil, adminError(err)
 	}
 	out := make([]admin.Client, 0, len(rows))
 	for _, row := range rows {
@@ -115,25 +118,25 @@ func (p registryPort) Clients(ctx context.Context) ([]admin.Client, error) {
 
 // UpdateClient implements admin.Registry.
 func (p registryPort) UpdateClient(ctx context.Context, id string, e admin.ClientEdit) error {
-	return p.reg.Update(ctx, id, e.Name, e.Region, e.Paths)
+	return adminError(p.reg.Update(ctx, id, e.Name, e.Region, e.Paths))
 }
 
 // SetClientEnabled implements admin.Registry.
 func (p registryPort) SetClientEnabled(ctx context.Context, id string, enabled bool) error {
 	if enabled {
-		return p.reg.Enable(ctx, id)
+		return adminError(p.reg.Enable(ctx, id))
 	}
-	return p.reg.Disable(ctx, id)
+	return adminError(p.reg.Disable(ctx, id))
 }
 
 // RevokeClient implements admin.Registry.
 func (p registryPort) RevokeClient(ctx context.Context, id string) error {
-	return p.reg.Revoke(ctx, id)
+	return adminError(p.reg.Revoke(ctx, id))
 }
 
 // DeleteClient implements admin.Registry.
 func (p registryPort) DeleteClient(ctx context.Context, id string) error {
-	return p.reg.Delete(ctx, id)
+	return adminError(p.reg.Delete(ctx, id))
 }
 
 // client converts a registry row, filling in the revision mon-server built for
@@ -163,6 +166,28 @@ func (p registryPort) client(ctx context.Context, row registry.Client) admin.Cli
 		}
 	}
 	return c
+}
+
+// adminError translates a registry failure into the vocabulary the admin UI
+// turns into a status code. Without it every one of them would surface as an
+// internal error, so a mon-client that has just been deleted in another tab
+// would answer 500 instead of "not found", and a rejected name would look like
+// a broken server rather than a correction the owner can make.
+func adminError(err error) error {
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, registry.ErrRequestNotFound), errors.Is(err, registry.ErrMonClientNotFound):
+		return fmt.Errorf("%w: %s", admin.ErrNotFound, err)
+	case errors.Is(err, registry.ErrRequestExpired), errors.Is(err, registry.ErrRequestNotPending),
+		errors.Is(err, registry.ErrNoFreeID):
+		return fmt.Errorf("%w: %s", admin.ErrConflict, err)
+	case errors.Is(err, registry.ErrEmptyName), errors.Is(err, registry.ErrInvalidPaths),
+		errors.Is(err, registry.ErrInvalidRequest):
+		return fmt.Errorf("%w: %s", admin.ErrInvalid, err)
+	default:
+		return err
+	}
 }
 
 // panelCheckPort runs the Check button: one GET /state with the values as

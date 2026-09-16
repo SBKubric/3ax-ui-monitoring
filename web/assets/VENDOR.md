@@ -12,6 +12,14 @@ from `/admin/assets/`. The Go build stays Node-free — nothing here is compiled
 | `reset.css` | `ant-design-vue` | 4.2.6 | `dist/reset.css` |
 | `dayjs.min.js` | `dayjs` | 1.11.13 | `dayjs.min.js` |
 | `dayjs.relativeTime.js` | `dayjs` | 1.11.13 | `plugin/relativeTime.js`, for the "N ago" columns |
+| `dayjs.advancedFormat.js` … `dayjs.weekday.js` | `dayjs` | 1.11.13 | the seven `plugin/*.js` builds listed below |
+
+`antd.min.js` takes seven dayjs plugins as externals and calls `dayjs.extend()`
+on each as it loads: `advancedFormat`, `customParseFormat`, `localeData`,
+`quarterOfYear`, `weekOfYear`, `weekYear`, `weekday`. They are its date
+pickers' dependencies, and although the admin UI has no date picker, they must
+still be present: `extend()` throws on an undefined plugin and the whole bundle
+would fail to load, taking every page with it. Load them before `antd.min.js`.
 
 Ant Design Vue 4 is CSS-in-JS: there is **no** `antd.min.css` to vendor. The
 component styles are injected at runtime by `antd.min.js`; `reset.css` is the

@@ -165,19 +165,20 @@
 <script src="/admin/assets/vue.global.prod.js?v={{.AssetsVersion}}"></script>
 <script src="/admin/assets/dayjs.min.js?v={{.AssetsVersion}}"></script>
 <script src="/admin/assets/dayjs.relativeTime.js?v={{.AssetsVersion}}"></script>
-<script>
-  // ant-design-vue's UMD build takes seven dayjs plugins as externals, for its
-  // date pickers. The admin UI has no date picker and web/assets/VENDOR.md
-  // vendors only dayjs itself and relativeTime, so the rest are stubbed: dayjs
-  // .extend() throws on undefined and the whole bundle would fail to load.
-  (function () {
-    var externals = ['advancedFormat', 'customParseFormat', 'localeData', 'quarterOfYear', 'weekOfYear', 'weekYear', 'weekday'];
-    for (var i = 0; i < externals.length; i++) {
-      var key = 'dayjs_plugin_' + externals[i];
-      if (!window[key]) { window[key] = function () {}; }
-    }
-  })();
-</script>
+<!--
+  ant-design-vue's UMD build takes these seven dayjs plugins as externals and
+  extends dayjs with them as it loads, so every one of them must exist before
+  antd.min.js runs: dayjs.extend() throws on undefined and the whole bundle
+  would fail, taking every page with it. They are vendored alongside dayjs in
+  web/assets, see VENDOR.md.
+-->
+<script src="/admin/assets/dayjs.advancedFormat.js?v={{.AssetsVersion}}"></script>
+<script src="/admin/assets/dayjs.customParseFormat.js?v={{.AssetsVersion}}"></script>
+<script src="/admin/assets/dayjs.localeData.js?v={{.AssetsVersion}}"></script>
+<script src="/admin/assets/dayjs.quarterOfYear.js?v={{.AssetsVersion}}"></script>
+<script src="/admin/assets/dayjs.weekOfYear.js?v={{.AssetsVersion}}"></script>
+<script src="/admin/assets/dayjs.weekYear.js?v={{.AssetsVersion}}"></script>
+<script src="/admin/assets/dayjs.weekday.js?v={{.AssetsVersion}}"></script>
 <script src="/admin/assets/antd.min.js?v={{.AssetsVersion}}"></script>
 <script>
   // MON is everything the four pages share: the boot data rendered into the
