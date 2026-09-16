@@ -277,6 +277,10 @@ func New(opts Options) (*Client, error) {
 // hangs off.
 func (c *Client) BaseURL() string { return c.base.String() }
 
+// Timeout is the per-request timeout, which is also the least a caller's
+// budget has to be for a request to stand a chance.
+func (c *Client) Timeout() time.Duration { return c.timeout }
+
 // LastContract reports the X-Mon-Contract header of the most recent successful
 // response. A mismatch is logged as a warning and never fails a request: the
 // contract says compatible changes keep the version, so the header is a signal
