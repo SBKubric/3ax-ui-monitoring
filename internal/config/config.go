@@ -59,8 +59,12 @@ var (
 	ErrUnknownTLSMode = errors.New("unknown tls mode")
 	// ErrMissingCertificate reports tls.mode=files without cert and key.
 	ErrMissingCertificate = errors.New("tls certificate and key are required")
-	// ErrMissingPublicIP reports tls.mode=acme-ip without publicIp: ACME for
-	// an IP address cannot be requested without knowing the address.
+	// ErrMissingPublicIP reports a missing publicIp. It is required in both
+	// TLS modes, for two separate reasons: a certificate for an IP address
+	// cannot be requested without knowing the address, and every mon-client's
+	// configuration carries probeUrl = https://<publicIp>:<port>/v1/probe
+	// (spec §5), which is where tunnel probes are sent. Without it mon-server
+	// starts but can never hand out a usable configuration.
 	ErrMissingPublicIP = errors.New("publicIp is required")
 	// ErrMissingListen reports an empty listen address.
 	ErrMissingListen = errors.New("listen is required")
@@ -178,15 +182,20 @@ func (c Config) Validate() error {
 	}
 	switch c.TLS.Mode {
 	case TLSModeACMEIP:
-		if c.PublicIP == "" {
-			return fmt.Errorf("tls.mode=%s: %w", TLSModeACMEIP, ErrMissingPublicIP)
-		}
 	case TLSModeFiles:
 		if c.TLS.Cert == "" || c.TLS.Key == "" {
 			return fmt.Errorf("tls.mode=%s: %w", TLSModeFiles, ErrMissingCertificate)
 		}
 	default:
 		return fmt.Errorf("tls.mode=%q: %w (want %q or %q)", c.TLS.Mode, ErrUnknownTLSMode, TLSModeACMEIP, TLSModeFiles)
+	}
+	// Checked after the mode, so a misspelled mode is still reported as one.
+	// Both modes need a public address: see ErrMissingPublicIP. Refusing to
+	// start is much kinder than starting and then failing to build any
+	// mon-client configuration, with an error no operator would connect back
+	// to a missing bootstrap field.
+	if c.PublicIP == "" {
+		return ErrMissingPublicIP
 	}
 	return nil
 }

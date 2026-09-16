@@ -51,7 +51,7 @@ mon-server run [-config <path>] [-log-level debug|info|warn|error]
 | ключ | ENV | default | что это |
 |---|---|---|---|
 | `listen` | `MON_LISTEN` | `:443` | адрес единственного HTTPS-листенера |
-| `publicIp` | `MON_PUBLIC_IP` | — | публичный IP: на него выпускается сертификат, из него собирается `probeUrl`. Обязателен при `tls.mode=acme-ip` |
+| `publicIp` | `MON_PUBLIC_IP` | — | публичный IP: на него выпускается сертификат, из него собирается `probeUrl` конфига mon-client (§5). **Обязателен в обоих режимах TLS** — без него сервис стартует, но не сможет собрать ни одного конфига |
 | `dataDir` | `MON_DATA_DIR` | `/var/lib/mon-server` | каталог данных: `mon-server.db` и `certs/` |
 | `tls.mode` | `MON_TLS_MODE` | `acme-ip` | `acme-ip` — сертификат Let's Encrypt на IP (certmagic, `tls-alpn-01`); `files` — свой сертификат |
 | `tls.cert` | `MON_TLS_CERT` | — | путь к файлу с PEM-цепочкой, обязателен при `tls.mode=files` |

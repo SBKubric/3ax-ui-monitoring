@@ -200,16 +200,24 @@ func TestValidate(t *testing.T) {
 		},
 		{
 			name: "files with a certificate and a key",
+			cfg:  Config{Listen: ":443", DataDir: "/var/lib/mon-server", PublicIP: "203.0.113.10", TLS: TLS{Mode: TLSModeFiles, Cert: "/c.pem", Key: "/k.pem"}},
+		},
+		{
+			// Not only ACME needs it: every mon-client configuration carries
+			// probeUrl built from this address (spec §5), so a files-mode box
+			// without one could never hand out a usable configuration.
+			name: "files without a public ip",
 			cfg:  Config{Listen: ":443", DataDir: "/var/lib/mon-server", TLS: TLS{Mode: TLSModeFiles, Cert: "/c.pem", Key: "/k.pem"}},
+			want: ErrMissingPublicIP,
 		},
 		{
 			name: "files without a certificate",
-			cfg:  Config{Listen: ":443", DataDir: "/var/lib/mon-server", TLS: TLS{Mode: TLSModeFiles, Key: "/k.pem"}},
+			cfg:  Config{Listen: ":443", DataDir: "/var/lib/mon-server", PublicIP: "203.0.113.10", TLS: TLS{Mode: TLSModeFiles, Key: "/k.pem"}},
 			want: ErrMissingCertificate,
 		},
 		{
 			name: "files without a key",
-			cfg:  Config{Listen: ":443", DataDir: "/var/lib/mon-server", TLS: TLS{Mode: TLSModeFiles, Cert: "/c.pem"}},
+			cfg:  Config{Listen: ":443", DataDir: "/var/lib/mon-server", PublicIP: "203.0.113.10", TLS: TLS{Mode: TLSModeFiles, Cert: "/c.pem"}},
 			want: ErrMissingCertificate,
 		},
 		{
