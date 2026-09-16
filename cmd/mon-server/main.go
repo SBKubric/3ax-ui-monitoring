@@ -23,6 +23,7 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/SBKubric/3ax-ui-monitoring/internal/app"
 	"github.com/SBKubric/3ax-ui-monitoring/internal/config"
 	"github.com/SBKubric/3ax-ui-monitoring/internal/store"
 )
@@ -135,44 +136,22 @@ func serveCommand(args []string, stderr io.Writer) int {
 	return exitOK
 }
 
-// serve opens the store and blocks until ctx is cancelled, which happens on
-// SIGINT or SIGTERM.
+// serve builds mon-server and runs it until ctx is cancelled, which happens
+// on SIGINT or SIGTERM.
 func serve(ctx context.Context, cfg config.Config, log *slog.Logger) error {
-	st, err := store.Open(cfg.DBPath(), log)
+	a, err := app.New(app.Options{Config: cfg, Version: version, Log: log})
 	if err != nil {
 		return err
 	}
 	defer func() {
-		if err := st.Close(); err != nil {
-			log.Error("closing the store", "error", err)
+		if err := a.Close(); err != nil {
+			log.Error("closing mon-server", "error", err)
 		}
 	}()
 
-	log.Info("mon-server starting",
-		"version", version,
-		"listen", cfg.Listen,
-		"dataDir", cfg.DataDir,
-		"database", cfg.DBPath(),
-		"tlsMode", cfg.TLS.Mode,
-		"publicIp", cfg.PublicIP,
-	)
-
-	// TODO(wiring): everything the process does is attached here, with cfg,
-	// log and st already in scope:
-	//   1. internal/tlsx — the TLS config for cfg.TLS.Mode, certmagic with
-	//      FileStorage in cfg.CertsDir() for acme-ip (spec §2.1);
-	//   2. internal/server — the single HTTPS listener on cfg.Listen with
-	//      /v1/*, /admin/* and /healthz, served until ctx is done and then
-	//      shut down gracefully (spec §2);
-	//   3. the background loops, each started here and stopped with ctx: the
-	//      panel poll (§4), the mon-client offline job (§7.3), the stats
-	//      bucket flush (§7.4) and the hourly retention job (§3).
-	// Until they exist, running the process only proves that the
-	// configuration loads and the database migrates.
-
-	<-ctx.Done()
+	err = a.Run(ctx)
 	log.Info("mon-server shutting down")
-	return nil
+	return err
 }
 
 // adminCommand implements `mon-server admin set <user>`.

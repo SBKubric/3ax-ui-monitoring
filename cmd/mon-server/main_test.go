@@ -12,6 +12,7 @@ import (
 
 	"github.com/SBKubric/3ax-ui-monitoring/internal/config"
 	"github.com/SBKubric/3ax-ui-monitoring/internal/store"
+	"github.com/SBKubric/3ax-ui-monitoring/internal/tlsx/tlstest"
 )
 
 // writeConfig writes a valid bootstrap configuration whose dataDir is a fresh
@@ -20,10 +21,24 @@ func writeConfig(t *testing.T) (configPath, dataDir string) {
 	t.Helper()
 	dir := t.TempDir()
 	dataDir = filepath.Join(dir, "data")
+
+	// A self-signed pair and tls.mode = files, so that nothing in this suite
+	// can reach a certificate authority: acme-ip would make `run` ask Let's
+	// Encrypt for a certificate for 203.0.113.10 the moment it starts serving.
+	// Port zero keeps the listener off any port a developer may be using.
+	certFile, keyFile, err := tlstest.WritePair(dir, "localhost", "127.0.0.1")
+	if err != nil {
+		t.Fatalf("write certificate: %v", err)
+	}
 	body, err := json.Marshal(map[string]any{
-		"listen":   ":8443",
+		"listen":   "127.0.0.1:0",
 		"publicIp": "203.0.113.10",
 		"dataDir":  dataDir,
+		"tls": map[string]any{
+			"mode": "files",
+			"cert": certFile,
+			"key":  keyFile,
+		},
 	})
 	if err != nil {
 		t.Fatalf("marshal config: %v", err)
