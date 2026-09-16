@@ -1,0 +1,372 @@
+{{define "content"}}
+<a-config-provider :theme="themeConfig">
+  <div class="shell">
+    <mon-sider page="clients" :pending="pending"></mon-sider>
+    <main class="content">
+
+      <section class="card tight hd">
+        <h3>[[ s.title ]]</h3>
+        <a-tag data-testid="clients-count">[[ s.registered(clients.length) ]]</a-tag>
+        <span class="sp"></span>
+        <span class="muted small">[[ s.operateHint ]]</span>
+        <span data-testid="clients-refresh"><a-button size="small" :loading="loading" @click="load">[[ s.refresh ]]</a-button></span>
+      </section>
+
+      <a-alert v-if="error" type="error" show-icon :message="error" data-testid="clients-error"></a-alert>
+
+      <section class="card pad0">
+        <div class="scroll">
+          <table class="t" data-testid="clients-table">
+            <thead>
+              <tr>
+                <th scope="col">[[ s.colOperate ]]</th>
+                <th scope="col">[[ s.colEnabled ]]</th>
+                <th scope="col">[[ s.colName ]]</th>
+                <th scope="col">[[ s.colState ]]</th>
+                <th scope="col">[[ s.colHeartbeat ]]</th>
+                <th scope="col">[[ s.colPaths ]]</th>
+                <th scope="col">[[ s.colVersion ]]</th>
+                <th scope="col">[[ s.colConfig ]]</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="record in clients" :key="record.id" :class="record.enabled ? '' : 'row-disabled'"
+                  data-testid="client-row" :data-client-id="record.id">
+                <td>
+                  <a-dropdown :trigger="['click']">
+                    <span data-testid="client-operations"><a-button size="small">⋯</a-button></span>
+                    <template #overlay>
+                      <a-menu>
+                        <a-menu-item key="edit" @click="openEdit(record)">
+                          <span :data-testid="'client-edit-' + record.id">[[ s.edit ]]</span>
+                        </a-menu-item>
+                        <a-menu-item key="revoke" @click="openRevoke(record)">
+                          <span :data-testid="'client-revoke-' + record.id">[[ s.revoke ]]</span>
+                        </a-menu-item>
+                        <a-menu-item key="delete" danger @click="openDelete(record)">
+                          <span :data-testid="'client-delete-' + record.id">[[ s.remove ]]</span>
+                        </a-menu-item>
+                      </a-menu>
+                    </template>
+                  </a-dropdown>
+                </td>
+                <td>
+                  <span data-testid="client-enabled">
+                    <a-switch size="small" :checked="record.enabled" :loading="busyId === record.id"
+                              @change="setEnabled(record, $event)"></a-switch>
+                  </span>
+                </td>
+                <td>
+                  <b data-testid="client-name">[[ record.name ]]</b>
+                  <div class="muted mono tiny" data-testid="client-id">[[ record.id ]] · [[ record.region || '—' ]]</div>
+                </td>
+                <td>
+                  <a-tag :color="stateColor(record)" data-testid="client-state">[[ stateLabel(record) ]]</a-tag>
+                  <div class="muted tiny" v-if="record.tokenRevoked" data-testid="client-revoked">[[ s.tokenRevoked ]]</div>
+                </td>
+                <td><span data-testid="client-heartbeat">[[ heartbeatLabel(record) ]]</span></td>
+                <td>
+                  <span data-testid="client-paths">
+                    <a-tag v-for="p in record.paths" :key="p" :color="p === 'proxy' ? 'blue' : 'default'">[[ p ]]</a-tag>
+                    <span v-if="!record.paths || !record.paths.length" class="muted">—</span>
+                  </span>
+                </td>
+                <td>
+                  <span data-testid="client-version">
+                    <template v-if="record.version">v[[ record.version ]]<span class="muted"> · xray [[ record.xrayVersion || '—' ]]</span></template>
+                    <span v-else class="muted">—</span>
+                  </span>
+                </td>
+                <td>
+                  <span data-testid="client-config">
+                    <a-tooltip v-if="record.configError" :title="record.configError">
+                      <a-tag color="error">[[ s.configError(MON.shortRevision(record.appliedRevision)) ]]</a-tag>
+                    </a-tooltip>
+                    <template v-else-if="record.appliedRevision">
+                      <span class="mono">[[ MON.shortRevision(record.appliedRevision) ]]</span>
+                      <a-tooltip v-if="record.configRevision && record.configRevision !== record.appliedRevision" :title="s.behindTip(record.configRevision)">
+                        <a-tag color="warning" data-testid="client-config-behind">[[ s.behind ]]</a-tag>
+                      </a-tooltip>
+                    </template>
+                    <span v-else class="muted">—</span>
+                  </span>
+                </td>
+              </tr>
+              <tr v-if="!clients.length && !loading">
+                <td colspan="8"><div class="empty" data-testid="clients-empty">[[ s.empty ]]</div></td>
+              </tr>
+              <tr v-if="loading && !clients.length">
+                <td colspan="8"><div class="empty"><a-spin></a-spin></div></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- Edit: name, region and paths; the id never changes (§9.3). -->
+      <a-modal v-model:open="edit.open" :title="s.editTitle" :mask-closable="false" :width="620">
+        <div class="stack" data-testid="edit-modal" v-if="edit.client">
+          <div class="fi">
+            <label>[[ s.idIs ]]</label>
+            <span class="mono" data-testid="edit-id">[[ edit.client.id ]]</span>
+            <div class="muted tiny">[[ s.idFixed ]]</div>
+          </div>
+          <div class="row2">
+            <div class="fi">
+              <label for="edit-name">[[ s.name ]]</label>
+              <span data-testid="edit-name"><a-input id="edit-name" v-model:value="edit.name" :maxlength="128"></a-input></span>
+            </div>
+            <div class="fi">
+              <label for="edit-region">[[ s.region ]]</label>
+              <span data-testid="edit-region"><a-input id="edit-region" v-model:value="edit.region" :maxlength="64"></a-input></span>
+            </div>
+          </div>
+          <div class="fi">
+            <label>[[ s.paths ]]</label>
+            <a-checkbox-group v-model:value="edit.paths">
+              <span data-testid="edit-path-proxy"><a-checkbox value="proxy">proxy</a-checkbox></span>
+              <span data-testid="edit-path-direct"><a-checkbox value="direct">direct</a-checkbox></span>
+            </a-checkbox-group>
+            <div class="muted tiny">[[ s.pathsWarning ]]</div>
+          </div>
+          <div class="fi">
+            <label>[[ s.revisions ]]</label>
+            <div class="small">
+              <div>[[ s.appliedRevision ]] <span class="mono" data-testid="edit-applied-revision">[[ edit.client.appliedRevision || '—' ]]</span></div>
+              <div>[[ s.serverRevision ]] <span class="mono" data-testid="edit-server-revision">[[ edit.client.configRevision || '—' ]]</span></div>
+            </div>
+          </div>
+          <div class="fi" v-if="edit.client.configError">
+            <label>[[ s.configErrorLabel(MON.stamp(edit.client.configErrorAt)) ]]</label>
+            <div class="pre" data-testid="edit-config-error">[[ edit.client.configError ]]</div>
+          </div>
+          <a-alert v-if="edit.error" type="error" show-icon :message="edit.error" data-testid="edit-error"></a-alert>
+        </div>
+        <template #footer>
+          <span data-testid="edit-cancel"><a-button @click="edit.open = false">[[ s.cancel ]]</a-button></span>
+          <span data-testid="edit-submit"><a-button type="primary" :loading="edit.busy" @click="submitEdit">[[ s.save ]]</a-button></span>
+        </template>
+      </a-modal>
+
+      <!-- Revoke: the box wipes its state and files a fresh request (§6). -->
+      <a-modal v-model:open="revoke.open" :title="s.revokeTitle" :width="520">
+        <div class="stack" data-testid="revoke-modal" v-if="revoke.client">
+          <div>[[ s.revokeBody(revoke.client.id) ]]</div>
+          <a-alert type="warning" show-icon :message="s.revokeHint"></a-alert>
+          <a-alert v-if="revoke.error" type="error" show-icon :message="revoke.error" data-testid="revoke-error"></a-alert>
+        </div>
+        <template #footer>
+          <span data-testid="revoke-cancel"><a-button @click="revoke.open = false">[[ s.cancel ]]</a-button></span>
+          <span data-testid="revoke-submit"><a-button danger type="primary" :loading="revoke.busy" @click="submitRevoke">[[ s.revoke ]]</a-button></span>
+        </template>
+      </a-modal>
+
+      <!-- Delete: the row and its targets go (§6). -->
+      <a-modal v-model:open="remove.open" :title="s.deleteTitle" :width="520">
+        <div class="stack" data-testid="delete-modal" v-if="remove.client">
+          <div>[[ s.deleteBody(remove.client.id) ]]</div>
+          <a-alert v-if="remove.error" type="error" show-icon :message="remove.error" data-testid="delete-error"></a-alert>
+        </div>
+        <template #footer>
+          <span data-testid="delete-cancel"><a-button @click="remove.open = false">[[ s.cancel ]]</a-button></span>
+          <span data-testid="delete-submit"><a-button danger type="primary" :loading="remove.busy" @click="submitDelete">[[ s.remove ]]</a-button></span>
+        </template>
+      </a-modal>
+
+    </main>
+  </div>
+</a-config-provider>
+{{end}}
+
+{{define "script"}}
+<script>
+  // The registry (spec §9.3): one Vue application, every string in one object.
+  // Nothing here shows the state of targets — that picture lives on the
+  // panel's Monitoring page (§1).
+  (function () {
+    var strings = {
+      title: 'mon-clients',
+      registered: function (n) { return n + ' registered'; },
+      operateHint: '"⋯" → Edit, Revoke token, Delete. Revoking makes the box wipe its state and register again.',
+      refresh: 'Refresh',
+      colOperate: 'Operate',
+      colEnabled: 'Enabled',
+      colName: 'Name',
+      colState: 'State',
+      colHeartbeat: 'Last heartbeat',
+      colPaths: 'Paths',
+      colVersion: 'Version',
+      colConfig: 'Config',
+      empty: 'No mon-client has been approved yet.',
+      edit: 'Edit',
+      revoke: 'Revoke token',
+      remove: 'Delete',
+      tokenRevoked: 'token revoked',
+      stateNever: 'never seen',
+      stateDisabled: 'disabled',
+      approvedAgo: function (when) { return 'approved ' + when; },
+      neverSeen: 'never',
+      configError: function (rev) { return rev ? '⚠ config error · ' + rev : '⚠ config error'; },
+      behind: 'config pending',
+      behindTip: function (rev) { return 'mon-server has built revision ' + rev + '; the box is still on the previous one.'; },
+      editTitle: 'Edit mon-client',
+      idIs: 'id',
+      idFixed: 'The id is derived from the name at approval and never changes, not even when the box is replaced.',
+      name: 'Name',
+      region: 'Region',
+      paths: 'Paths this mon-client probes',
+      pathsWarning: 'For a box in a hostile region leave only proxy: direct reveals the real server\'s address to that box.',
+      revisions: 'Config revision',
+      appliedRevision: 'applied by the box:',
+      serverRevision: 'built by mon-server:',
+      configErrorLabel: function (when) { return 'Config error reported ' + when; },
+      cancel: 'Cancel',
+      save: 'Save',
+      revokeTitle: 'Revoke the client token',
+      revokeBody: function (id) { return 'Revoke the token of ' + id + '?'; },
+      revokeHint: 'The box gets 401 on its next call, wipes its state and files a fresh registration request. Approve that request as a replacement to give this record its id, history and paths back.',
+      deleteTitle: 'Delete mon-client',
+      deleteBody: function (id) { return 'Delete ' + id + ' and everything mon-server keeps about it? The panel drops it from its cache with the next snapshot. This cannot be undone.'; },
+      saved: 'Saved.'
+    };
+
+    MON.createApp({
+      setup: function () {
+        var ref = Vue.ref, reactive = Vue.reactive, computed = Vue.computed;
+        var clients = ref([]);
+        var pending = ref(MON.boot.pending || 0);
+        var loading = ref(false);
+        var error = ref('');
+        var busyId = ref('');
+
+        var edit = reactive({ open: false, client: null, name: '', region: '', paths: [], busy: false, error: '' });
+        var revoke = reactive({ open: false, client: null, busy: false, error: '' });
+        var remove = reactive({ open: false, client: null, busy: false, error: '' });
+
+        async function load() {
+          loading.value = true;
+          try {
+            var obj = await MON.api('GET', '/admin/api/clients');
+            MON.clock.sync(obj.serverTime);
+            clients.value = obj.clients || [];
+            pending.value = obj.pending || 0;
+            error.value = '';
+          } catch (e) {
+            error.value = MON.errorText(e);
+          } finally {
+            loading.value = false;
+          }
+        }
+
+        function stateLabel(record) {
+          if (!record.enabled) { return strings.stateDisabled; }
+          if (record.state === 'NEVER') { return strings.stateNever; }
+          return record.state;
+        }
+        function stateColor(record) {
+          if (!record.enabled) { return 'default'; }
+          if (record.state === 'ONLINE') { return 'success'; }
+          if (record.state === 'OFFLINE') { return 'error'; }
+          return 'default';
+        }
+        function heartbeatLabel(record) {
+          if (record.lastHeartbeat) { return MON.ago(record.lastHeartbeat); }
+          if (record.approvedAt) { return strings.approvedAgo(MON.ago(record.approvedAt)); }
+          return strings.neverSeen;
+        }
+
+        async function mutate(path, body, done) {
+          var out = await MON.call('POST', path, body);
+          if (out.status === 401) { MON.signOutTo(); return null; }
+          if (!out.env.success) { return out.env; }
+          antd.message.success(out.env.msg || strings.saved);
+          if (done) { await done(); }
+          return out.env;
+        }
+
+        async function setEnabled(record, value) {
+          busyId.value = record.id;
+          try {
+            var env = await mutate('/admin/api/clients/' + encodeURIComponent(record.id) + '/enabled', { enabled: !!value }, load);
+            if (env && !env.success) { antd.message.error(env.msg); }
+          } catch (e) {
+            antd.message.error(MON.errorText(e));
+          } finally {
+            busyId.value = '';
+          }
+        }
+
+        function openEdit(record) {
+          edit.client = record;
+          edit.name = record.name;
+          edit.region = record.region;
+          edit.paths = (record.paths || []).slice();
+          edit.error = '';
+          edit.open = true;
+        }
+        async function submitEdit() {
+          if (!edit.client) { return; }
+          edit.busy = true;
+          edit.error = '';
+          try {
+            var env = await mutate('/admin/api/clients/' + encodeURIComponent(edit.client.id),
+              { name: edit.name, region: edit.region, paths: edit.paths }, load);
+            if (env && !env.success) { edit.error = env.msg; return; }
+            edit.open = false;
+          } catch (e) {
+            edit.error = MON.errorText(e);
+          } finally {
+            edit.busy = false;
+          }
+        }
+
+        function openRevoke(record) { revoke.client = record; revoke.error = ''; revoke.open = true; }
+        async function submitRevoke() {
+          if (!revoke.client) { return; }
+          revoke.busy = true;
+          revoke.error = '';
+          try {
+            var env = await mutate('/admin/api/clients/' + encodeURIComponent(revoke.client.id) + '/revoke', undefined, load);
+            if (env && !env.success) { revoke.error = env.msg; return; }
+            revoke.open = false;
+          } catch (e) {
+            revoke.error = MON.errorText(e);
+          } finally {
+            revoke.busy = false;
+          }
+        }
+
+        function openDelete(record) { remove.client = record; remove.error = ''; remove.open = true; }
+        async function submitDelete() {
+          if (!remove.client) { return; }
+          remove.busy = true;
+          remove.error = '';
+          try {
+            var env = await mutate('/admin/api/clients/' + encodeURIComponent(remove.client.id) + '/delete', undefined, load);
+            if (env && !env.success) { remove.error = env.msg; return; }
+            remove.open = false;
+          } catch (e) {
+            remove.error = MON.errorText(e);
+          } finally {
+            remove.busy = false;
+          }
+        }
+
+        Vue.onMounted(load);
+
+        return {
+          s: strings, MON: MON,
+          themeConfig: computed(MON.themeConfig),
+          clients: clients, pending: pending, loading: loading, error: error, busyId: busyId,
+          edit: edit, revoke: revoke, remove: remove,
+          load: load, stateLabel: stateLabel, stateColor: stateColor, heartbeatLabel: heartbeatLabel,
+          setEnabled: setEnabled,
+          openEdit: openEdit, submitEdit: submitEdit,
+          openRevoke: openRevoke, submitRevoke: submitRevoke,
+          openDelete: openDelete, submitDelete: submitDelete
+        };
+      }
+    }).mount('#app');
+  })();
+</script>
+{{end}}

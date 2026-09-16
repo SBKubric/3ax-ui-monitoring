@@ -1,0 +1,309 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>{{.Title}}</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/admin/assets/reset.css?v={{.AssetsVersion}}">
+<script>
+  // Paint in the right theme from the first frame: the Vue application picks
+  // the same value up again once it boots.
+  (function () {
+    var t = null;
+    try { t = localStorage.getItem('mon-admin-theme'); } catch (e) {}
+    if (t !== 'dark' && t !== 'light') {
+      t = (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light';
+    }
+    document.documentElement.setAttribute('data-theme', t);
+  })();
+</script>
+<style>
+  /* Panel tokens (3AX-UI panel, variant A of the admin UI prototype). Ant
+     Design Vue is themed through ConfigProvider; these cover the shell around
+     it, which is plain markup. */
+  :root {
+    --pn-bg: #f0f2f5; --pn-card: #ffffff; --pn-card2: #fafafa;
+    --pn-text: rgba(0,0,0,.78); --pn-muted: rgba(0,0,0,.45);
+    --pn-line: #f0f0f0; --pn-stroke: #d9d9d9;
+    --pn-primary: #008771; --pn-primary-soft: #e6f7f3;
+    --pn-menu: #151f31; --pn-menu-text: rgba(255,255,255,.65);
+    --st-up: #008771; --st-up-soft: #e6f7f3; --st-down: #cf3c3c; --st-down-soft: #fdecec;
+    --st-warn: #b58a00; --st-warn-soft: #fff8dc; --st-off: #8c8c8c; --st-off-soft: #f2f2f2;
+    --code-bg: #0f1a2b; --code-fg: #e9f5f1;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --pn-bg: #0a1222; --pn-card: #151f31; --pn-card2: #0a1222;
+      --pn-text: rgba(255,255,255,.78); --pn-muted: rgba(255,255,255,.45);
+      --pn-line: #2c3950; --pn-stroke: #2c3950;
+      --pn-primary: #3ad3ba; --pn-primary-soft: #0f2a2a;
+      --st-up: #3ad3ba; --st-up-soft: #10302b; --st-down: #e04141; --st-down-soft: #3a1717;
+      --st-warn: #e0b93a; --st-warn-soft: #3a3212; --st-off: #8a94a6; --st-off-soft: #1b2436;
+      --code-bg: #05090f; --code-fg: #cdebe3;
+    }
+  }
+  :root[data-theme="dark"] {
+    --pn-bg: #0a1222; --pn-card: #151f31; --pn-card2: #0a1222;
+    --pn-text: rgba(255,255,255,.78); --pn-muted: rgba(255,255,255,.45);
+    --pn-line: #2c3950; --pn-stroke: #2c3950;
+    --pn-primary: #3ad3ba; --pn-primary-soft: #0f2a2a;
+    --st-up: #3ad3ba; --st-up-soft: #10302b; --st-down: #e04141; --st-down-soft: #3a1717;
+    --st-warn: #e0b93a; --st-warn-soft: #3a3212; --st-off: #8a94a6; --st-off-soft: #1b2436;
+    --code-bg: #05090f; --code-fg: #cdebe3;
+  }
+
+  [v-cloak] { display: none; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; background: var(--pn-bg); color: var(--pn-text);
+    font: 14px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+    font-variant-numeric: tabular-nums;
+  }
+  h1, h2, h3, h4 { margin: 0; font-weight: 600; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .93em; }
+  .muted { color: var(--pn-muted); }
+  .small { font-size: 12px; }
+  .tiny { font-size: 11px; }
+  .sp { flex: 1 1 auto; }
+  .nowrap { white-space: nowrap; }
+  .break { overflow-wrap: anywhere; }
+
+  /* Shell: dark sidebar, content column (prototype variant A). */
+  .shell { display: grid; grid-template-columns: 220px minmax(0, 1fr); min-height: 100vh; }
+  .sider {
+    background: var(--pn-menu); color: var(--pn-menu-text);
+    padding: 12px 0; display: grid; align-content: start; gap: 2px;
+  }
+  .sider .brand { padding: 6px 24px 14px; color: #fff; font-weight: 600; display: grid; }
+  .sider .brand small { color: var(--pn-menu-text); font-weight: 400; font-size: 11px; overflow-wrap: anywhere; }
+  .sider .mi {
+    display: flex; align-items: center; gap: 10px; padding: 0 24px; height: 40px;
+    font-size: 14px; color: var(--pn-menu-text); text-decoration: none;
+    background: none; border: 0; width: 100%; text-align: left; cursor: pointer; font-family: inherit;
+  }
+  .sider .mi:hover { color: #fff; }
+  .sider .mi.active { background: var(--pn-primary); color: #fff; }
+  .sider .mi .ic { width: 16px; text-align: center; opacity: .85; font-size: 13px; }
+  .sider .cnt {
+    margin-left: auto; background: var(--st-down); color: #fff; border-radius: 10px;
+    font-size: 11px; padding: 0 6px; line-height: 18px; min-width: 18px; text-align: center;
+  }
+  .sider .foot { margin-top: 18px; padding: 10px 24px; display: flex; align-items: center; gap: 10px; font-size: 12px; }
+  .content { padding: 20px 16px; display: grid; gap: 14px; align-content: start; min-width: 0; }
+  @media (max-width: 720px) {
+    .shell { grid-template-columns: 1fr; }
+    .sider { grid-auto-flow: row; }
+    .sider .mi { height: 36px; }
+  }
+
+  .card { background: var(--pn-card); border: 1px solid var(--pn-line); border-radius: 12px; padding: 14px 18px; min-width: 0; }
+  .card.tight { padding: 10px 14px; }
+  .card.pad0 { padding: 6px; }
+  .hd { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .fi { display: grid; gap: 4px; min-width: 0; }
+  .fi > label { font-size: 12px; color: var(--pn-muted); }
+  .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  @media (max-width: 520px) { .row2 { grid-template-columns: 1fr; } }
+  .stack { display: grid; gap: 12px; min-width: 0; }
+  .inline { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+
+  /* Pairing code: the value the administrator compares with the box's log. */
+  .code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    letter-spacing: .12em; font-weight: 700; font-size: 18px;
+  }
+  .code.big {
+    font-size: 28px; letter-spacing: .18em; background: var(--code-bg); color: var(--code-fg);
+    padding: 8px 16px; border-radius: 6px; display: inline-block;
+  }
+  .pre {
+    background: var(--pn-card2); border: 1px solid var(--pn-line); border-radius: 6px;
+    padding: 8px 10px; font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; max-height: 220px; overflow: auto;
+  }
+  .empty { padding: 18px; text-align: center; color: var(--pn-muted); }
+
+  /* A settings row: what it is on the left, the control on the right. */
+  .sli { display: grid; grid-template-columns: minmax(0, 1fr) minmax(220px, 360px); gap: 16px; align-items: start; padding: 12px 0; border-bottom: 1px solid var(--pn-line); }
+  .sli:last-child { border-bottom: 0; }
+  .sli .tt { font-weight: 500; }
+  .sli .d { color: var(--pn-muted); font-size: 12px; }
+  @media (max-width: 640px) { .sli { grid-template-columns: 1fr; } }
+
+  /* Tables in the style of the panel's inbounds list. Plain markup on
+     purpose: an in-DOM template cannot carry Ant Design Vue's camelCase
+     bodyCell slot, because the browser lowercases attribute names. */
+  .scroll { overflow-x: auto; }
+  table.t { width: 100%; border-collapse: collapse; font-size: 13px; }
+  table.t th, table.t td { padding: 8px 10px; border-bottom: 1px solid var(--pn-line); text-align: left; vertical-align: middle; white-space: nowrap; }
+  table.t th { color: var(--pn-muted); font-weight: 500; background: var(--pn-card2); position: sticky; top: 0; }
+  table.t tbody tr:hover > td { background: var(--pn-card2); }
+  table.t tbody tr:last-child > td { border-bottom: 0; }
+  /* A registration request that looks like a box already in the registry. */
+  table.t tr.row-match > td { background: var(--st-warn-soft); }
+  table.t tr.row-disabled > td { color: var(--pn-muted); }
+  .ok-text { color: var(--st-up); }
+  .err-text { color: var(--st-down); }
+  .warn-text { color: var(--st-warn); font-weight: 600; }
+  .login-wrap { min-height: 100vh; display: grid; place-items: center; padding: 24px 16px; position: relative; }
+  .login-wrap::before {
+    content: ""; position: absolute; left: 0; right: 0; top: 0; height: 160px;
+    background: linear-gradient(180deg, color-mix(in srgb, var(--pn-primary) 14%, transparent), transparent);
+  }
+  .login-box {
+    position: relative; background: var(--pn-card); border: 1px solid var(--pn-line);
+    border-radius: 18px; padding: 26px 28px; width: min(380px, 100%); display: grid; gap: 14px;
+    box-shadow: 0 6px 24px rgba(0,0,0,.08);
+  }
+</style>
+</head>
+<body>
+<div id="app" v-cloak>{{template "content" .}}</div>
+
+<script src="/admin/assets/vue.global.prod.js?v={{.AssetsVersion}}"></script>
+<script src="/admin/assets/dayjs.min.js?v={{.AssetsVersion}}"></script>
+<script src="/admin/assets/dayjs.relativeTime.js?v={{.AssetsVersion}}"></script>
+<script>
+  // ant-design-vue's UMD build takes seven dayjs plugins as externals, for its
+  // date pickers. The admin UI has no date picker and web/assets/VENDOR.md
+  // vendors only dayjs itself and relativeTime, so the rest are stubbed: dayjs
+  // .extend() throws on undefined and the whole bundle would fail to load.
+  (function () {
+    var externals = ['advancedFormat', 'customParseFormat', 'localeData', 'quarterOfYear', 'weekOfYear', 'weekYear', 'weekday'];
+    for (var i = 0; i < externals.length; i++) {
+      var key = 'dayjs_plugin_' + externals[i];
+      if (!window[key]) { window[key] = function () {}; }
+    }
+  })();
+</script>
+<script src="/admin/assets/antd.min.js?v={{.AssetsVersion}}"></script>
+<script>
+  // MON is everything the four pages share: the boot data rendered into the
+  // page, the theme switch, the fetch wrapper around the {success,msg,obj}
+  // envelope, the time helpers and the sidebar component. Each page then
+  // creates exactly one Vue application of its own (spec §9.1).
+  window.MON = (function () {
+    var boot = {{.Boot}};
+    dayjs.extend(dayjs_plugin_relativeTime);
+
+    var theme = Vue.reactive({ dark: document.documentElement.getAttribute('data-theme') === 'dark' });
+    function applyTheme() {
+      document.documentElement.setAttribute('data-theme', theme.dark ? 'dark' : 'light');
+      try { localStorage.setItem('mon-admin-theme', theme.dark ? 'dark' : 'light'); } catch (e) {}
+    }
+    function setDark(value) { theme.dark = !!value; applyTheme(); }
+    function themeConfig() {
+      return {
+        algorithm: theme.dark ? antd.theme.darkAlgorithm : antd.theme.defaultAlgorithm,
+        token: { colorPrimary: '#008771', colorLink: '#008771', borderRadius: 6 }
+      };
+    }
+
+    // clock keeps the page on mon-server's time: every payload carries
+    // serverTime, so a countdown never drifts with the browser's clock.
+    var clock = {
+      offset: 0,
+      sync: function (serverTime) { if (serverTime) { this.offset = Date.now() - serverTime; } },
+      now: function () { return Date.now() - this.offset; }
+    };
+
+    function signOutTo(next) {
+      window.location.href = '/admin/login?next=' + encodeURIComponent(next || window.location.pathname);
+    }
+
+    // call returns the whole envelope and never throws on a refusal, which is
+    // what the login card needs. api() is the same thing for the pages that
+    // only care about success.
+    async function call(method, path, body) {
+      var init = { method: method, credentials: 'same-origin', cache: 'no-store', headers: { 'Accept': 'application/json' } };
+      if (body !== undefined) {
+        init.headers['Content-Type'] = 'application/json';
+        init.body = JSON.stringify(body);
+      }
+      var res = await fetch(path, init);
+      var env = null;
+      try { env = await res.json(); } catch (e) { env = null; }
+      if (!env) { env = { success: false, msg: 'The server answered ' + res.status + '.', obj: null }; }
+      return { status: res.status, env: env };
+    }
+    async function api(method, path, body) {
+      var out = await call(method, path, body);
+      if (out.status === 401) { signOutTo(); throw new Error(out.env.msg || 'Not signed in.'); }
+      if (!out.env.success) { throw new Error(out.env.msg || 'The server answered ' + out.status + '.'); }
+      return out.env.obj;
+    }
+
+    function ago(ms) { return ms ? dayjs(ms).from(dayjs(clock.now())) : '—'; }
+    function stamp(ms) { return ms ? dayjs(ms).format('YYYY-MM-DD HH:mm:ss') : '—'; }
+    function mmss(ms) {
+      if (!ms || ms <= 0) { return '0:00'; }
+      var total = Math.floor(ms / 1000);
+      return Math.floor(total / 60) + ':' + String(total % 60).padStart(2, '0');
+    }
+    // slug previews the mon-client id under the Name field. The registry has
+    // the last word on it; this is the same rule, shown early.
+    function slug(name) {
+      return String(name || '').toLowerCase()
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/^-+|-+$/g, '')
+        .slice(0, 64);
+    }
+    function shortRevision(rev) { return rev ? String(rev).slice(0, 8) : ''; }
+    function errorText(err) { return (err && err.message) ? err.message : String(err); }
+
+    var sider = {
+      name: 'MonSider',
+      props: { page: { type: String, default: '' }, pending: { type: Number, default: 0 } },
+      setup: function () {
+        return { boot: boot, theme: theme, setDark: setDark, logout: logout };
+      },
+      template: [
+        '<aside class="sider">',
+        '  <div class="brand">mon-server<small>[[ boot.publicIp || "admin UI" ]] · v[[ boot.version ]]</small></div>',
+        '  <a class="mi" :class="{ active: page === \'requests\' }" href="/admin/requests" data-testid="nav-requests">',
+        '    <span class="ic" aria-hidden="true">▤</span>Requests',
+        '    <span class="cnt" v-if="pending > 0" data-testid="requests-badge">[[ pending ]]</span></a>',
+        '  <a class="mi" :class="{ active: page === \'clients\' }" href="/admin/clients" data-testid="nav-clients">',
+        '    <span class="ic" aria-hidden="true">▣</span>mon-clients</a>',
+        '  <a class="mi" :class="{ active: page === \'settings\' }" href="/admin/settings" data-testid="nav-settings">',
+        '    <span class="ic" aria-hidden="true">⚙</span>Settings</a>',
+        '  <button type="button" class="mi" @click="logout" data-testid="nav-logout">',
+        '    <span class="ic" aria-hidden="true">⎋</span>Log out</button>',
+        '  <div class="foot">',
+        '    <span class="muted">Dark</span>',
+        '    <span data-testid="theme-toggle"><a-switch size="small" :checked="theme.dark" @change="setDark"></a-switch></span>',
+        '  </div>',
+        '</aside>'
+      ].join('\n')
+    };
+
+    async function logout() {
+      try { await call('POST', '/admin/api/logout'); } catch (e) {}
+      window.location.href = '/admin/login';
+    }
+
+    // createApp wires every page the same way: the Vue delimiters move out of
+    // the way of html/template, Ant Design Vue is installed, and the sidebar
+    // is available as <mon-sider>.
+    function createApp(options) {
+      var app = Vue.createApp(options);
+      app.config.compilerOptions.delimiters = ['[[', ']]'];
+      app.config.errorHandler = function (err) { console.error(err); };
+      app.use(antd);
+      app.component('mon-sider', sider);
+      return app;
+    }
+
+    return {
+      boot: boot, theme: theme, setDark: setDark, themeConfig: themeConfig, clock: clock,
+      call: call, api: api, logout: logout, signOutTo: signOutTo,
+      ago: ago, stamp: stamp, mmss: mmss, slug: slug, shortRevision: shortRevision,
+      errorText: errorText, createApp: createApp
+    };
+  })();
+</script>
+{{template "script" .}}
+</body>
+</html>

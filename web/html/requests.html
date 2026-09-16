@@ -1,0 +1,347 @@
+{{define "content"}}
+<a-config-provider :theme="themeConfig">
+  <div class="shell">
+    <mon-sider page="requests" :pending="pending"></mon-sider>
+    <main class="content">
+
+      <section class="card tight hd">
+        <h3>[[ s.title ]]</h3>
+        <a-tag :color="pending ? 'warning' : 'default'" data-testid="requests-pending-count">[[ s.pending(pending) ]]</a-tag>
+        <span class="sp"></span>
+        <span class="muted small" data-testid="requests-rate-limits">[[ s.rateLimits(limits) ]]</span>
+        <span data-testid="requests-refresh"><a-button size="small" :loading="loading" @click="load">[[ s.refresh ]]</a-button></span>
+      </section>
+
+      <a-alert v-if="error" type="error" show-icon :message="error" data-testid="requests-error"></a-alert>
+
+      <section class="card pad0">
+        <div class="scroll">
+          <table class="t" data-testid="requests-table">
+            <thead>
+              <tr>
+                <th scope="col">[[ s.colIp ]]</th>
+                <th scope="col">[[ s.colHostname ]]</th>
+                <th scope="col">[[ s.colCode ]]</th>
+                <th scope="col">[[ s.colExpires ]]</th>
+                <th scope="col">[[ s.colOperate ]]</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="record in requests" :key="record.requestId"
+                  :class="(record.matches && record.matches.length) ? 'row-match' : ''"
+                  data-testid="request-row" :data-request-id="record.requestId">
+                <td>
+                  <span class="mono" data-testid="request-ip">[[ record.remoteIp ]]</span>
+                  <div class="muted tiny" v-if="record.publicIp && record.publicIp !== record.remoteIp">[[ s.reportsIp(record.publicIp) ]]</div>
+                </td>
+                <td>
+                  <span data-testid="request-hostname">[[ record.hostname || '—' ]]</span>
+                  <div class="muted tiny">[[ s.versionAttempt(record.version, record.attempt) ]]</div>
+                  <div v-if="record.matches && record.matches.length" class="tiny" data-testid="request-hint">
+                    <a-tag color="warning">[[ s.matchHint(record.matches[0]) ]]</a-tag>
+                  </div>
+                </td>
+                <td><span class="code" data-testid="request-code">[[ spaced(record.pairingCode) ]]</span></td>
+                <td>
+                  <span data-testid="request-expires" :class="expiringSoon(record) ? 'warn-text' : ''">[[ s.expiresIn(mmss(remaining(record))) ]]</span>
+                  <div class="muted tiny">[[ s.received(ago(record.createdAt)) ]]</div>
+                </td>
+                <td>
+                  <div class="inline">
+                    <span data-testid="request-approve">
+                      <a-button size="small" type="primary" @click="openApprove(record, 'new')">[[ s.approve ]]</a-button>
+                    </span>
+                    <span data-testid="request-approve-replacement">
+                      <a-button size="small" @click="openApprove(record, 'replace')">[[ s.approveReplacement ]]</a-button>
+                    </span>
+                    <span data-testid="request-reject">
+                      <a-button size="small" danger @click="openReject(record)">[[ s.reject ]]</a-button>
+                    </span>
+                  </div>
+                </td>
+              </tr>
+              <tr v-if="!requests.length && !loading">
+                <td colspan="5"><div class="empty" data-testid="requests-empty">[[ s.empty ]]</div></td>
+              </tr>
+              <tr v-if="loading && !requests.length">
+                <td colspan="5"><div class="empty"><a-spin></a-spin></div></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="card tight muted small" data-testid="requests-note">[[ s.note ]]</section>
+
+      <!-- Approve / approve as replacement (§9.2). -->
+      <a-modal v-model:open="approve.open" :title="s.approveTitle" :mask-closable="false" :width="620">
+        <div class="stack" data-testid="approve-modal" v-if="approve.request">
+          <div class="hd">
+            <span class="mono">[[ approve.request.remoteIp ]]</span>
+            <span>· [[ approve.request.hostname ]] · v[[ approve.request.version ]]</span>
+            <span class="sp"></span>
+            <span class="code big" data-testid="approve-code">[[ spaced(approve.request.pairingCode) ]]</span>
+          </div>
+
+          <a-alert type="warning" show-icon :message="s.compareCode(mmss(remaining(approve.request)))" data-testid="approve-code-warning"></a-alert>
+
+          <a-radio-group v-model:value="approve.mode" button-style="solid" @change="modeChanged">
+            <a-radio-button value="new" data-testid="approve-mode-new">[[ s.modeNew ]]</a-radio-button>
+            <a-radio-button value="replace" data-testid="approve-mode-replace">[[ s.modeReplace ]]</a-radio-button>
+          </a-radio-group>
+
+          <div class="fi" v-if="approve.mode === 'replace'">
+            <label for="approve-existing">[[ s.replacedRecord ]]</label>
+            <span data-testid="approve-existing">
+              <a-select id="approve-existing" v-model:value="approve.monClientId" style="width:100%"
+                        :placeholder="s.pickRecord" @change="pickExisting">
+                <a-select-option v-for="c in clients" :key="c.id" :value="c.id">
+                  <span :data-testid="'approve-existing-option-' + c.id">[[ c.name ]] · [[ c.id ]] · [[ c.region || '—' ]]</span>
+                </a-select-option>
+              </a-select>
+            </span>
+            <div class="muted tiny">[[ s.replaceExplains ]]</div>
+          </div>
+
+          <div class="row2">
+            <div class="fi">
+              <label for="approve-name">[[ s.name ]]</label>
+              <span data-testid="approve-name">
+                <a-input id="approve-name" v-model:value="approve.name" :maxlength="128"
+                         :disabled="approve.mode === 'replace'" :placeholder="s.namePlaceholder"></a-input>
+              </span>
+              <div class="muted tiny">[[ s.idIs ]] <span class="mono" data-testid="approve-id">[[ derivedId || '—' ]]</span> [[ s.idPermanent ]]</div>
+            </div>
+            <div class="fi">
+              <label for="approve-region">[[ s.region ]]</label>
+              <span data-testid="approve-region">
+                <a-input id="approve-region" v-model:value="approve.region" :maxlength="64"
+                         :disabled="approve.mode === 'replace'" :placeholder="s.regionPlaceholder"></a-input>
+              </span>
+            </div>
+          </div>
+
+          <div class="fi">
+            <label>[[ s.paths ]]</label>
+            <a-checkbox-group v-model:value="approve.paths" :disabled="approve.mode === 'replace'">
+              <span data-testid="approve-path-proxy"><a-checkbox value="proxy">proxy</a-checkbox></span>
+              <span data-testid="approve-path-direct"><a-checkbox value="direct">direct</a-checkbox></span>
+            </a-checkbox-group>
+            <div class="muted tiny" data-testid="approve-paths-warning">[[ s.pathsWarning ]]</div>
+          </div>
+
+          <a-alert v-if="approve.error" type="error" show-icon :message="approve.error" data-testid="approve-error"></a-alert>
+        </div>
+        <template #footer>
+          <span data-testid="approve-cancel"><a-button @click="approve.open = false">[[ s.cancel ]]</a-button></span>
+          <span data-testid="approve-submit">
+            <a-button type="primary" :loading="approve.busy" @click="submitApprove">[[ s.approveAndIssue ]]</a-button>
+          </span>
+        </template>
+      </a-modal>
+
+      <!-- Reject (§6: the box waits an hour before asking again). -->
+      <a-modal v-model:open="reject.open" :title="s.rejectTitle" :width="480">
+        <div class="stack" data-testid="reject-modal" v-if="reject.request">
+          <div>[[ s.rejectBody(reject.request.hostname, reject.request.remoteIp) ]]</div>
+          <a-alert v-if="reject.error" type="error" show-icon :message="reject.error" data-testid="reject-error"></a-alert>
+        </div>
+        <template #footer>
+          <span data-testid="reject-cancel"><a-button @click="reject.open = false">[[ s.cancel ]]</a-button></span>
+          <span data-testid="reject-submit">
+            <a-button danger type="primary" :loading="reject.busy" @click="submitReject">[[ s.reject ]]</a-button>
+          </span>
+        </template>
+      </a-modal>
+
+    </main>
+  </div>
+</a-config-provider>
+{{end}}
+
+{{define "script"}}
+<script>
+  // Registration requests (spec §9.2): one Vue application, every string of
+  // the page in one object.
+  (function () {
+    var strings = {
+      title: 'Registration requests',
+      pending: function (n) { return n + ' pending'; },
+      rateLimits: function (l) {
+        return 'rate limit: ' + l.perIpPerMinute + '/min per IP · at most ' + l.pendingPerIp +
+          ' pending per IP · at most ' + l.pendingGlobal + ' pending in total';
+      },
+      refresh: 'Refresh',
+      colIp: 'IP',
+      colHostname: 'Hostname',
+      colCode: 'Pairing code',
+      colExpires: 'Expires',
+      colOperate: 'Operate',
+      empty: 'No box is waiting for approval.',
+      reportsIp: function (ip) { return 'reports ' + ip; },
+      versionAttempt: function (version, attempt) { return 'v' + (version || '?') + ' · attempt ' + (attempt || 1); },
+      matchHint: function (m) {
+        return (m.reason === 'ip' ? 'same address as ' : 'same hostname as ') + m.monClientId + ': replacement?';
+      },
+      expiresIn: function (left) { return 'expires in ' + left; },
+      received: function (when) { return 'received ' + when; },
+      approve: 'Approve',
+      approveReplacement: 'Approve as replacement',
+      reject: 'Reject',
+      note: 'An approved request hands its token to the box once, then disappears from here: the box shows up under mon-clients as "never seen" until its first heartbeat.',
+      approveTitle: 'Approve registration request',
+      compareCode: function (left) { return 'Compare this code with the box\'s log before approving. It stays valid for ' + left + '.'; },
+      modeNew: 'New mon-client',
+      modeReplace: 'Replace an existing one',
+      replacedRecord: 'mon-client this box replaces',
+      pickRecord: 'Pick a mon-client',
+      replaceExplains: 'The record keeps its id, its history, its name, its region and its paths. Its old token is revoked.',
+      name: 'Name',
+      namePlaceholder: 'Amsterdam #2',
+      region: 'Region',
+      regionPlaceholder: 'NL',
+      idIs: 'id:',
+      idPermanent: '(the slug of the name, permanent)',
+      paths: 'Paths this mon-client probes',
+      pathsWarning: 'For a box in a hostile region leave only proxy: direct reveals the real server\'s address to that box.',
+      cancel: 'Cancel',
+      approveAndIssue: 'Approve and issue token',
+      rejectTitle: 'Reject registration request',
+      rejectBody: function (host, ip) { return 'Reject the request from ' + (host || 'this box') + ' (' + ip + ')? It waits an hour before asking again.'; },
+      approved: 'Approved.',
+      rejected: 'Request rejected.'
+    };
+
+    MON.createApp({
+      setup: function () {
+        var ref = Vue.ref, reactive = Vue.reactive, computed = Vue.computed;
+        var requests = ref([]);
+        var clients = ref([]);
+        var limits = ref({ perIpPerMinute: 1, pendingPerIp: 3, pendingGlobal: 20 });
+        var pending = ref(MON.boot.pending || 0);
+        var loading = ref(false);
+        var error = ref('');
+        var tick = ref(MON.clock.now());
+        var timer = null;
+
+        var approve = reactive({ open: false, request: null, mode: 'new', name: '', region: '', paths: ['proxy', 'direct'], monClientId: undefined, busy: false, error: '' });
+        var reject = reactive({ open: false, request: null, busy: false, error: '' });
+
+        async function load() {
+          loading.value = true;
+          try {
+            var obj = await MON.api('GET', '/admin/api/requests');
+            MON.clock.sync(obj.serverTime);
+            requests.value = obj.requests || [];
+            clients.value = obj.clients || [];
+            limits.value = obj.rateLimits || limits.value;
+            pending.value = obj.pending || 0;
+            error.value = '';
+          } catch (e) {
+            error.value = MON.errorText(e);
+          } finally {
+            loading.value = false;
+          }
+        }
+
+        function remaining(record) { return record ? (record.expiresAt - tick.value) : 0; }
+        function expiringSoon(record) { return remaining(record) < 60000; }
+        function spaced(code) { return code ? String(code).slice(0, 3) + ' ' + String(code).slice(3) : ''; }
+
+        function openApprove(record, mode) {
+          approve.request = record;
+          approve.mode = mode;
+          approve.name = '';
+          approve.region = '';
+          approve.paths = ['proxy', 'direct'];
+          approve.monClientId = undefined;
+          approve.error = '';
+          if (mode === 'replace' && record.matches && record.matches.length) {
+            approve.monClientId = record.matches[0].monClientId;
+            pickExisting(approve.monClientId);
+          }
+          approve.open = true;
+        }
+        function modeChanged() {
+          if (approve.mode === 'replace' && approve.monClientId) { pickExisting(approve.monClientId); }
+        }
+        function pickExisting(id) {
+          var found = clients.value.filter(function (c) { return c.id === id; })[0];
+          if (!found) { return; }
+          // A replacement keeps the record's name, region and paths (§6).
+          approve.name = found.name;
+          approve.region = found.region;
+          approve.paths = (found.paths || []).slice();
+        }
+
+        async function submitApprove() {
+          if (!approve.request) { return; }
+          approve.busy = true;
+          approve.error = '';
+          try {
+            var body = {
+              mode: approve.mode,
+              name: approve.name,
+              region: approve.region,
+              paths: approve.paths,
+              monClientId: approve.mode === 'replace' ? approve.monClientId : ''
+            };
+            var out = await MON.call('POST', '/admin/api/requests/' + encodeURIComponent(approve.request.requestId) + '/approve', body);
+            if (out.status === 401) { MON.signOutTo(); return; }
+            if (!out.env.success) { approve.error = out.env.msg || strings.approved; return; }
+            approve.open = false;
+            antd.message.success(out.env.msg || strings.approved);
+            await load();
+          } catch (e) {
+            approve.error = MON.errorText(e);
+          } finally {
+            approve.busy = false;
+          }
+        }
+
+        function openReject(record) {
+          reject.request = record;
+          reject.error = '';
+          reject.open = true;
+        }
+        async function submitReject() {
+          if (!reject.request) { return; }
+          reject.busy = true;
+          reject.error = '';
+          try {
+            var out = await MON.call('POST', '/admin/api/requests/' + encodeURIComponent(reject.request.requestId) + '/reject');
+            if (out.status === 401) { MON.signOutTo(); return; }
+            if (!out.env.success) { reject.error = out.env.msg || ''; return; }
+            reject.open = false;
+            antd.message.success(out.env.msg || strings.rejected);
+            await load();
+          } catch (e) {
+            reject.error = MON.errorText(e);
+          } finally {
+            reject.busy = false;
+          }
+        }
+
+        Vue.onMounted(function () {
+          load();
+          timer = window.setInterval(function () { tick.value = MON.clock.now(); }, 1000);
+        });
+        Vue.onUnmounted(function () { if (timer) { window.clearInterval(timer); } });
+
+        return {
+          s: strings,
+          themeConfig: computed(MON.themeConfig),
+          requests: requests, clients: clients, limits: limits, pending: pending,
+          loading: loading, error: error,
+          approve: approve, reject: reject,
+          derivedId: computed(function () { return approve.mode === 'replace' ? (approve.monClientId || '') : MON.slug(approve.name); }),
+          load: load, remaining: remaining, expiringSoon: expiringSoon, spaced: spaced,
+          openApprove: openApprove, modeChanged: modeChanged, pickExisting: pickExisting,
+          submitApprove: submitApprove, openReject: openReject, submitReject: submitReject,
+          mmss: MON.mmss, ago: MON.ago
+        };
+      }
+    }).mount('#app');
+  })();
+</script>
+{{end}}

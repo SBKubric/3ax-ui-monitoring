@@ -1,0 +1,117 @@
+{{define "content"}}
+<a-config-provider :theme="themeConfig">
+  <div class="login-wrap">
+    <div class="login-box">
+      <div class="hd">
+        <h2 style="font-size:22px">[[ s.title ]]</h2>
+        <span class="sp"></span>
+        <span data-testid="theme-toggle"><a-switch size="small" :checked="theme.dark" @change="setDark"></a-switch></span>
+      </div>
+      <div class="muted small" data-testid="login-subtitle">[[ subtitle ]]</div>
+
+      <a-alert v-if="error" type="error" show-icon :message="error" data-testid="login-error"></a-alert>
+
+      <form @submit.prevent="submit" data-testid="login-form">
+        <div class="stack">
+          <div class="fi">
+            <label for="username">[[ s.username ]]</label>
+            <span data-testid="login-username">
+              <a-input id="username" v-model:value="username" name="username" autocomplete="username"
+                       :disabled="busy" :maxlength="64" autofocus></a-input>
+            </span>
+          </div>
+          <div class="fi">
+            <label for="password">[[ s.password ]]</label>
+            <span data-testid="login-password">
+              <a-input-password id="password" v-model:value="password" name="password"
+                                autocomplete="current-password" :disabled="busy"></a-input-password>
+            </span>
+          </div>
+          <span data-testid="login-submit">
+            <a-button type="primary" html-type="submit" block :loading="busy">[[ s.signIn ]]</a-button>
+          </span>
+        </div>
+      </form>
+
+      <div class="muted tiny" data-testid="login-hint">
+        <div v-if="attemptsLeft !== null && attemptsLeft > 0">[[ s.attemptsLeft(attemptsLeft) ]]</div>
+        <div>[[ s.lockout(boot.maxLoginFailures, boot.lockoutMinutes) ]]</div>
+        <div>[[ s.sessions(boot.sessionHours) ]]</div>
+        <div>[[ s.setPassword ]] <span class="mono">mon-server admin set &lt;user&gt;</span></div>
+      </div>
+    </div>
+  </div>
+</a-config-provider>
+{{end}}
+
+{{define "script"}}
+<script>
+  // Login card (spec §9.1): one Vue application, every string in one object.
+  (function () {
+    var strings = {
+      title: 'mon-server',
+      subtitleWith: function (addr) { return addr + ' · single administrator, no second factor'; },
+      subtitlePlain: 'Single administrator, no second factor',
+      username: 'Username',
+      password: 'Password',
+      signIn: 'Sign in',
+      attemptsLeft: function (n) { return n === 1 ? 'One attempt left before this address is locked.' : n + ' attempts left before this address is locked.'; },
+      lockout: function (max, minutes) { return 'After ' + max + ' failed attempts this IP address is locked for ' + minutes + ' minutes.'; },
+      sessions: function (hours) { return 'A session lasts ' + hours + ' hours.'; },
+      setPassword: 'The login and password are set on the box:',
+      failed: 'Sign in failed.'
+    };
+
+    MON.createApp({
+      setup: function () {
+        var ref = Vue.ref;
+        var username = ref('');
+        var password = ref('');
+        var busy = ref(false);
+        var error = ref('');
+        var attemptsLeft = ref(null);
+
+        async function submit() {
+          if (busy.value) { return; }
+          busy.value = true;
+          error.value = '';
+          try {
+            var out = await MON.call('POST', '/admin/api/login', {
+              username: username.value,
+              password: password.value,
+              next: MON.boot.next || ''
+            });
+            if (out.env.success) {
+              window.location.href = (out.env.obj && out.env.obj.next) || '/admin/requests';
+              return;
+            }
+            error.value = out.env.msg || strings.failed;
+            attemptsLeft.value = (out.env.obj && typeof out.env.obj.attemptsLeft === 'number' && out.env.obj.attemptsLeft > 0)
+              ? out.env.obj.attemptsLeft : null;
+            password.value = '';
+          } catch (e) {
+            error.value = MON.errorText(e);
+          } finally {
+            busy.value = false;
+          }
+        }
+
+        return {
+          s: strings,
+          boot: MON.boot,
+          theme: MON.theme,
+          setDark: MON.setDark,
+          themeConfig: Vue.computed(MON.themeConfig),
+          subtitle: MON.boot.publicIp ? strings.subtitleWith(MON.boot.publicIp) : strings.subtitlePlain,
+          username: username,
+          password: password,
+          busy: busy,
+          error: error,
+          attemptsLeft: attemptsLeft,
+          submit: submit
+        };
+      }
+    }).mount('#app');
+  })();
+</script>
+{{end}}

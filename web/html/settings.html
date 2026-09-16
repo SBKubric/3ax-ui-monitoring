@@ -1,0 +1,417 @@
+{{define "content"}}
+<a-config-provider :theme="themeConfig">
+  <div class="shell">
+    <mon-sider page="settings" :pending="pending"></mon-sider>
+    <main class="content">
+
+      <section class="card tight hd">
+        <span data-testid="settings-save">
+          <a-button type="primary" :loading="saving" :disabled="loading" @click="save">[[ s.save ]]</a-button>
+        </span>
+        <span class="sp"></span>
+        <span data-testid="settings-status">
+          <a-alert :type="statusType" show-icon :message="statusLine"></a-alert>
+        </span>
+      </section>
+
+      <a-alert v-if="error" type="error" show-icon :message="error" data-testid="settings-error"></a-alert>
+
+      <section class="card">
+        <a-tabs v-model:active-key="tab">
+
+          <a-tab-pane key="real">
+            <template #tab><span data-testid="tab-real">[[ s.tabReal ]]</span></template>
+            <div class="sli">
+              <div><div class="tt">[[ s.panelUrl ]]</div><div class="d">[[ s.panelUrlHelp ]]</div></div>
+              <div>
+                <span data-testid="settings-panel-url">
+                  <a-input id="panel-url" v-model:value="form.panelUrl" placeholder="https://panel.example.net/secretpath"></a-input>
+                </span>
+              </div>
+            </div>
+            <div class="sli">
+              <div><div class="tt">[[ s.monToken ]]</div><div class="d">[[ s.monTokenHelp ]]</div></div>
+              <div class="stack">
+                <span data-testid="settings-mon-token">
+                  <a-input-password id="mon-token" v-model:value="form.monToken" autocomplete="off"
+                                    :placeholder="secretPlaceholder(data.realServer.monToken)"></a-input-password>
+                </span>
+                <div class="inline">
+                  <span data-testid="settings-check">
+                    <a-button :loading="checking" @click="check">[[ s.check ]]</a-button>
+                  </span>
+                  <span class="small" v-if="checkResult" :class="checkResult.ok ? 'ok-text' : 'err-text'" data-testid="settings-check-result">[[ checkResult.msg ]]</span>
+                </div>
+                <div class="muted tiny">[[ s.checkHelp ]]</div>
+              </div>
+            </div>
+            <div class="sli">
+              <div><div class="tt">[[ s.realHost ]]</div><div class="d">[[ s.realHostHelp ]]</div></div>
+              <div>
+                <span data-testid="settings-real-host">
+                  <a-input id="real-host" v-model:value="form.realHost" :placeholder="s.realHostPlaceholder"></a-input>
+                </span>
+              </div>
+            </div>
+            <div class="sli">
+              <div><div class="tt">[[ s.proxyFront ]]</div><div class="d">[[ s.proxyFrontHelp ]]</div></div>
+              <div>
+                <span class="mono small" data-testid="settings-proxy-front">[[ proxyFrontLine ]]</span>
+              </div>
+            </div>
+          </a-tab-pane>
+
+          <a-tab-pane key="telegram">
+            <template #tab><span data-testid="tab-telegram">[[ s.tabTelegram ]]</span></template>
+            <div class="sli">
+              <div><div class="tt">[[ s.tgToken ]]</div><div class="d">[[ s.tgTokenHelp ]]</div></div>
+              <div>
+                <span data-testid="settings-tg-token">
+                  <a-input-password id="tg-token" v-model:value="form.tgToken" autocomplete="off"
+                                    :placeholder="secretPlaceholder(data.telegram.tgToken)"></a-input-password>
+                </span>
+              </div>
+            </div>
+            <div class="sli">
+              <div><div class="tt">[[ s.tgChatId ]]</div><div class="d">[[ s.tgChatIdHelp ]]</div></div>
+              <div class="stack">
+                <span data-testid="settings-tg-chat-id">
+                  <a-input id="tg-chat-id" v-model:value="form.tgChatId" placeholder="-1001234567890"></a-input>
+                </span>
+                <div class="inline">
+                  <span data-testid="settings-test-telegram">
+                    <a-button :loading="testing" @click="testTelegram">[[ s.sendTest ]]</a-button>
+                  </span>
+                  <span class="small" v-if="testResult" :class="testResult.ok ? 'ok-text' : 'err-text'" data-testid="settings-test-result">[[ testResult.msg ]]</span>
+                </div>
+                <div class="muted tiny">[[ s.sendTestHelp ]]</div>
+              </div>
+            </div>
+          </a-tab-pane>
+
+          <a-tab-pane key="thresholds">
+            <template #tab><span data-testid="tab-thresholds">[[ s.tabThresholds ]]</span></template>
+            <div class="sli">
+              <div><div class="tt">[[ s.downUp ]]</div><div class="d">[[ s.downUpHelp ]]</div></div>
+              <div class="inline">
+                <span data-testid="settings-down-after"><a-input-number id="down-after" v-model:value="form.downAfter" :min="1" :max="100"></a-input-number></span>
+                <span data-testid="settings-up-after"><a-input-number id="up-after" v-model:value="form.upAfter" :min="1" :max="100"></a-input-number></span>
+              </div>
+            </div>
+            <div class="sli">
+              <div><div class="tt">[[ s.flapping ]]</div><div class="d">[[ s.flappingHelp ]]</div></div>
+              <div class="inline">
+                <span data-testid="settings-flap-n"><a-input-number id="flap-n" v-model:value="form.flapN" :min="2" :max="100"></a-input-number></span>
+                <span class="muted">[[ s.within ]]</span>
+                <span data-testid="settings-flap-min"><a-input-number id="flap-min" v-model:value="form.flapMin" :min="1" :max="1440"></a-input-number></span>
+                <span class="muted">[[ s.minutes ]]</span>
+              </div>
+            </div>
+            <div class="sli">
+              <div><div class="tt">[[ s.flapHold ]]</div><div class="d">[[ s.flapHoldHelp ]]</div></div>
+              <div class="inline">
+                <span data-testid="settings-flap-hold-min"><a-input-number id="flap-hold-min" v-model:value="form.flapHoldMin" :min="1" :max="1440"></a-input-number></span>
+                <span class="muted">[[ s.minutes ]]</span>
+              </div>
+            </div>
+            <div class="sli">
+              <div><div class="tt">[[ s.offlineDown ]]</div><div class="d">[[ s.offlineDownHelp ]]</div></div>
+              <div class="inline">
+                <span data-testid="settings-client-offline-after"><a-input-number id="client-offline-after" v-model:value="form.clientOfflineAfter" :min="1" :max="100"></a-input-number></span>
+                <span data-testid="settings-panel-down-after"><a-input-number id="panel-down-after" v-model:value="form.panelDownAfter" :min="1" :max="100"></a-input-number></span>
+              </div>
+            </div>
+          </a-tab-pane>
+
+          <a-tab-pane key="probe">
+            <template #tab><span data-testid="tab-probe">[[ s.tabProbe ]]</span></template>
+            <a-alert type="info" show-icon :message="s.probeWarning" style="margin-bottom:8px" data-testid="settings-probe-warning"></a-alert>
+            <div class="sli" v-for="field in probeFields" :key="field.key">
+              <div><div class="tt">[[ field.title ]]</div><div class="d">[[ field.help ]]</div></div>
+              <div class="inline">
+                <span :data-testid="field.testid">
+                  <a-input-number :id="field.key" v-model:value="form[field.key]" :min="field.min" :max="field.max" :step="100"></a-input-number>
+                </span>
+                <span class="muted">ms</span>
+              </div>
+            </div>
+          </a-tab-pane>
+
+          <a-tab-pane key="tls">
+            <template #tab><span data-testid="tab-tls">[[ s.tabTLS ]]</span></template>
+            <div class="sli">
+              <div><div class="tt">[[ s.tlsMode ]]</div><div class="d">[[ s.tlsModeHelp ]]</div></div>
+              <div><span class="mono small" data-testid="settings-tls-mode">[[ tlsLine ]]</span></div>
+            </div>
+            <div class="sli">
+              <div><div class="tt">[[ s.listen ]]</div><div class="d">[[ s.listenHelp ]]</div></div>
+              <div><span class="mono small" data-testid="settings-listen">[[ data.tlsAdmin.listen || '—' ]]</span></div>
+            </div>
+            <div class="sli">
+              <div><div class="tt">[[ s.dataDir ]]</div><div class="d">[[ s.dataDirHelp ]]</div></div>
+              <div><span class="mono small break" data-testid="settings-data-dir">[[ data.tlsAdmin.dataDir || '—' ]]</span></div>
+            </div>
+            <div class="sli">
+              <div><div class="tt">[[ s.administrator ]]</div><div class="d">[[ s.administratorHelp ]]</div></div>
+              <div><span class="mono small break" data-testid="settings-admin-hint">[[ data.tlsAdmin.adminHint ]]</span></div>
+            </div>
+          </a-tab-pane>
+
+        </a-tabs>
+      </section>
+
+    </main>
+  </div>
+</a-config-provider>
+{{end}}
+
+{{define "script"}}
+<script>
+  // Settings (spec §9.4): one Save applies everything, Check and Send test act
+  // on the typed values and save nothing. Every string of the page is here.
+  (function () {
+    var strings = {
+      save: 'Save',
+      tabReal: 'Real server',
+      tabTelegram: 'Telegram',
+      tabThresholds: 'Thresholds',
+      tabProbe: 'Probe',
+      tabTLS: 'TLS & admin',
+      panelUrl: 'Panel URL',
+      panelUrlHelp: 'The panel on the real server, webBasePath included: where /mon/v1/* answers. Polled once a minute for state and probe configs.',
+      monToken: 'Monitoring token',
+      monTokenHelp: 'The monToken from the panel\'s Monitoring settings tab. It is stored on this box and never sent back to this page; leave the field empty to keep the stored one.',
+      check: 'Check',
+      checkHelp: 'Check calls GET /state with the values as typed and saves nothing.',
+      realHost: 'Address for path direct',
+      realHostHelp: 'The host substituted into direct targets: the real server as clients reach it without the override. Empty means the host of the panel URL. Only mon-clients with the direct path ever see it.',
+      realHostPlaceholder: 'host of the panel URL',
+      proxyFront: 'Proxy front',
+      proxyFrontHelp: 'Read-only, as the panel reports it in GET /state. mon-server has no setting of its own: the front lives in the panel\'s host override, and /probe/configs already carries it.',
+      tgToken: 'Telegram bot token',
+      tgTokenHelp: 'The same bot the panel uses. mon-server writes to it only when the panel is unreachable, and for mon-client config errors. Leave empty to keep the stored token.',
+      tgChatId: 'Telegram chat id',
+      tgChatIdHelp: 'Where those messages go.',
+      sendTest: 'Send test',
+      sendTestHelp: 'Send test uses the values as typed and saves nothing.',
+      downUp: 'Down after / Up after',
+      downUpHelp: 'Consecutive failed probes before a target is down; consecutive successes before it is up again.',
+      flapping: 'Flapping',
+      flappingHelp: 'How many up/down transitions inside the window mark a target as flapping.',
+      within: 'in',
+      minutes: 'min',
+      flapHold: 'Flapping hold',
+      flapHoldHelp: 'Quiet period before a flapping target goes back to its real state.',
+      offlineDown: 'mon-client offline after / panel down after',
+      offlineDownHelp: 'Missed heartbeats before a mon-client counts as offline; failed panel calls before mon-server declares the panel down and starts writing to Telegram itself.',
+      probeWarning: 'These parameters travel to every mon-client in its configuration. Saving a change here rebuilds every configuration, so every mon-client gets a new config revision.',
+      tlsMode: 'TLS',
+      tlsModeHelp: 'From the bootstrap configuration, read-only here.',
+      listen: 'Listen address',
+      listenHelp: 'The single HTTPS listener: /v1/* for mon-clients, /admin/* for this UI.',
+      dataDir: 'Data directory',
+      dataDirHelp: 'The SQLite database and the certificate storage.',
+      administrator: 'Administrator',
+      administratorHelp: 'One account, no second factor in v1. Change the login and password on the box:',
+      saved: 'Settings saved.',
+      panelReachable: 'Panel reachable',
+      panelUnreachable: 'Panel unreachable',
+      panelUnknown: 'The panel has not been polled yet',
+      neverChecked: 'never checked',
+      overrideOff: 'override off',
+      inbounds: function (n) { return n + ' inbounds'; },
+      checkedAgo: function (when) { return 'checked ' + when; },
+      keepStored: function (hint) { return 'stored ' + hint + ' — leave empty to keep it'; },
+      notStored: 'not set',
+      expiresIn: function (when) { return ', certificate expires ' + when; },
+      renews: function (when) { return ', renews ' + when; }
+    };
+
+    var probeFields = [
+      { key: 'intervalMs', testid: 'settings-interval-ms', title: 'Probe interval', help: 'How often a mon-client runs a full probe cycle.', min: 5000, max: 3600000 },
+      { key: 'budgetMs', testid: 'settings-budget-ms', title: 'Cycle budget', help: 'The whole cycle is abandoned after this. It must be shorter than the interval.', min: 1000, max: 600000 },
+      { key: 'connectMs', testid: 'settings-connect-ms', title: 'Connect timeout', help: 'TCP connect to one target.', min: 100, max: 120000 },
+      { key: 'tlsMs', testid: 'settings-tls-ms', title: 'TLS timeout', help: 'The TLS handshake, whose duration is also the latency that is reported.', min: 100, max: 120000 },
+      { key: 'headersMs', testid: 'settings-headers-ms', title: 'Headers timeout', help: 'Waiting for the response headers of the tunnel probe.', min: 100, max: 120000 },
+      { key: 'startJitterMs', testid: 'settings-start-jitter-ms', title: 'Start jitter', help: 'Random delay before a cycle, so the boxes do not probe in lockstep.', min: 0, max: 600000 },
+      { key: 'heartbeatTimeoutMs', testid: 'settings-heartbeat-timeout-ms', title: 'Heartbeat timeout', help: 'How long a mon-client waits for the answer to its heartbeat.', min: 1000, max: 120000 }
+    ];
+
+    var emptyData = {
+      realServer: { panelUrl: '', monToken: { set: false, hint: '' }, realHost: '' },
+      proxyFront: { enabled: false, host: '', seenAt: 0 },
+      telegram: { tgToken: { set: false, hint: '' }, tgChatId: '' },
+      thresholds: {}, probe: {},
+      tlsAdmin: { tlsMode: '', listen: '', dataDir: '', adminHint: '', certNotAfter: 0, certRenewAt: 0 },
+      panel: { status: 'UNKNOWN', reachable: false, revision: '', inbounds: 0, overrideEnabled: false, overrideHost: '', checkedAt: 0, error: '' }
+    };
+
+    MON.createApp({
+      setup: function () {
+        var ref = Vue.ref, reactive = Vue.reactive, computed = Vue.computed;
+        var data = ref(emptyData);
+        var form = reactive({
+          panelUrl: '', monToken: '', realHost: '', tgToken: '', tgChatId: '',
+          downAfter: 3, upAfter: 2, flapN: 4, flapMin: 30, flapHoldMin: 15,
+          clientOfflineAfter: 3, panelDownAfter: 3,
+          intervalMs: 60000, budgetMs: 20000, connectMs: 5000, tlsMs: 10000,
+          headersMs: 10000, startJitterMs: 5000, heartbeatTimeoutMs: 10000
+        });
+        var tab = ref('real');
+        var pending = ref(MON.boot.pending || 0);
+        var loading = ref(false);
+        var saving = ref(false);
+        var checking = ref(false);
+        var testing = ref(false);
+        var error = ref('');
+        var checkResult = ref(null);
+        var testResult = ref(null);
+
+        async function load() {
+          loading.value = true;
+          try {
+            var obj = await MON.api('GET', '/admin/api/settings');
+            MON.clock.sync(obj.serverTime);
+            data.value = obj;
+            pending.value = obj.pending || 0;
+            form.panelUrl = obj.realServer.panelUrl;
+            form.realHost = obj.realServer.realHost;
+            form.tgChatId = obj.telegram.tgChatId;
+            // The two secrets are never sent back to the page: the fields stay
+            // empty and only a typed value replaces what is stored.
+            form.monToken = '';
+            form.tgToken = '';
+            Object.keys(obj.thresholds).forEach(function (k) { form[k] = obj.thresholds[k]; });
+            Object.keys(obj.probe).forEach(function (k) { form[k] = obj.probe[k]; });
+            error.value = '';
+          } catch (e) {
+            error.value = MON.errorText(e);
+          } finally {
+            loading.value = false;
+          }
+        }
+
+        function body() {
+          var out = {
+            panelUrl: form.panelUrl, realHost: form.realHost, tgChatId: form.tgChatId,
+            downAfter: form.downAfter, upAfter: form.upAfter, flapN: form.flapN,
+            flapMin: form.flapMin, flapHoldMin: form.flapHoldMin,
+            clientOfflineAfter: form.clientOfflineAfter, panelDownAfter: form.panelDownAfter
+          };
+          probeFields.forEach(function (f) { out[f.key] = form[f.key]; });
+          // An untouched secret field is left out of the body, which the
+          // server reads as "keep the stored value".
+          if (form.monToken) { out.monToken = form.monToken; }
+          if (form.tgToken) { out.tgToken = form.tgToken; }
+          return out;
+        }
+
+        async function save() {
+          saving.value = true;
+          error.value = '';
+          try {
+            var out = await MON.call('POST', '/admin/api/settings', body());
+            if (out.status === 401) { MON.signOutTo(); return; }
+            if (!out.env.success) { error.value = out.env.msg; return; }
+            antd.message.success(out.env.msg || strings.saved);
+            await load();
+          } catch (e) {
+            error.value = MON.errorText(e);
+          } finally {
+            saving.value = false;
+          }
+        }
+
+        async function check() {
+          checking.value = true;
+          checkResult.value = null;
+          try {
+            var payload = { panelUrl: form.panelUrl };
+            if (form.monToken) { payload.monToken = form.monToken; }
+            var out = await MON.call('POST', '/admin/api/settings/check', payload);
+            if (out.status === 401) { MON.signOutTo(); return; }
+            var obj = out.env.obj;
+            checkResult.value = {
+              ok: out.env.success,
+              msg: out.env.success
+                ? out.env.msg + ' · revision ' + (obj.revision || '?') + ' · ' + strings.inbounds(obj.inbounds || 0) +
+                  (obj.overrideEnabled ? ' · override → ' + obj.overrideHost : ' · ' + strings.overrideOff)
+                : out.env.msg
+            };
+          } catch (e) {
+            checkResult.value = { ok: false, msg: MON.errorText(e) };
+          } finally {
+            checking.value = false;
+          }
+        }
+
+        async function testTelegram() {
+          testing.value = true;
+          testResult.value = null;
+          try {
+            var payload = { tgChatId: form.tgChatId };
+            if (form.tgToken) { payload.tgToken = form.tgToken; }
+            var out = await MON.call('POST', '/admin/api/settings/test-telegram', payload);
+            if (out.status === 401) { MON.signOutTo(); return; }
+            testResult.value = { ok: out.env.success, msg: out.env.msg };
+          } catch (e) {
+            testResult.value = { ok: false, msg: MON.errorText(e) };
+          } finally {
+            testing.value = false;
+          }
+        }
+
+        function secretPlaceholder(secret) {
+          return (secret && secret.set) ? strings.keepStored(secret.hint) : strings.notStored;
+        }
+
+        var statusLine = computed(function () {
+          var p = data.value.panel;
+          if (p.error) {
+            return strings.panelUnreachable + ' · ' + p.error +
+              ' · ' + (p.checkedAt ? strings.checkedAgo(MON.ago(p.checkedAt)) : strings.neverChecked);
+          }
+          if (!p.checkedAt) { return strings.panelUnknown; }
+          return strings.panelReachable +
+            ' · revision ' + (p.revision || '?') +
+            ' · ' + strings.inbounds(p.inbounds) +
+            ' · ' + (p.overrideEnabled ? 'override → ' + p.overrideHost : strings.overrideOff) +
+            ' · ' + strings.checkedAgo(MON.ago(p.checkedAt));
+        });
+        var statusType = computed(function () {
+          var p = data.value.panel;
+          if (p.error) { return 'error'; }
+          if (!p.checkedAt) { return 'info'; }
+          return 'success';
+        });
+        var proxyFrontLine = computed(function () {
+          var f = data.value.proxyFront;
+          if (!f.enabled) { return strings.overrideOff + (f.seenAt ? ' · ' + strings.checkedAgo(MON.ago(f.seenAt)) : ''); }
+          return 'override on → ' + f.host + (f.seenAt ? ' · ' + strings.checkedAgo(MON.ago(f.seenAt)) : '');
+        });
+        var tlsLine = computed(function () {
+          var t = data.value.tlsAdmin;
+          var line = t.tlsMode || '—';
+          if (t.certNotAfter) { line += strings.expiresIn(MON.ago(t.certNotAfter)); }
+          if (t.certRenewAt) { line += strings.renews(MON.ago(t.certRenewAt)); }
+          return line;
+        });
+
+        Vue.onMounted(load);
+
+        return {
+          s: strings, probeFields: probeFields,
+          themeConfig: computed(MON.themeConfig),
+          data: data, form: form, tab: tab, pending: pending,
+          loading: loading, saving: saving, checking: checking, testing: testing,
+          error: error, checkResult: checkResult, testResult: testResult,
+          load: load, save: save, check: check, testTelegram: testTelegram,
+          secretPlaceholder: secretPlaceholder,
+          statusLine: statusLine, statusType: statusType,
+          proxyFrontLine: proxyFrontLine, tlsLine: tlsLine
+        };
+      }
+    }).mount('#app');
+  })();
+</script>
+{{end}}
