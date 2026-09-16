@@ -1,0 +1,22 @@
+# agent workspace (orchestration notes, conversation log) — never committed
+.agents/
+
+# build artifacts
+/bin/
+/dist/
+mon-server
+mon-client
+*.test
+*.out
+
+# local data
+*.db
+*.db-shm
+*.db-wal
+/tmp/
+
+# node (e2e only)
+node_modules/
+e2e/test-results/
+e2e/playwright-report/
+e2e/blob-report/
