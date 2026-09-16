@@ -1,0 +1,18 @@
+# Build output
+/mon-server
+/dist/
+*.test
+*.out
+
+# Local runtime data
+/data/
+*.db
+*.db-wal
+*.db-shm
+
+# Node, test-time only (see docs/agents/testing.md)
+node_modules/
+/e2e/test-results/
+/e2e/playwright-report/
+/e2e/blob-report/
+/e2e/.cache/

@@ -1,0 +1,12 @@
+{
+  "name": "3ax-mon-server-e2e",
+  "private": true,
+  "description": "Playwright end-to-end suite for mon-server, run against this repository's Docker image.",
+  "scripts": {
+    "test": "playwright test",
+    "report": "playwright show-report"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.49.1"
+  }
+}
