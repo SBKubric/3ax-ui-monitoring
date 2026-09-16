@@ -25,7 +25,6 @@ const (
 	clientID = "ams-1"
 	xray     = store.InboundKindXray
 	proxy    = store.PathProxy
-	direct   = store.PathDirect
 )
 
 // harness is one mon-server talking to one stub panel.
@@ -475,4 +474,19 @@ func equalInts(got, want []int) bool {
 		}
 	}
 	return true
+}
+
+// TestDispatchFitsThePollerSeam is a compile-time guarantee that the method
+// the wiring layer hands to the poll loop has exactly the shape
+// panel.PollOptions.Dispatch declares (spec §4 step 4), and that the recorder
+// and the panel client satisfy the two interfaces this package asks for.
+func TestDispatchFitsThePollerSeam(t *testing.T) {
+	h := newHarness(t)
+	var opts panel.PollOptions
+	opts.Dispatch = h.d.Dispatch
+	if opts.Dispatch == nil {
+		t.Fatal("the poller seam is nil")
+	}
+	var _ dispatch.Stats = h.rec
+	var _ dispatch.Panel = mustClient(t, h.stub, h.clk)
 }
