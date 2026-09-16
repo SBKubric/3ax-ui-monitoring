@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"sync"
 	"time"
 
@@ -80,6 +81,14 @@ type PollOptions struct {
 	// how many events it managed to send, which is the number the "panel back"
 	// message quotes (spec §4 step 4, §4.1).
 	Dispatch func(ctx context.Context) (sentEvents int, err error)
+
+	// NeedsRebuild reports that fresh probe material is wanted even though the
+	// panel's revision has not changed. mon-server's own state can make the
+	// stored configurations stale on its own: a mon-client approved between
+	// two revisions has none at all, and editing a mon-client's paths changes
+	// which targets it should be given. Nil means only a revision change
+	// triggers a refetch.
+	NeedsRebuild func(ctx context.Context) (bool, error)
 }
 
 // Poller runs the once-a-minute conversation with the panel of spec §4 and
@@ -98,10 +107,11 @@ type Poller struct {
 	log      *slog.Logger
 	interval time.Duration
 
-	snapshot  func(ctx context.Context) ([]MonClientSnapshot, error)
-	rebuild   func(ctx context.Context, cfgs map[string]ProbeConfigs) error
-	reconcile func(ctx context.Context, inbounds []Inbound, cfgs map[string]ProbeConfigs) error
-	dispatch  func(ctx context.Context) (int, error)
+	snapshot     func(ctx context.Context) ([]MonClientSnapshot, error)
+	rebuild      func(ctx context.Context, cfgs map[string]ProbeConfigs) error
+	reconcile    func(ctx context.Context, inbounds []Inbound, cfgs map[string]ProbeConfigs) error
+	dispatch     func(ctx context.Context) (int, error)
+	needsRebuild func(ctx context.Context) (bool, error)
 
 	// mu serialises cycles: Run and a manual PollOnce never overlap.
 	mu sync.Mutex
@@ -126,17 +136,18 @@ func NewPoller(opts PollOptions) (*Poller, error) {
 		return nil, fmt.Errorf("%w: store is nil", ErrInvalidOptions)
 	}
 	p := &Poller{
-		client:    opts.Client,
-		st:        opts.Store,
-		outbox:    opts.Outbox,
-		alertFn:   opts.Alert,
-		clock:     opts.Clock,
-		log:       opts.Log,
-		interval:  opts.Interval,
-		snapshot:  opts.Snapshot,
-		rebuild:   opts.Rebuild,
-		reconcile: opts.Reconcile,
-		dispatch:  opts.Dispatch,
+		client:       opts.Client,
+		st:           opts.Store,
+		outbox:       opts.Outbox,
+		alertFn:      opts.Alert,
+		clock:        opts.Clock,
+		log:          opts.Log,
+		interval:     opts.Interval,
+		snapshot:     opts.Snapshot,
+		rebuild:      opts.Rebuild,
+		reconcile:    opts.Reconcile,
+		dispatch:     opts.Dispatch,
+		needsRebuild: opts.NeedsRebuild,
 	}
 	if p.alertFn == nil {
 		p.alertFn = alert.Discard
@@ -250,8 +261,12 @@ func (p *Poller) cycle(ctx context.Context, ps *store.PanelState, settings store
 		}
 	}
 
-	// Step 3: a new revision means new probe material and a reconciliation.
-	if state.Revision != ps.LastRevision {
+	// Step 3: new probe material and a reconciliation. A changed panel revision
+	// is the usual trigger, but not the only one: a mon-client approved between
+	// two revisions has no configuration at all, and waiting for the panel to
+	// change something before building one would leave it probing nothing
+	// indefinitely.
+	if state.Revision != ps.LastRevision || p.rebuildWanted(ctx) {
 		if err := p.applyRevision(ctx, ps, state, settings); err != nil {
 			problems = append(problems, err)
 			if errors.Is(err, ErrUnavailable) {
@@ -322,9 +337,16 @@ func (p *Poller) fetchConfigs(ctx context.Context, ps *store.PanelState, state S
 	cfgs := map[string]ProbeConfigs{}
 	var problems []error
 
+	// Spec §9.4: realHost defaults to the host of the panel URL, which is
+	// where mon-server already reaches the real server. Without the default a
+	// fresh install that only filled in the panel address would never monitor
+	// the direct path at all.
 	realHost := settings.RealHost
 	if realHost == "" {
-		p.log.Warn("no real host configured, the direct path has no probe material")
+		realHost = HostOf(settings.PanelURL)
+	}
+	if realHost == "" {
+		p.log.Warn("no real host configured and none can be derived from the panel url, the direct path has no probe material")
 	} else {
 		direct, err := p.client.ProbeConfigs(ctx, realHost)
 		problems = append(problems, p.observe(ctx, ps, settings.PanelDownAfter, err))
@@ -580,4 +602,34 @@ func truncate(err error, n int) string {
 		return msg
 	}
 	return msg[:n]
+}
+
+// rebuildWanted asks the layer above whether it needs fresh probe material
+// even though the panel's revision has not moved. It is how a mon-client
+// approved between two revisions gets its first configuration.
+func (p *Poller) rebuildWanted(ctx context.Context) bool {
+	if p.needsRebuild == nil {
+		return false
+	}
+	wanted, err := p.needsRebuild(ctx)
+	if err != nil {
+		p.log.Error("cannot tell whether the configs need rebuilding", "err", err)
+		return false
+	}
+	return wanted
+}
+
+// HostOf returns the host of a URL without its port, or an empty string when
+// raw is not a URL with a host. It is exported because it is what supplies the
+// default for realHost (spec §9.4), so the admin UI can show the same value it
+// will actually be polled with.
+func HostOf(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return ""
+	}
+	return u.Hostname()
 }

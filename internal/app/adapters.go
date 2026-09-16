@@ -25,6 +25,17 @@ import (
 type registryPort struct {
 	reg *registry.Registry
 	cfg *clientcfg.Builder
+	// onRegistryChange is called after a change the panel cannot see but which
+	// makes a stored configuration wrong: a newly approved mon-client has none,
+	// and an edited set of paths changes which targets one should be given.
+	onRegistryChange func()
+}
+
+// changed reports a registry change to the poll loop, if anyone is listening.
+func (p registryPort) changed() {
+	if p.onRegistryChange != nil {
+		p.onRegistryChange()
+	}
 }
 
 // PendingRequests implements admin.Registry.
@@ -95,6 +106,9 @@ func (p registryPort) Approve(ctx context.Context, a admin.Approval) (admin.Clie
 	if err != nil {
 		return admin.Client{}, adminError(err)
 	}
+	// An approved mon-client has no configuration document yet, and the panel
+	// revision it would be built from has not changed. Ask for one now.
+	p.changed()
 	return p.client(ctx, row), nil
 }
 
@@ -118,7 +132,13 @@ func (p registryPort) Clients(ctx context.Context) ([]admin.Client, error) {
 
 // UpdateClient implements admin.Registry.
 func (p registryPort) UpdateClient(ctx context.Context, id string, e admin.ClientEdit) error {
-	return adminError(p.reg.Update(ctx, id, e.Name, e.Region, e.Paths))
+	if err := adminError(p.reg.Update(ctx, id, e.Name, e.Region, e.Paths)); err != nil {
+		return err
+	}
+	// Paths decide which targets this mon-client is given, so its document is
+	// now wrong (spec §5).
+	p.changed()
+	return nil
 }
 
 // SetClientEnabled implements admin.Registry.

@@ -42,7 +42,7 @@ make image                 # Docker-образ 3ax-mon-server:<version>
 mon-server run [-config <path>] [-log-level debug|info|warn|error]
 ```
 
-В образе уже выставлены `MON_DATA_DIR=/var/lib/mon-server` (том) и `MON_LISTEN=:443`, `EXPOSE 443`, команда по умолчанию — `run`. Живость проверяется без авторизации: `GET https://<publicIp>/healthz` → `200`.
+Образ существует прежде всего как объект тестирования для e2e-набора ([docs/agents/testing.md](docs/agents/testing.md): прогон идёт против образа этого репозитория) и как удобный способ запустить сервис; готовой поставкой он не считается — см. про упаковку ниже. В образе уже выставлены `MON_DATA_DIR=/var/lib/mon-server` (том) и `MON_LISTEN=:443`, `EXPOSE 443`, команда по умолчанию — `run`. Живость проверяется без авторизации: `GET https://<publicIp>/healthz` → `200`.
 
 ### Bootstrap-конфиг
 

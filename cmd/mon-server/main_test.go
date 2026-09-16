@@ -232,7 +232,20 @@ func TestAdminSetRefusesBadInput(t *testing.T) {
 }
 
 func TestServeOpensTheStoreAndStopsWithTheContext(t *testing.T) {
-	cfg := config.Config{Listen: ":8443", PublicIP: "203.0.113.10", DataDir: filepath.Join(t.TempDir(), "data"), TLS: config.TLS{Mode: config.TLSModeACMEIP}}
+	// Loopback on a free port with a self-signed pair: the default acme-ip mode
+	// would have `run` ask Let's Encrypt for a certificate as soon as it served,
+	// and a fixed port fails wherever one is already in use.
+	dir := t.TempDir()
+	certFile, keyFile, err := tlstest.WritePair(dir, "localhost", "127.0.0.1")
+	if err != nil {
+		t.Fatalf("write certificate: %v", err)
+	}
+	cfg := config.Config{
+		Listen:   "127.0.0.1:0",
+		PublicIP: "203.0.113.10",
+		DataDir:  filepath.Join(dir, "data"),
+		TLS:      config.TLS{Mode: config.TLSModeFiles, Cert: certFile, Key: keyFile},
+	}
 	log := newLogger(&bytes.Buffer{}, 0)
 
 	ctx, cancel := context.WithCancel(context.Background())

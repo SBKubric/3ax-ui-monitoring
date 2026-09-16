@@ -186,9 +186,19 @@ func TestSubmitCountsOnlyLiveRequestsAgainstTheGlobalLimit(t *testing.T) {
 	for i := range MaxPendingTotal {
 		submit(t, reg, fmt.Sprintf("203.0.113.%d", i), "7K3F9Q")
 	}
-	// Every one of them times out, so the queue is empty again.
-	fake.Advance(RequestTTL + time.Second)
 
+	// The queue is full, so a fresh address is refused. Without this the test
+	// would pass even if the global limit were never enforced at all.
+	_, err := reg.Submit(context.Background(), SubmitRequest{
+		PairingCode: "7K3F9Q", Hostname: "vps-full", Version: "0.1.0", RemoteIP: "198.51.100.1",
+	})
+	if !errors.Is(err, ErrRateLimited) || !errors.Is(err, ErrTooManyPendingGlobal) {
+		t.Fatalf("submit with the queue full = %v, want the global pending limit", err)
+	}
+
+	// Every one of them times out, so the queue is empty again and the same
+	// address gets in.
+	fake.Advance(RequestTTL + time.Second)
 	submit(t, reg, "198.51.100.1", "7K3F9Q")
 }
 

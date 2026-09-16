@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/SBKubric/3ax-ui-monitoring/internal/admin"
@@ -88,6 +89,16 @@ type App struct {
 	poller      *panel.Poller
 	pollerURL   string
 	pollerToken string
+
+	// pollNow asks the poll loop to run a cycle at once instead of waiting for
+	// the next minute. Approving a mon-client or changing its paths should
+	// take effect immediately, not on the next tick.
+	pollNow chan struct{}
+	// rebuildWanted records that mon-server's own state made the stored
+	// configurations stale, so the next cycle must refetch the probe material
+	// even though the panel's revision has not moved. It is cleared once a
+	// rebuild has actually run.
+	rebuildWanted atomic.Bool
 }
 
 // New opens the database and builds every component. It performs no network
@@ -110,6 +121,7 @@ func New(o Options) (*App, error) {
 		log:        o.Log,
 		clk:        o.Clock,
 		httpClient: &http.Client{Timeout: panel.DefaultTimeout},
+		pollNow:    make(chan struct{}, 1),
 	}
 
 	st, err := store.Open(o.Config.DBPath(), o.Log, store.WithClock(o.Clock))
@@ -182,7 +194,7 @@ func (a *App) newAdmin() (*admin.Server, error) {
 	notAfter := a.certificateNotAfter()
 	return admin.New(admin.Options{
 		Store:    a.store,
-		Registry: registryPort{reg: a.registry, cfg: a.configs},
+		Registry: registryPort{reg: a.registry, cfg: a.configs, onRegistryChange: a.requestRebuild},
 		Panel:    panelCheckPort{httpClient: a.httpClient, clock: a.clk, log: a.log},
 		Telegram: telegramPort{httpClient: a.httpClient, log: a.log},
 		Configs:  rebuildPort{cfg: a.configs, log: a.log},
@@ -348,8 +360,59 @@ func (a *App) runPanelPoll(ctx context.Context) {
 			return
 		case <-ticker.C:
 			a.pollOnce(ctx)
+		case <-a.pollNow:
+			a.pollOnce(ctx)
 		}
 	}
+}
+
+// requestRebuild marks the stored configurations stale and wakes the poll loop.
+// It is called when the registry changes in a way the panel cannot see: a
+// mon-client approved between two panel revisions has no configuration at all,
+// and one whose paths were edited has the wrong one.
+func (a *App) requestRebuild() {
+	a.rebuildWanted.Store(true)
+	select {
+	case a.pollNow <- struct{}{}:
+	default: // a cycle is already queued, which is all this needs
+	}
+}
+
+// needsRebuild is the poller's seam for "refetch even though the revision has
+// not moved". It answers yes when something asked for it, and also whenever an
+// enabled mon-client has no configuration document: that condition is derived
+// from the database rather than remembered, so it survives a restart.
+func (a *App) needsRebuild(ctx context.Context) (bool, error) {
+	if a.rebuildWanted.Load() {
+		return true, nil
+	}
+	var missing int64
+	err := a.store.DB().WithContext(ctx).
+		Model(&store.MonClient{}).
+		Where("enabled = ?", true).
+		Where("id NOT IN (?)", a.store.DB().Model(&store.ClientConfig{}).Select("mon_client_id")).
+		Count(&missing).Error
+	if err != nil {
+		return false, fmt.Errorf("app: count mon-clients without a config: %w", err)
+	}
+	return missing > 0, nil
+}
+
+// snapshot is the registry snapshot POST /probe/ensure carries, capped at the
+// contract's limit. Over it the panel refuses the whole request, which would
+// stop the probe accounts being maintained at all, so a too-large registry
+// loses its tail with a loud log rather than losing the call.
+func (a *App) snapshot(ctx context.Context) ([]panel.MonClientSnapshot, error) {
+	all, err := a.registry.Snapshot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if len(all) <= panel.MaxMonClients {
+		return all, nil
+	}
+	a.log.Error("the registry is larger than the panel contract allows, the snapshot is truncated",
+		"mon_clients", len(all), "limit", panel.MaxMonClients)
+	return all[:panel.MaxMonClients], nil
 }
 
 // pollOnce runs one cycle against the panel currently configured.
@@ -400,16 +463,17 @@ func (a *App) currentPoller() (*panel.Poller, error) {
 	}
 
 	poller, err := panel.NewPoller(panel.PollOptions{
-		Client:    client,
-		Store:     a.store,
-		Outbox:    events.New(a.store, a.alert),
-		Alert:     a.alert,
-		Clock:     a.clk,
-		Log:       a.log,
-		Snapshot:  a.registry.Snapshot,
-		Rebuild:   a.rebuildConfigs,
-		Reconcile: a.reconcileTargets,
-		Dispatch:  dispatcher.Dispatch,
+		Client:       client,
+		Store:        a.store,
+		Outbox:       events.New(a.store, a.alert),
+		Alert:        a.alert,
+		Clock:        a.clk,
+		Log:          a.log,
+		Snapshot:     a.snapshot,
+		Rebuild:      a.rebuildConfigs,
+		Reconcile:    a.reconcileTargets,
+		Dispatch:     dispatcher.Dispatch,
+		NeedsRebuild: a.needsRebuild,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("app: poller: %w", err)
@@ -430,6 +494,9 @@ func (a *App) rebuildConfigs(ctx context.Context, cfgs map[string]panel.ProbeCon
 	if err != nil {
 		return err
 	}
+	// Cleared only now: a cycle that failed before reaching this point must
+	// leave the request standing so the next one still refetches.
+	a.rebuildWanted.Store(false)
 	changed := 0
 	for _, r := range results {
 		if r.Changed {

@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -250,5 +251,154 @@ func saveSettingsFull(t *testing.T, st *store.Store, panelURL, monToken, realHos
 	settings.RealHost = realHost
 	if err := st.SaveSettings(settings); err != nil {
 		t.Fatalf("save settings: %v", err)
+	}
+}
+
+// TestAMonClientApprovedBetweenRevisionsGetsAConfig is the regression test for
+// the worst bug the review found: probe material was refetched only when the
+// panel's revision changed, so a mon-client approved at any other moment had
+// no configuration document, no target rows, and every heartbeat result it
+// sent was silently discarded — indefinitely, since the panel had no reason to
+// change anything.
+func TestAMonClientApprovedBetweenRevisionsGetsAConfig(t *testing.T) {
+	a, _ := newApp(t)
+
+	stub := paneltest.NewStub(t)
+	stub.SetToken("monitoring-token")
+	stub.SetInbounds(
+		panel.Inbound{Kind: panel.InboundKindXray, InboundID: 12, Protocol: "vless", Port: 443, Enable: true},
+	)
+	saveSettingsFull(t, a.store, stub.URL(), "monitoring-token", "203.0.113.10")
+
+	ctx := context.Background()
+
+	// A first cycle, with an empty registry: the revision is recorded.
+	if err := a.pollOnceErr(ctx); err != nil {
+		t.Fatalf("first cycle: %v", err)
+	}
+	before, err := a.store.PanelState()
+	if err != nil {
+		t.Fatalf("panel state: %v", err)
+	}
+	if before.LastRevision == "" {
+		t.Fatal("the first cycle recorded no revision")
+	}
+
+	// Now a mon-client is approved. The panel has changed nothing.
+	mc := store.MonClient{ID: "ams-1", Name: "Amsterdam #1", Region: "NL", Enabled: true, State: store.ClientStateNever}
+	if err := a.store.DB().Create(&mc).Error; err != nil {
+		t.Fatalf("create mon-client: %v", err)
+	}
+
+	wanted, err := a.needsRebuild(ctx)
+	if err != nil {
+		t.Fatalf("needsRebuild: %v", err)
+	}
+	if !wanted {
+		t.Fatal("a mon-client with no configuration did not ask for a rebuild")
+	}
+
+	if err := a.pollOnceErr(ctx); err != nil {
+		t.Fatalf("second cycle: %v", err)
+	}
+
+	document, revision, err := a.configs.Document(ctx, "ams-1")
+	if err != nil {
+		t.Fatalf("the mon-client still has no configuration: %v", err)
+	}
+	if revision == "" || len(document) == 0 {
+		t.Fatalf("empty configuration: revision %q, %d bytes", revision, len(document))
+	}
+
+	// And its targets exist, or every result it reports would be discarded.
+	var targets int64
+	if err := a.store.DB().Model(&store.Target{}).Where("mon_client_id = ?", "ams-1").Count(&targets).Error; err != nil {
+		t.Fatalf("count targets: %v", err)
+	}
+	if targets == 0 {
+		t.Error("the mon-client has no target rows, so its heartbeats would be discarded")
+	}
+
+	// The panel's revision never moved; this was mon-server's own doing.
+	after, err := a.store.PanelState()
+	if err != nil {
+		t.Fatalf("panel state: %v", err)
+	}
+	if after.LastRevision != before.LastRevision {
+		t.Errorf("the panel revision changed (%q → %q); the test no longer proves what it claims",
+			before.LastRevision, after.LastRevision)
+	}
+
+	// With everything built, nothing asks for another rebuild.
+	wanted, err = a.needsRebuild(ctx)
+	if err != nil {
+		t.Fatalf("needsRebuild: %v", err)
+	}
+	if wanted {
+		t.Error("a rebuild is still wanted after every mon-client has a configuration, so every cycle would refetch")
+	}
+}
+
+// TestRequestRebuildIsHonouredAndCleared: an explicit request survives until a
+// rebuild actually runs, so a cycle that fails first does not swallow it.
+func TestRequestRebuildIsHonouredAndCleared(t *testing.T) {
+	a, _ := newApp(t)
+	ctx := context.Background()
+
+	if wanted, err := a.needsRebuild(ctx); err != nil || wanted {
+		t.Fatalf("a fresh app wants a rebuild: %v, %v", wanted, err)
+	}
+
+	a.requestRebuild()
+	if wanted, err := a.needsRebuild(ctx); err != nil || !wanted {
+		t.Fatalf("an explicit request was not honoured: %v, %v", wanted, err)
+	}
+	// Still wanted: nothing has rebuilt anything yet.
+	if wanted, _ := a.needsRebuild(ctx); !wanted {
+		t.Error("the request was consumed by merely being read, so a failed cycle would lose it")
+	}
+
+	// The loop is woken, and a second request does not block on the full channel.
+	select {
+	case <-a.pollNow:
+	default:
+		t.Error("the poll loop was not woken")
+	}
+	a.requestRebuild()
+	a.requestRebuild()
+
+	if err := a.rebuildConfigs(ctx, nil); err != nil {
+		t.Fatalf("rebuildConfigs: %v", err)
+	}
+	if wanted, err := a.needsRebuild(ctx); err != nil || wanted {
+		t.Errorf("the request survived a completed rebuild: %v, %v", wanted, err)
+	}
+}
+
+// TestSnapshotIsCappedAtTheContractLimit: over the limit the panel refuses the
+// whole request, which would stop the probe accounts being maintained at all.
+// Losing the tail of a very large registry is the lesser harm.
+func TestSnapshotIsCappedAtTheContractLimit(t *testing.T) {
+	a, _ := newApp(t)
+
+	for i := range panel.MaxMonClients + 5 {
+		mc := store.MonClient{
+			ID:      fmt.Sprintf("box-%03d", i),
+			Name:    fmt.Sprintf("Box %d", i),
+			Region:  "NL",
+			Enabled: true,
+			State:   store.ClientStateNever,
+		}
+		if err := a.store.DB().Create(&mc).Error; err != nil {
+			t.Fatalf("create mon-client %d: %v", i, err)
+		}
+	}
+
+	snapshot, err := a.snapshot(context.Background())
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	if len(snapshot) != panel.MaxMonClients {
+		t.Errorf("snapshot carries %d mon-clients, want the contract limit of %d", len(snapshot), panel.MaxMonClients)
 	}
 }

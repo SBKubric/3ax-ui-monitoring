@@ -428,7 +428,10 @@ func TestPollOnceDiscardsStaleProbeMaterial(t *testing.T) {
 	}
 }
 
-func TestPollOnceWithoutARealHostHasNoDirectMaterial(t *testing.T) {
+// Spec §9.4: realHost defaults to the host of the panel URL. A fresh install
+// that filled in only the panel address must still monitor the direct path,
+// because that address is where mon-server already reaches the real server.
+func TestPollOnceDefaultsTheRealHostToThePanelHost(t *testing.T) {
 	h := newPollHarness(t)
 	settings, err := h.st.Settings()
 	if err != nil {
@@ -438,21 +441,81 @@ func TestPollOnceWithoutARealHostHasNoDirectMaterial(t *testing.T) {
 	if err := h.st.SaveSettings(settings); err != nil {
 		t.Fatalf("save settings: %v", err)
 	}
+	wantHost := panel.HostOf(settings.PanelURL)
+	if wantHost == "" {
+		t.Fatalf("the harness panel url %q has no host to derive from", settings.PanelURL)
+	}
 
 	if err := h.poller.PollOnce(t.Context()); err != nil {
 		t.Fatalf("PollOnce: %v", err)
 	}
-	if n := h.stub.Count(paneltest.ProbeConfigs); n != 0 {
-		t.Errorf("read the probe material %d times, want none without a real host", n)
+
+	var directHosts []string
+	for _, req := range h.stub.Requests() {
+		if req.Endpoint == paneltest.ProbeConfigs {
+			if host := req.Query.Get("host"); host != "" {
+				directHosts = append(directHosts, host)
+			}
+		}
 	}
-	if rebuilds, _, _ := h.calls(); rebuilds != 0 {
-		t.Errorf("rebuilt %d times, want none", rebuilds)
+	if len(directHosts) != 1 || directHosts[0] != wantHost {
+		t.Errorf("direct material was read for hosts %v, want exactly [%s]", directHosts, wantHost)
 	}
-	if ps := h.panelState(t); ps.LastRevision != "" {
-		t.Errorf("lastRevision = %q, want it unset until the material is read", ps.LastRevision)
+	if rebuilds, _, _ := h.calls(); rebuilds != 1 {
+		t.Errorf("rebuilt %d times, want once", rebuilds)
 	}
-	if !strings.Contains(h.logs.String(), "no real host configured") {
-		t.Errorf("logs = %q, want the missing host logged", h.logs.String())
+	if ps := h.panelState(t); ps.LastRevision != paneltest.DefaultRevision {
+		t.Errorf("lastRevision = %q, want it recorded", ps.LastRevision)
+	}
+}
+
+// An explicit realHost still wins over the derived one: the real server's
+// address is not always the address the panel is reached at.
+func TestPollOnceExplicitRealHostWinsOverThePanelHost(t *testing.T) {
+	h := newPollHarness(t)
+	settings, err := h.st.Settings()
+	if err != nil {
+		t.Fatalf("settings: %v", err)
+	}
+	settings.RealHost = "203.0.113.10"
+	if err := h.st.SaveSettings(settings); err != nil {
+		t.Fatalf("save settings: %v", err)
+	}
+
+	if err := h.poller.PollOnce(t.Context()); err != nil {
+		t.Fatalf("PollOnce: %v", err)
+	}
+
+	for _, req := range h.stub.Requests() {
+		if req.Endpoint == paneltest.ProbeConfigs {
+			if host := req.Query.Get("host"); host != "" && host != "203.0.113.10" {
+				t.Errorf("direct material was read for %q, want the configured 203.0.113.10", host)
+			}
+		}
+	}
+}
+
+// hostOf is what supplies the default, so pin its edges here rather than
+// inferring them from a poll cycle.
+func TestHostOf(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{name: "empty", in: "", want: ""},
+		{name: "host only", in: "https://panel.example.net/", want: "panel.example.net"},
+		{name: "port is dropped", in: "https://panel.example.net:2053/xyz/", want: "panel.example.net"},
+		{name: "address", in: "https://203.0.113.10:2053/", want: "203.0.113.10"},
+		{name: "ipv6 is unbracketed", in: "https://[2001:db8::1]:2053/", want: "2001:db8::1"},
+		{name: "not a url", in: "panel.example.net", want: ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := panel.HostOf(tc.in); got != tc.want {
+				t.Errorf("panel.HostOf(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
 	}
 }
 
