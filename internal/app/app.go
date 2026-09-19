@@ -21,6 +21,7 @@ import (
 	"github.com/SBKubric/3ax-ui-monitoring/internal/clock"
 	"github.com/SBKubric/3ax-ui-monitoring/internal/config"
 	"github.com/SBKubric/3ax-ui-monitoring/internal/panel"
+	"github.com/SBKubric/3ax-ui-monitoring/internal/registry"
 	"github.com/SBKubric/3ax-ui-monitoring/internal/store"
 	"github.com/SBKubric/3ax-ui-monitoring/internal/tg"
 	"github.com/SBKubric/3ax-ui-monitoring/internal/tlsx"
@@ -71,6 +72,10 @@ type App struct {
 	server *api.Server
 	http   *http.Server
 	mgr    *tlsx.Manager
+
+	// registry is step 4's registration desk and mon-client directory,
+	// exposed through Registry() so later steps can wire their hooks.
+	registry *registry.Registry
 
 	// ctx/cancel is App's own lifetime context, independent of whatever
 	// signal-driven ctx a caller passes to Run: it exists purely so
@@ -153,6 +158,13 @@ func newApp(d Deps, readTimeout, writeTimeout time.Duration) (*App, error) {
 		Notifier: d.Notifier,
 	})
 
+	// Step 4's registration desk: mounted here (not inside api.New) because
+	// it needs the store and clock this function already has in hand, and
+	// because api.New must stay usable on its own in api's own tests
+	// without a store.
+	reg := registry.New(d.Store, d.Clock)
+	api.RegisterRoutes(srv.V1, reg)
+
 	httpSrv := &http.Server{
 		Handler:   srv.Engine,
 		TLSConfig: tlsCfg,
@@ -181,6 +193,7 @@ func newApp(d Deps, readTimeout, writeTimeout time.Duration) (*App, error) {
 		http:       httpSrv,
 		mgr:        mgr,
 		poller:     poller,
+		registry:   reg,
 		ctx:        ctx,
 		cancel:     cancel,
 		lnCh:       make(chan net.Listener, 1),
@@ -356,4 +369,12 @@ func (a *App) Poller() *panel.Poller {
 // its whole internal http.Server.
 func (a *App) Server() *api.Server {
 	return a.server
+}
+
+// Registry exposes the registration desk / mon-client directory so later
+// steps (the state engine, the admin UI) can call into it — Approve,
+// Revoke, SetHooks and the rest of internal/registry's exported surface —
+// without App growing a method per registry operation.
+func (a *App) Registry() *registry.Registry {
+	return a.registry
 }

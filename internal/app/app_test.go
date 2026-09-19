@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -459,5 +460,34 @@ func TestShutdown_AbandonsAHungPollerWhenItsCtxExpires(t *testing.T) {
 	}
 	if a.pollStopped.Load() {
 		t.Fatal("the poll loop is reported stopped, but its notifier is still blocked — the test's own premise is broken")
+	}
+}
+
+// TestRegistry_WiredIntoServer checks step 4's wiring: New builds a
+// non-nil Registry, exposed through App.Registry, and the same instance
+// backs the POST /v1/register route New mounted on Server().V1 — a real
+// registration request over the App's own TLS listener gets the protocol's
+// 202, not the JSON error envelope's "no such route".
+func TestRegistry_WiredIntoServer(t *testing.T) {
+	a, clientTLS := newTestApp(t)
+	if a.Registry() == nil {
+		t.Fatal("Registry() = nil, want a constructed *registry.Registry")
+	}
+
+	addr, err := a.Start()
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	client := &http.Client{Transport: &http.Transport{TLSClientConfig: clientTLS}}
+	body := bytes.NewBufferString(`{"pairingCode":"ABCDEF","hostname":"h","version":"0.1.0","publicIp":"203.0.113.5"}`)
+	resp, err := client.Post("https://"+addr+"/v1/register", "application/json", body)
+	if err != nil {
+		t.Fatalf("POST /v1/register: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202", resp.StatusCode)
 	}
 }
