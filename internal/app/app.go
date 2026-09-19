@@ -13,11 +13,14 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/SBKubric/3ax-ui-monitoring/internal/api"
 	"github.com/SBKubric/3ax-ui-monitoring/internal/clock"
 	"github.com/SBKubric/3ax-ui-monitoring/internal/config"
+	"github.com/SBKubric/3ax-ui-monitoring/internal/panel"
 	"github.com/SBKubric/3ax-ui-monitoring/internal/store"
 	"github.com/SBKubric/3ax-ui-monitoring/internal/tg"
 	"github.com/SBKubric/3ax-ui-monitoring/internal/tlsx"
@@ -96,6 +99,15 @@ type App struct {
 	// when nothing is listening (the common case: Shutdown was the cause,
 	// and Run has already moved on to its own shutdown sequence).
 	serveErrCh chan error
+
+	poller *panel.Poller
+
+	// pollCancel stops the poll loop; pollWG is how Shutdown joins it, so
+	// that a process (or a -race test) never outlives its own goroutine.
+	// pollStopped is only there for tests to observe the join.
+	pollCancel  context.CancelFunc
+	pollWG      sync.WaitGroup
+	pollStopped atomic.Bool
 }
 
 // New builds an App from cfg and deps: the TLS config and (for "acme-ip") a
@@ -129,6 +141,18 @@ func newApp(d Deps, readTimeout, writeTimeout time.Duration) (*App, error) {
 
 	srv := api.New()
 
+	// The poll cycle needs nothing but the store, the clock and the
+	// notifier to start: it reads the panel URL and token from settings
+	// every minute, so a mon-server that has not been configured yet comes
+	// up and starts polling the moment an operator fills the settings page
+	// in (spec §4). Snapshot/Configs/Inbounds/Stats stay nil until the
+	// steps that implement them wire themselves in through Poller().
+	poller := panel.NewPoller(panel.PollerDeps{
+		Store:    d.Store,
+		Clock:    d.Clock,
+		Notifier: d.Notifier,
+	})
+
 	httpSrv := &http.Server{
 		Handler:   srv.Engine,
 		TLSConfig: tlsCfg,
@@ -156,6 +180,7 @@ func newApp(d Deps, readTimeout, writeTimeout time.Duration) (*App, error) {
 		server:     srv,
 		http:       httpSrv,
 		mgr:        mgr,
+		poller:     poller,
 		ctx:        ctx,
 		cancel:     cancel,
 		lnCh:       make(chan net.Listener, 1),
@@ -195,6 +220,15 @@ func (a *App) Start() (addr string, err error) {
 		return "", fmt.Errorf("app: manage tls: %w", err)
 	}
 
+	pollCtx, cancel := context.WithCancel(context.Background())
+	a.pollCancel = cancel
+	a.pollWG.Add(1)
+	go func() {
+		defer a.pollWG.Done()
+		defer a.pollStopped.Store(true)
+		a.poller.Run(pollCtx)
+	}()
+
 	go func() {
 		// cert/key args are empty because TLSConfig already carries the
 		// certificate (via Certificates for "files", via GetCertificate for
@@ -210,19 +244,45 @@ func (a *App) Start() (addr string, err error) {
 	return addr, nil
 }
 
-// Shutdown stops the listener from accepting new connections and waits for
+// Shutdown stops the listener from accepting new connections, waits for
 // handlers already in flight to finish, up to ctx's deadline (spec §2:
-// "graceful shutdown: дождаться текущих обработчиков"). Buffers in SQLite
-// are already durable by the time a handler returns, so there is nothing
-// else for the HTTP half of shutdown to flush. After the HTTP server has
-// finished shutting down, it cancels App's own lifetime context (stopping
-// any in-flight certmagic retries mgr.Manage queued) and stops mgr's cache
-// maintenance goroutine, so a full Shutdown leaves nothing running under
-// -race.
+// "graceful shutdown: дождаться текущих обработчиков"), and joins the panel
+// poll loop. Buffers in SQLite are already durable by the time a handler
+// returns, so there is nothing else for shutdown to flush; the join is
+// about not leaving a goroutine writing to the database after the process
+// believes it has stopped. After the HTTP server has finished shutting
+// down, it cancels App's own lifetime context (stopping any in-flight
+// certmagic retries mgr.Manage queued) and stops mgr's cache maintenance
+// goroutine, so a full Shutdown leaves nothing running under -race. It is
+// safe to call twice, which is what lets a test register it in t.Cleanup
+// and still call it explicitly.
+//
+// Joining the poll loop is itself bounded by ctx: the poller's own
+// pollCycleDeadline keeps one cycle from running forever, but that deadline
+// (minutes) can still be far longer than the caller's shutdown ctx
+// (cmd/mon-server gives it a fixed grace period). Waiting unboundedly here
+// would mean a single hung cycle can keep the whole process from ever
+// exiting. If ctx expires first, Shutdown returns anyway and logs that the
+// poller was abandoned; the goroutine finishes on its own once the cycle it
+// is in actually returns; it does not stay stuck, its cleanup is only late.
 func (a *App) Shutdown(ctx context.Context) error {
+	if a.pollCancel != nil {
+		a.pollCancel()
+	}
 	err := a.http.Shutdown(ctx)
 	a.cancel()
 	a.mgr.Stop()
+
+	joined := make(chan struct{})
+	go func() {
+		a.pollWG.Wait()
+		close(joined)
+	}()
+	select {
+	case <-joined:
+	case <-ctx.Done():
+		slog.Warn("app: shutdown context expired before the panel poll loop stopped; abandoning it")
+	}
 	return err
 }
 
@@ -279,6 +339,15 @@ func (a *App) Run(ctx context.Context) error {
 	}
 	slog.Info("shutdown complete")
 	return runErr
+}
+
+// Poller exposes the panel poll loop so later steps can wire their
+// collaborators into it — the registry as the snapshot source and config
+// builder (steps 4 and 5), the state engine as the inbound sink and stats
+// flusher (steps 6 and 7) — and so the state machine can ask PanelDown()
+// who should send a transition to Telegram (spec §4.1).
+func (a *App) Poller() *panel.Poller {
+	return a.poller
 }
 
 // Server exposes the underlying api.Server so later steps' tests (and this

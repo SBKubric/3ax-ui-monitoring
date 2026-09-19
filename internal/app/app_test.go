@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"github.com/SBKubric/3ax-ui-monitoring/internal/panel/paneltest"
 	"io"
 	"net"
 	"net/http"
@@ -344,5 +345,119 @@ func TestApp_ReadTimeoutClosesStalledBody(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > 1500*time.Millisecond {
 		t.Fatalf("round trip with a stalled body took %v, want well under 1.5s (readTimeout=%v)", elapsed, shortReadTimeout)
+	}
+}
+
+// TestShutdown_JoinsThePanelPoller checks that the panel poll loop (spec §4)
+// is started by Start and actually joined by Shutdown: a goroutine still
+// running after Shutdown returned would keep writing to a database the
+// process believes it has closed, and would show up as a leak under -race.
+func TestShutdown_JoinsThePanelPoller(t *testing.T) {
+	a, _ := newTestApp(t)
+
+	if a.Poller() == nil {
+		t.Fatal("New did not wire a panel poller")
+	}
+	if _, err := a.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := a.Shutdown(ctx); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	if !a.pollStopped.Load() {
+		t.Fatal("Shutdown returned while the panel poll loop was still running")
+	}
+	if a.Poller().PanelDown() {
+		t.Fatal("an unconfigured mon-server must not start out in PANEL_DOWN")
+	}
+}
+
+// hangingNotifier is a tg.Notifier that ignores ctx entirely and blocks
+// until released — standing in for a collaborator that does not honour
+// cancellation as diligently as the panel HTTPClient does (plausible for the
+// real Telegram client's own HTTP call, step 9's problem to get right, not
+// this one's). It is what makes TestShutdown_AbandonsAHungPollerWhenItsCtxExpires
+// a genuine reproduction: the panel HTTPClient's request-scoped cancellation
+// alone cannot be relied on to unstick every cycle promptly.
+type hangingNotifier struct{ release chan struct{} }
+
+func (h *hangingNotifier) Send(context.Context, string) error {
+	<-h.release
+	return nil
+}
+
+// TestShutdown_AbandonsAHungPollerWhenItsCtxExpires checks the self-check
+// finding on Shutdown's other lifecycle point: joining the panel poll loop
+// must be bounded by Shutdown's own ctx, not by however long the poller
+// actually takes to return. A cycle stuck inside a collaborator that does
+// not honour ctx cancellation must not be able to keep Shutdown from ever
+// returning — it comes back once its own ctx expires, having abandoned the
+// still-running poller rather than waited on it forever. Without the bound
+// this reproduces the old bug: Shutdown would hang until the notifier is
+// released, however long that takes.
+func TestShutdown_AbandonsAHungPollerWhenItsCtxExpires(t *testing.T) {
+	dir := t.TempDir()
+	certPath, keyPath := tlsxtest.WriteSelfSigned(t, dir)
+	st, err := store.Open(filepath.Join(dir, "t.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+
+	notifier := &hangingNotifier{release: make(chan struct{})}
+
+	cfg := &config.Config{
+		Listen:  "127.0.0.1:0",
+		DataDir: dir,
+		TLS:     config.TLSConfig{Mode: config.TLSModeFiles, Cert: certPath, Key: keyPath},
+	}
+	a, err := New(Deps{Cfg: cfg, Store: st, Clock: clock.Real{}, Notifier: notifier})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = a.Shutdown(ctx)
+	})
+	// Registered after the Shutdown cleanup above, so t.Cleanup's LIFO order
+	// runs this first: unblock the notifier before that final Shutdown call
+	// has to abandon it a second time, so the goroutine this test
+	// intentionally stalls does not leak into the rest of the test binary's
+	// life.
+	t.Cleanup(func() { close(notifier.release) })
+
+	stub := paneltest.NewStub(t)
+	stub.SetMonEnabled(false) // bare 404 on every request (contract §2)
+
+	set := store.DefaultSettings()
+	set.PanelURL = stub.URL()
+	set.MonToken = stub.Token()
+	if err := st.SaveSettings(set); err != nil {
+		t.Fatalf("SaveSettings: %v", err)
+	}
+
+	if _, err := a.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	// The first cycle runs immediately (no minute-long wait needed): the
+	// bare 404 fires notifyRejected on its very first Poll, which is where
+	// the poll loop is now stuck inside notifier.Send.
+	time.Sleep(150 * time.Millisecond)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	if err := a.Shutdown(ctx); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("Shutdown took %v, want to return once its own ctx expired rather than wait forever on the stuck notifier", elapsed)
+	}
+	if a.pollStopped.Load() {
+		t.Fatal("the poll loop is reported stopped, but its notifier is still blocked — the test's own premise is broken")
 	}
 }
