@@ -8,18 +8,25 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"golang.org/x/term"
 
+	"github.com/SBKubric/3ax-ui-monitoring/internal/app"
+	"github.com/SBKubric/3ax-ui-monitoring/internal/clock"
 	"github.com/SBKubric/3ax-ui-monitoring/internal/config"
 	"github.com/SBKubric/3ax-ui-monitoring/internal/store"
+	"github.com/SBKubric/3ax-ui-monitoring/internal/tg"
 )
 
 // defaultConfigPath is the bootstrap file spec §2 names; overridable with
@@ -36,6 +43,17 @@ const envAdminPassword = "MON_ADMIN_PASSWORD"
 // os.Args or a real terminal. It returns the process exit code; main's only
 // job is to pass that to os.Exit.
 func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	return runCtx(context.Background(), args, stdin, stdout, stderr, nil)
+}
+
+// runCtx is run's real body: ctx and onListen exist purely so this
+// package's own tests can drive `run` (specifically its "run" subcommand)
+// deterministically — cancelling ctx directly instead of racing a real
+// OS signal against a freshly-picked port, and learning the bound address
+// via onListen instead of having to know it in advance. run always passes
+// context.Background() and a nil onListen; only the "run" subcommand (via
+// runRun) makes use of either.
+func runCtx(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer, onListen func(addr string)) int {
 	if len(args) == 0 {
 		fmt.Fprintln(stderr, usage())
 		return 2
@@ -43,7 +61,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 
 	switch args[0] {
 	case "run":
-		return runRun(args[1:], stderr)
+		return runRun(ctx, args[1:], stderr, onListen)
 	case "admin":
 		return runAdmin(args[1:], stdin, stdout, stderr)
 	case "version":
@@ -85,12 +103,24 @@ func configFlagSet(fs *flag.FlagSet) bool {
 	return explicit
 }
 
-// runRun loads and validates the bootstrap config, opens the store, and then
-// stops: the listener does not exist until step 2 (TLS) and internal/app
-// (wiring) land. Returning a clear, named error here instead of silently
-// exiting 0 is deliberate — anyone running `mon-server run` today gets an
-// honest "not built yet" instead of a process that appears to hang.
-func runRun(args []string, stderr io.Writer) int {
+// runRun loads and validates the bootstrap config, opens the store, wires up
+// the App (internal/app: TLS, the gin engine, the HTTPS listener) and runs
+// it until SIGINT, SIGTERM, or ctx itself is cancelled (parent asks it to
+// stop; production always passes context.Background(), so in practice this
+// is always a signal — cli_test.go's own tests are what actually cancel a
+// live ctx directly, to avoid racing a real signal against a freshly-picked
+// port). Validation happens before anything with a side effect (opening the
+// store, building TLS, binding the listener), so a bad config file fails
+// fast and loud instead of a process that appears to hang or half-starts.
+//
+// Start, Wait and Shutdown are called separately here rather than via
+// App.Run, specifically so stop() can run between Wait and Shutdown:
+// signal.NotifyContext's own doc comment recommends calling stop as soon as
+// the first signal has been handled, so that a second SIGINT/SIGTERM falls
+// through to Go's default handling (an immediate exit) instead of being
+// silently absorbed by a ctx that's already Done while a slow graceful
+// shutdown is still in progress.
+func runRun(ctx context.Context, args []string, stderr io.Writer, onListen func(addr string)) int {
 	const usage = "Usage: mon-server run [-config path]"
 
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
@@ -115,13 +145,58 @@ func runRun(args []string, stderr io.Writer) int {
 	}
 
 	dbPath := filepath.Join(cfg.DataDir, "mon-server.db")
-	if _, err := store.Open(dbPath); err != nil {
+	st, err := store.Open(dbPath)
+	if err != nil {
 		fmt.Fprintf(stderr, "mon-server: open store: %v\n", err)
 		return 1
 	}
 
-	fmt.Fprintln(stderr, "run: listener arrives in step 2")
-	return 1
+	a, err := app.New(app.Deps{
+		Cfg:      cfg,
+		Store:    st,
+		Clock:    clock.Real{},
+		Notifier: tg.Nop{},
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "mon-server: %v\n", err)
+		return 1
+	}
+
+	// SIGINT (Ctrl-C, an operator running it in a foreground shell) and
+	// SIGTERM (systemd stop, container shutdown) both mean "shut down
+	// gracefully"; NotifyContext cancels sigCtx on either, or when ctx
+	// itself is cancelled, instead of the process dying mid-request.
+	sigCtx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+
+	addr, err := a.Start()
+	if err != nil {
+		stop()
+		fmt.Fprintf(stderr, "mon-server: %v\n", err)
+		return 1
+	}
+	slog.Info("listening", "addr", addr, "tls", cfg.TLS.Mode)
+	if onListen != nil {
+		onListen(addr)
+	}
+
+	runErr := a.Wait(sigCtx)
+
+	// See the doc comment above: stop relaying signals before the
+	// (potentially slow) graceful shutdown, not after.
+	stop()
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), app.ShutdownGrace)
+	defer cancel()
+	if shutErr := a.Shutdown(shutdownCtx); shutErr != nil && runErr == nil {
+		runErr = shutErr
+	}
+	slog.Info("shutdown complete")
+
+	if runErr != nil {
+		fmt.Fprintf(stderr, "mon-server: %v\n", runErr)
+		return 1
+	}
+	return 0
 }
 
 // runAdmin implements `admin set <user>`. Flags are parsed before the

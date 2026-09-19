@@ -219,6 +219,35 @@ func TestValidate_ACMEIPRequiresPublicIP(t *testing.T) {
 	}
 }
 
+// TestValidate_ACMEIPRequiresIPLiteral checks that publicIp must actually
+// parse as an IP address (net.ParseIP), and that a loopback or private
+// address is rejected too: Let's Encrypt can never validate either as
+// reachable from the internet, so accepting them would only fail later, at
+// ACME time, with a much less obvious error.
+func TestValidate_ACMEIPRequiresIPLiteral(t *testing.T) {
+	cases := []struct {
+		name     string
+		publicIP string
+		wantErr  bool
+	}{
+		{"host:port pair", "203.0.113.5:443", true},
+		{"hostname", "example.com", true},
+		{"loopback", "127.0.0.1", true},
+		{"private", "10.0.0.5", true},
+		{"ipv4 literal", "203.0.113.5", false},
+		{"ipv6 literal", "2001:db8::1", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &Config{Listen: DefaultListen, DataDir: DefaultDataDir, PublicIP: tc.publicIP, TLS: TLSConfig{Mode: TLSModeACMEIP}}
+			err := cfg.Validate()
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("Validate() with publicIp=%q: error = %v, wantErr %v", tc.publicIP, err, tc.wantErr)
+			}
+		})
+	}
+}
+
 // TestValidate_UnknownMode checks that a typo'd tls.mode is rejected rather
 // than silently falling through to one of the two known modes.
 func TestValidate_UnknownMode(t *testing.T) {

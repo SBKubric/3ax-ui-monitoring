@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 )
 
@@ -179,8 +180,11 @@ func mergeEnv(cfg *Config) {
 
 // Validate checks that Config is internally consistent enough to start the
 // listener (spec §2.1): "files" mode needs both halves of a keypair, and
-// "acme-ip" needs to know which IP to certify. It does not check that the
-// paths exist or that the IP is reachable — that surfaces naturally when TLS
+// "acme-ip" needs a publicIp that is actually an IP address certmagic can
+// request a certificate for, not a hostname, a host:port pair, or a
+// loopback/private address that Let's Encrypt could never validate as
+// reachable from this box. It does not check that the paths exist or that
+// the IP is reachable from the internet — that surfaces naturally when TLS
 // setup (step 2) tries to use them.
 func (c *Config) Validate() error {
 	switch c.TLS.Mode {
@@ -191,6 +195,16 @@ func (c *Config) Validate() error {
 	case TLSModeACMEIP:
 		if c.PublicIP == "" {
 			return errors.New("config: tls.mode=acme-ip requires publicIp")
+		}
+		ip := net.ParseIP(c.PublicIP)
+		if ip == nil {
+			return fmt.Errorf("tls.mode acme-ip: publicIp %q is not an IP address", c.PublicIP)
+		}
+		if ip.IsLoopback() {
+			return fmt.Errorf("tls.mode acme-ip: publicIp %q is a loopback address, not reachable from the internet", c.PublicIP)
+		}
+		if ip.IsPrivate() {
+			return fmt.Errorf("tls.mode acme-ip: publicIp %q is a private address, not reachable from the internet", c.PublicIP)
 		}
 	default:
 		return fmt.Errorf("config: unknown tls.mode %q (want %q or %q)", c.TLS.Mode, TLSModeACMEIP, TLSModeFiles)

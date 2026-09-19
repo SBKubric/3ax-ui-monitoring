@@ -2,13 +2,20 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/SBKubric/3ax-ui-monitoring/internal/store"
+	"github.com/SBKubric/3ax-ui-monitoring/internal/tlsx/tlsxtest"
 )
 
 // clearEnv unsets every MON_* variable the CLI reads (mirroring
@@ -177,27 +184,153 @@ func TestRun_UnknownCommand(t *testing.T) {
 	}
 }
 
-// TestRun_RunReturnsPlaceholderError checks `run`'s honest placeholder: it
-// must load config, validate it, open the store, and only then report that
-// the listener does not exist yet (step 2) — not fail before getting that
-// far, and not silently exit 0.
-func TestRun_RunReturnsPlaceholderError(t *testing.T) {
+// TestRun_FailsFastOnInvalidConfigWithoutStartingAnything checks that a
+// config which fails Validate (here: acme-ip mode with no publicIp) is
+// rejected before `run` ever opens the store or attempts to build TLS/bind a
+// listener — a bad config must fail loudly and immediately, not partially
+// start something it then has no clean way to tear down.
+func TestRun_FailsFastOnInvalidConfigWithoutStartingAnything(t *testing.T) {
 	clearEnv(t)
-	configPath := writeTestConfig(t)
+	dir := t.TempDir()
+	cfg := map[string]any{
+		"listen":  "127.0.0.1:0",
+		"dataDir": dir,
+		"tls":     map[string]any{"mode": "acme-ip"}, // no publicIp: Validate must reject this
+	}
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	configPath := filepath.Join(dir, "config.json")
+	if err := os.WriteFile(configPath, data, 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
 
 	var stdout, stderr bytes.Buffer
 	code := run([]string{"run", "-config", configPath}, strings.NewReader(""), &stdout, &stderr)
 	if code == 0 {
-		t.Fatal("exit code = 0, want non-zero: the listener does not exist yet")
-	}
-	if !strings.Contains(stderr.String(), "listener arrives in step 2") {
-		t.Fatalf("stderr = %q, want the step-2 placeholder message", stderr.String())
+		t.Fatal("exit code = 0, want non-zero for an invalid config")
 	}
 
-	// The store must actually have been opened and migrated along the way.
-	dir := filepath.Dir(configPath)
+	if _, err := os.Stat(filepath.Join(dir, "mon-server.db")); err == nil {
+		t.Fatal("mon-server.db was created: want config validation to fail before the store is ever opened")
+	}
+}
+
+// syncBuffer is a bytes.Buffer safe for the concurrent read (test goroutine)
+// and write (the run() call in its own goroutine) that
+// TestRun_RunServesAndShutsDownOnSignal needs.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// TestRunCtx_RunServesAndShutsDownWhenCtxCancelled is the end-to-end
+// exercise of the whole "run" subcommand: a valid "files"-mode config
+// listening on an OS-assigned loopback port (127.0.0.1:0) brings up a real
+// HTTPS listener (proven by a successful /healthz request against the
+// self-signed cert tlsxtest hands out), and cancelling the ctx passed to
+// runCtx — standing in for the SIGINT/SIGTERM a real deployment would send —
+// makes it shut down cleanly with exit code 0, instead of hanging forever or
+// dying uncleanly. Driving this through ctx cancellation instead of a real
+// self-sent signal removes the previous version's two flaky ingredients: a
+// freeLoopbackAddr probe port that could be stolen by another process
+// before `run` rebound it, and a self-SIGTERM racing whatever else in this
+// test binary might be handling signals. It also checks the coverage a
+// deleted placeholder test used to provide: that `run` actually leaves
+// mon-server.db behind in dataDir.
+func TestRunCtx_RunServesAndShutsDownWhenCtxCancelled(t *testing.T) {
+	clearEnv(t)
+	dir := t.TempDir()
+	certPath, keyPath := tlsxtest.WriteSelfSigned(t, dir)
+	cfg := map[string]any{
+		"listen":  "127.0.0.1:0",
+		"dataDir": dir,
+		"tls":     map[string]any{"mode": "files", "cert": certPath, "key": keyPath},
+	}
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	configPath := filepath.Join(dir, "config.json")
+	if err := os.WriteFile(configPath, data, 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	addrCh := make(chan string, 1)
+	onListen := func(addr string) { addrCh <- addr }
+
+	var stdout, stderr syncBuffer
+	codeCh := make(chan int, 1)
+	go func() {
+		codeCh <- runCtx(ctx, []string{"run", "-config", configPath}, strings.NewReader(""), &stdout, &stderr, onListen)
+	}()
+
+	var addr string
+	select {
+	case addr = <-addrCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("onListen was never called")
+	}
+
+	certPEM, err := os.ReadFile(certPath)
+	if err != nil {
+		t.Fatalf("read cert: %v", err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(certPEM) {
+		t.Fatal("AppendCertsFromPEM: failed to parse test cert")
+	}
+	client := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool}}}
+
+	// Poll /healthz until the listener actually accepts connections (it was
+	// bound by the time onListen fired, but ServeTLS starts serving from a
+	// separate goroutine).
+	deadline := time.Now().Add(5 * time.Second)
+	var healthy bool
+	for time.Now().Before(deadline) {
+		resp, err := client.Get("https://" + addr + "/healthz")
+		if err == nil {
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				healthy = true
+				break
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !healthy {
+		t.Fatalf("GET /healthz never returned 200 (stderr so far: %s)", stderr.String())
+	}
+
+	cancel()
+
+	select {
+	case code := <-codeCh:
+		if code != 0 {
+			t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr.String())
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("run() did not return after ctx was cancelled")
+	}
+
 	if _, err := os.Stat(filepath.Join(dir, "mon-server.db")); err != nil {
-		t.Fatalf("expected mon-server.db to exist: %v", err)
+		t.Fatalf("mon-server.db: %v, want it to exist after run returns", err)
 	}
 }
 
