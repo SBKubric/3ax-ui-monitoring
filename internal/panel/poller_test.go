@@ -3,6 +3,7 @@ package panel_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"path/filepath"
@@ -474,6 +475,48 @@ func TestPoll_ThreeFailuresDeclarePanelDown(t *testing.T) {
 				t.Fatal("PANEL_DOWN was declared twice")
 			}
 		})
+	}
+}
+
+// failingNotifier is a Notifier whose Send always errors, standing in for a
+// broken bot token or an unreachable Telegram API.
+type failingNotifier struct{}
+
+func (failingNotifier) Send(context.Context, string) error {
+	return errors.New("tg: send message: boom")
+}
+
+// TestPoll_TelegramSendFailureDoesNotBreakCycle checks Poller.notify's own
+// contract (internal/panel/poller.go: "logging rather than propagating a
+// delivery failure: a broken bot token must not stop the poll cycle") end
+// to end: even when every Telegram send errors, PANEL_DOWN is still
+// declared and the panel event is still enqueued and marked notified.
+func TestPoll_TelegramSendFailureDoesNotBreakCycle(t *testing.T) {
+	h := newHarness(t)
+	h.poller = panel.NewPoller(panel.PollerDeps{
+		Store:    h.store,
+		Clock:    h.clk,
+		Notifier: failingNotifier{},
+		Snapshot: h.snapshot,
+		Configs:  h.configs,
+		Inbounds: h.inbounds,
+		Stats:    h.stats,
+		NewClient: func(baseURL, token string) panel.Client {
+			return panel.NewHTTPClient(baseURL, token, h.clk, panel.WithSleeper(func(context.Context, time.Duration) error { return nil }))
+		},
+	})
+
+	h.failCycles(t, 3, func(s *paneltest.Stub) { s.DropNext(4) })
+
+	if !h.poller.PanelDown() {
+		t.Fatal("PANEL_DOWN not declared even though every Telegram send failed")
+	}
+	evs := h.panelEvents(t)
+	if len(evs) != 1 {
+		t.Fatalf("panel events = %+v, want exactly one despite the Telegram failures", evs)
+	}
+	if !evs[0].Notified {
+		t.Fatal("panel event must still be notified=true (mon-server attempted delivery; contract §4.6 does not care that it failed)")
 	}
 }
 

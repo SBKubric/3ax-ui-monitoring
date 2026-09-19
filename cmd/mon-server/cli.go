@@ -152,10 +152,14 @@ func runRun(ctx context.Context, args []string, stderr io.Writer, onListen func(
 	}
 
 	a, err := app.New(app.Deps{
-		Cfg:      cfg,
-		Store:    st,
-		Clock:    clock.Real{},
-		Notifier: tg.Nop{},
+		Cfg:   cfg,
+		Store: st,
+		Clock: clock.Real{},
+		// tg.NewFromSettings rereads tgToken/tgChatId from Settings on every
+		// Send (spec §9.4), so an admin can fill in the Telegram tab or
+		// change bots at runtime with no restart; NewHTTP(nil, "") is the
+		// real Bot API client (step 9).
+		Notifier: tg.NewFromSettings(st, tg.NewHTTP(nil, "")),
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "mon-server: %v\n", err)
