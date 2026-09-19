@@ -49,6 +49,10 @@ const readTimeout = 30 * time.Second
 // so that step doesn't also need to touch this timeout.
 const writeTimeout = 60 * time.Second
 
+// defaultHTTPSPort is the port probeURL assumes when cfg.Listen names none
+// — the port an https:// URL leaves implicit.
+const defaultHTTPSPort = "443"
+
 // Deps are every collaborator App needs, injected rather than constructed
 // internally so tests can pass a temp-file store, a Fake clock and a
 // tg.Recorder instead of the real things (architecture brief §4: "no global
@@ -76,6 +80,11 @@ type App struct {
 	// registry is step 4's registration desk and mon-client directory,
 	// exposed through Registry() so later steps can wire their hooks.
 	registry *registry.Registry
+
+	// configs is step 5's per-mon-client config builder, exposed through
+	// Configs() so step 10's Settings Save can call RebuildAll when a probe
+	// parameter or realHost changes (spec §9.4).
+	configs *registry.ConfigBuilder
 
 	// ctx/cancel is App's own lifetime context, independent of whatever
 	// signal-driven ctx a caller passes to Run: it exists purely so
@@ -165,6 +174,21 @@ func newApp(d Deps, readTimeout, writeTimeout time.Duration) (*App, error) {
 	reg := registry.New(d.Store, d.Clock)
 	api.RegisterRoutes(srv.V1, reg)
 
+	// Step 5's config builder: it reads the panel material off the poller
+	// and hands finished documents to GET /v1/config (spec §5). The two
+	// directions are wired here rather than in either package because each
+	// needs the other — the poller rebuilds configs on a material change,
+	// the builder reads the poller's material — and internal/app is the one
+	// place that may know about both.
+	configs := registry.NewConfigBuilder(d.Store, d.Clock, poller, probeURL(d.Cfg))
+	poller.SetConfigs(configs)
+	poller.SetSnapshot(reg.SnapshotSource())
+	reg.SetHooks(registry.Hooks{
+		PathsChanged: configs.Rebuild,
+		Approved:     configs.Rebuild,
+	})
+	api.ConfigRoutes(srv.V1, reg, configs)
+
 	httpSrv := &http.Server{
 		Handler:   srv.Engine,
 		TLSConfig: tlsCfg,
@@ -194,6 +218,7 @@ func newApp(d Deps, readTimeout, writeTimeout time.Duration) (*App, error) {
 		mgr:        mgr,
 		poller:     poller,
 		registry:   reg,
+		configs:    configs,
 		ctx:        ctx,
 		cancel:     cancel,
 		lnCh:       make(chan net.Listener, 1),
@@ -369,6 +394,29 @@ func (a *App) Poller() *panel.Poller {
 // its whole internal http.Server.
 func (a *App) Server() *api.Server {
 	return a.server
+}
+
+// probeURL is the address mon-clients send tunnel probes to (spec §5:
+// "https://<publicIp>:<port>/v1/probe"). It comes from bootstrap config,
+// not settings: it names this process's own listener, which is fixed at
+// start-up. A Listen with no port at all (or one this process could not
+// parse) falls back to 443, the port a public HTTPS URL omits — better a
+// config document a mon-client can at least try than one with an empty
+// port in it.
+func probeURL(cfg *config.Config) string {
+	port := defaultHTTPSPort
+	if _, p, err := net.SplitHostPort(cfg.Listen); err == nil && p != "" {
+		port = p
+	}
+	return "https://" + net.JoinHostPort(cfg.PublicIP, port) + "/v1/probe"
+}
+
+// Configs exposes step 5's config builder so step 10's Settings Save can
+// rebuild every mon-client's document when a probe parameter or realHost
+// changes (spec §9.4), and so tests can reach the document a mon-client
+// would be served.
+func (a *App) Configs() *registry.ConfigBuilder {
+	return a.configs
 }
 
 // Registry exposes the registration desk / mon-client directory so later

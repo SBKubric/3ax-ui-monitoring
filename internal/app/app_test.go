@@ -18,6 +18,7 @@ import (
 
 	"github.com/SBKubric/3ax-ui-monitoring/internal/clock"
 	"github.com/SBKubric/3ax-ui-monitoring/internal/config"
+	"github.com/SBKubric/3ax-ui-monitoring/internal/registry"
 	"github.com/SBKubric/3ax-ui-monitoring/internal/store"
 	"github.com/SBKubric/3ax-ui-monitoring/internal/tg"
 	"github.com/SBKubric/3ax-ui-monitoring/internal/tlsx/tlsxtest"
@@ -489,5 +490,85 @@ func TestRegistry_WiredIntoServer(t *testing.T) {
 
 	if resp.StatusCode != http.StatusAccepted {
 		t.Fatalf("status = %d, want 202", resp.StatusCode)
+	}
+}
+
+// TestProbeURL checks spec §5's probeUrl is built from bootstrap config —
+// the public IP plus the listener's own port, and 443 when Listen names no
+// usable port at all.
+func TestProbeURL(t *testing.T) {
+	cases := []struct {
+		name     string
+		publicIP string
+		listen   string
+		want     string
+	}{
+		{name: "explicit port", publicIP: "203.0.113.10", listen: "0.0.0.0:8443", want: "https://203.0.113.10:8443/v1/probe"},
+		{name: "default https port", publicIP: "203.0.113.10", listen: "0.0.0.0:443", want: "https://203.0.113.10:443/v1/probe"},
+		{name: "no port at all", publicIP: "203.0.113.10", listen: "0.0.0.0", want: "https://203.0.113.10:443/v1/probe"},
+		{name: "empty listen", publicIP: "203.0.113.10", listen: "", want: "https://203.0.113.10:443/v1/probe"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := probeURL(&config.Config{PublicIP: tc.publicIP, Listen: tc.listen})
+			if got != tc.want {
+				t.Fatalf("probeURL = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestConfigs_WiredIntoServer checks step 5's wiring end to end: App builds
+// a ConfigBuilder, exposes it through Configs(), and GET /v1/config is
+// mounted behind the client-token middleware on the App's own listener. A
+// mon-server that has never reached a panel has no document to serve, so
+// the authenticated fetch is the spec §5 cold-start answer — 503
+// config_not_ready — rather than a 404 from an unmounted route.
+func TestConfigs_WiredIntoServer(t *testing.T) {
+	a, clientTLS := newTestApp(t)
+	if a.Configs() == nil {
+		t.Fatal("Configs() = nil, want a constructed *registry.ConfigBuilder")
+	}
+
+	ctx := context.Background()
+	reg := a.Registry()
+	out, err := reg.Register(ctx, registry.RegisterInput{PairingCode: "ABCDEF", Hostname: "h", RemoteIP: "198.51.100.7"})
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if _, err := reg.Approve(ctx, out.RequestID, registry.ApproveInput{Name: "ams-1"}); err != nil {
+		t.Fatalf("Approve: %v", err)
+	}
+	poll, err := reg.Poll(ctx, out.RequestID)
+	if err != nil {
+		t.Fatalf("Poll: %v", err)
+	}
+	if poll.Token == "" {
+		t.Fatal("Poll handed out no client token")
+	}
+
+	addr, err := a.Start()
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	client := &http.Client{Transport: &http.Transport{TLSClientConfig: clientTLS}}
+	req, err := http.NewRequest(http.MethodGet, "https://"+addr+"/v1/config", nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+poll.Token)
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("GET /v1/config: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503, body=%s", resp.StatusCode, body)
+	}
+	if !bytes.Contains(body, []byte("config_not_ready")) {
+		t.Fatalf("body = %s, want the config_not_ready error code", body)
 	}
 }

@@ -1,0 +1,586 @@
+package registry
+
+import (
+	"context"
+	"errors"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"gorm.io/gorm/clause"
+
+	"github.com/SBKubric/3ax-ui-monitoring/internal/clock"
+	"github.com/SBKubric/3ax-ui-monitoring/internal/panel"
+	"github.com/SBKubric/3ax-ui-monitoring/internal/panel/paneltest"
+	"github.com/SBKubric/3ax-ui-monitoring/internal/store"
+	"github.com/SBKubric/3ax-ui-monitoring/internal/tg"
+)
+
+// testProbeURL is the probeUrl internal/app would compute from bootstrap
+// config (spec §5); the builder itself takes it as a value.
+const testProbeURL = "https://203.0.113.10:443/v1/probe"
+
+// fakeMaterial is a MaterialSource a test can set by hand, standing in for
+// *panel.Poller everywhere the panel itself is not what is under test.
+type fakeMaterial struct {
+	m  panel.Material
+	ok bool
+}
+
+func (f *fakeMaterial) Material() (panel.Material, bool) { return f.m, f.ok }
+
+// sampleMaterial is one panel revision with one xray inbound and one AWG
+// one on both paths, the smallest material that exercises every rule in
+// spec §5 (two kinds, two paths, an override).
+func sampleMaterial() panel.Material {
+	return panel.Material{
+		Revision:   "rev-1",
+		Override:   panel.Override{Enabled: true, Host: "front.example.net"},
+		ProbeSubID: "sub-1",
+		Proxy: []panel.ProbeItem{
+			{Kind: store.InboundKindXray, InboundId: 12, Link: "vless://probe@front.example.net:443#probe-12"},
+			{Kind: store.InboundKindAwg, InboundId: 0, Filename: "probe.conf", Conf: "[Peer]\nEndpoint = front.example.net:51820\n"},
+		},
+		Direct: []panel.ProbeItem{
+			{Kind: store.InboundKindXray, InboundId: 12, Link: "vless://probe@real.example.net:443#probe-12"},
+			{Kind: store.InboundKindAwg, InboundId: 0, Filename: "probe.conf", Conf: "[Peer]\nEndpoint = real.example.net:51820\n"},
+		},
+	}
+}
+
+// newTestBuilder builds a ConfigBuilder over a fresh store with the sample
+// material already available, plus the panel_inbounds rows the protocol
+// field is joined from (protocol §4.2).
+func newTestBuilder(t *testing.T) (*ConfigBuilder, *Registry, *store.Store, *clock.Fake, *fakeMaterial) {
+	t.Helper()
+	r, st, clk := newTestRegistry(t)
+	mat := &fakeMaterial{m: sampleMaterial(), ok: true}
+	savePanelInbound(t, st, store.PanelInbound{
+		InboundKind: store.InboundKindXray, InboundId: 12,
+		Protocol: "vless", Port: 443, Remark: "Reality main", Enable: true,
+	})
+	savePanelInbound(t, st, store.PanelInbound{
+		InboundKind: store.InboundKindAwg, InboundId: 0,
+		Protocol: "awg", Port: 51820, Remark: "AWG", Enable: true,
+	})
+	return NewConfigBuilder(st, clk, mat, testProbeURL), r, st, clk, mat
+}
+
+// savePanelInbound upserts one panel_inbounds row the way the poller does
+// (by its (kind, inboundId) key), so a test can both seed a row and change
+// one it has already seeded.
+func savePanelInbound(t *testing.T, st *store.Store, in store.PanelInbound) {
+	t.Helper()
+	err := st.DB.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "inbound_kind"}, {Name: "inbound_id"}},
+		DoUpdates: clause.AssignmentColumns([]string{"protocol", "port", "remark", "enable", "seen_revision"}),
+	}).Create(&in).Error
+	if err != nil {
+		t.Fatalf("save panel inbound: %v", err)
+	}
+}
+
+// mustCurrent builds (if needed) and returns one mon-client's document.
+func mustCurrent(t *testing.T, b *ConfigBuilder, id string) *ConfigDoc {
+	t.Helper()
+	doc, err := b.Current(context.Background(), id)
+	if err != nil {
+		t.Fatalf("Current(%q): %v", id, err)
+	}
+	return doc
+}
+
+// keysOf renders a document's targets as "kind:id/path" strings, the form
+// an assertion failure is readable in.
+func keysOf(doc *ConfigDoc) []string {
+	out := make([]string, 0, len(doc.Targets))
+	for _, ct := range doc.Targets {
+		out = append(out, ct.InboundKind+":"+strconv.Itoa(ct.InboundID)+"/"+ct.Path)
+	}
+	return out
+}
+
+// --- Document shape (spec §5, protocol §4.2) ---
+
+// TestRebuild_TargetsAreItemsTimesPaths checks the core rule: every path of
+// the mon-client crossed with the items of that path, sorted, with protocol
+// joined from panel_inbounds.
+func TestRebuild_TargetsAreItemsTimesPaths(t *testing.T) {
+	b, r, _, clk, _ := newTestBuilder(t)
+	mc := approve(t, r, clk, "ams-1", nil)
+
+	if err := b.RebuildAll(context.Background()); err != nil {
+		t.Fatalf("RebuildAll: %v", err)
+	}
+	doc := mustCurrent(t, b, mc.Id)
+
+	want := []string{"awg:0/direct", "awg:0/proxy", "xray:12/direct", "xray:12/proxy"}
+	got := keysOf(doc)
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("targets = %v, want %v", got, want)
+	}
+	if doc.MonClientID != mc.Id {
+		t.Errorf("monClientId = %q, want %q", doc.MonClientID, mc.Id)
+	}
+	if doc.ProbeURL != testProbeURL {
+		t.Errorf("probeUrl = %q, want %q", doc.ProbeURL, testProbeURL)
+	}
+	if doc.Probe.IntervalMs != 60000 || doc.Probe.HeartbeatTimeoutMs != 10000 {
+		t.Errorf("probe = %+v, want the spec §9.4 defaults", doc.Probe)
+	}
+	for _, tgt := range doc.Targets {
+		wantProto := "vless"
+		if tgt.InboundKind == store.InboundKindAwg {
+			wantProto = "awg"
+		}
+		if tgt.Protocol != wantProto {
+			t.Errorf("target %s:%d/%s protocol = %q, want %q", tgt.InboundKind, tgt.InboundID, tgt.Path, tgt.Protocol, wantProto)
+		}
+	}
+}
+
+// TestRebuild_ProtocolComesFromPanelInbounds checks the join is real: an
+// inbound whose panel_inbounds row says "vmess" shows up as vmess.
+func TestRebuild_ProtocolComesFromPanelInbounds(t *testing.T) {
+	b, r, st, clk, _ := newTestBuilder(t)
+	savePanelInbound(t, st, store.PanelInbound{
+		InboundKind: store.InboundKindXray, InboundId: 12,
+		Protocol: "vmess", Port: 443, Enable: true,
+	})
+	mc := approve(t, r, clk, "ams-1", []string{store.PathDirect})
+
+	if err := b.Rebuild(context.Background(), mc.Id); err != nil {
+		t.Fatalf("Rebuild: %v", err)
+	}
+	doc := mustCurrent(t, b, mc.Id)
+	for _, tgt := range doc.Targets {
+		if tgt.InboundKind == store.InboundKindXray && tgt.Protocol != "vmess" {
+			t.Fatalf("protocol = %q, want vmess", tgt.Protocol)
+		}
+	}
+}
+
+// TestRebuild_ProxyOnlyClientNeverSeesRealServer is the hostile-region rule
+// (protocol §4.2): a mon-client with paths=["proxy"] gets no direct targets
+// and its document never mentions the real server's address.
+func TestRebuild_ProxyOnlyClientNeverSeesRealServer(t *testing.T) {
+	b, r, st, clk, _ := newTestBuilder(t)
+	mc := approve(t, r, clk, "hostile-1", []string{store.PathProxy})
+
+	if err := b.RebuildAll(context.Background()); err != nil {
+		t.Fatalf("RebuildAll: %v", err)
+	}
+	doc := mustCurrent(t, b, mc.Id)
+	for _, tgt := range doc.Targets {
+		if tgt.Path != store.PathProxy {
+			t.Fatalf("target %s:%d has path %q, want only proxy", tgt.InboundKind, tgt.InboundID, tgt.Path)
+		}
+	}
+
+	var row store.ClientConfig
+	if err := st.DB.First(&row, "mon_client_id = ?", mc.Id).Error; err != nil {
+		t.Fatalf("load client_configs: %v", err)
+	}
+	if strings.Contains(row.Document, "real.example.net") {
+		t.Fatalf("document leaks the real server's address: %s", row.Document)
+	}
+}
+
+// TestRebuild_OverrideOffDropsProxyTargets checks spec §5: without the
+// panel's host override there is no proxy front to probe, so a mon-client
+// that asks for the proxy path simply gets no proxy targets.
+func TestRebuild_OverrideOffDropsProxyTargets(t *testing.T) {
+	b, r, _, clk, mat := newTestBuilder(t)
+	m := sampleMaterial()
+	m.Override = panel.Override{Enabled: false}
+	mat.m = m
+	mc := approve(t, r, clk, "ams-1", nil)
+
+	if err := b.RebuildAll(context.Background()); err != nil {
+		t.Fatalf("RebuildAll: %v", err)
+	}
+	doc := mustCurrent(t, b, mc.Id)
+	if len(doc.Targets) == 0 {
+		t.Fatal("no targets at all, want the direct ones")
+	}
+	for _, tgt := range doc.Targets {
+		if tgt.Path == store.PathProxy {
+			t.Fatalf("proxy target %s:%d present with the override off", tgt.InboundKind, tgt.InboundID)
+		}
+	}
+}
+
+// TestRebuild_LinkAndConfPassedThrough checks spec §5's "как есть": the
+// panel has already substituted the right host, so mon-server copies.
+func TestRebuild_LinkAndConfPassedThrough(t *testing.T) {
+	b, r, _, clk, _ := newTestBuilder(t)
+	mc := approve(t, r, clk, "ams-1", []string{store.PathProxy})
+	if err := b.RebuildAll(context.Background()); err != nil {
+		t.Fatalf("RebuildAll: %v", err)
+	}
+	doc := mustCurrent(t, b, mc.Id)
+	for _, tgt := range doc.Targets {
+		switch tgt.InboundKind {
+		case store.InboundKindXray:
+			if tgt.Link != "vless://probe@front.example.net:443#probe-12" || tgt.Conf != "" {
+				t.Errorf("xray target = %+v, want the proxy link verbatim and no conf", tgt)
+			}
+		case store.InboundKindAwg:
+			if tgt.Conf != "[Peer]\nEndpoint = front.example.net:51820\n" || tgt.Link != "" {
+				t.Errorf("awg target = %+v, want the proxy conf verbatim and no link", tgt)
+			}
+		}
+	}
+}
+
+// --- Revision (spec §5, protocol §4.1) ---
+
+// TestCanonicalJSON_KeyOrderDoesNotMatter is the canonical-JSON contract the
+// revision rests on: the same document with its keys written in a different
+// order hashes identically, and configRevision itself is never part of the
+// input.
+func TestCanonicalJSON_KeyOrderDoesNotMatter(t *testing.T) {
+	a := []byte(`{"configRevision":"aaaa","monClientId":"ams-1","probe":{"budgetMs":20000,"intervalMs":60000}}`)
+	bb := []byte(`{"probe":{"intervalMs":60000,"budgetMs":20000},"monClientId":"ams-1","configRevision":"bbbb"}`)
+
+	ca, err := canonicalJSON(a)
+	if err != nil {
+		t.Fatalf("canonicalJSON(a): %v", err)
+	}
+	cb, err := canonicalJSON(bb)
+	if err != nil {
+		t.Fatalf("canonicalJSON(b): %v", err)
+	}
+	if string(ca) != string(cb) {
+		t.Fatalf("canonical forms differ:\n%s\n%s", ca, cb)
+	}
+	if strings.Contains(string(ca), "configRevision") {
+		t.Fatalf("canonical form still carries configRevision: %s", ca)
+	}
+}
+
+// TestRevision_StableAcrossRebuilds checks that rebuilding from unchanged
+// material yields the same revision — otherwise every panel poll would make
+// every mon-client re-fetch and restart xray (protocol §4.3).
+func TestRevision_StableAcrossRebuilds(t *testing.T) {
+	b, r, _, clk, _ := newTestBuilder(t)
+	mc := approve(t, r, clk, "ams-1", nil)
+
+	if err := b.RebuildAll(context.Background()); err != nil {
+		t.Fatalf("RebuildAll: %v", err)
+	}
+	first := mustRevision(t, b, mc.Id)
+
+	clk.Advance(time.Minute)
+	if err := b.RebuildAll(context.Background()); err != nil {
+		t.Fatalf("RebuildAll (again): %v", err)
+	}
+	if got := mustRevision(t, b, mc.Id); got != first {
+		t.Fatalf("revision changed on an unchanged rebuild: %q → %q", first, got)
+	}
+}
+
+func mustRevision(t *testing.T, b *ConfigBuilder, id string) string {
+	t.Helper()
+	rev, err := b.CurrentRevision(context.Background(), id)
+	if err != nil {
+		t.Fatalf("CurrentRevision(%q): %v", id, err)
+	}
+	if len(rev) != revisionHexLen {
+		t.Fatalf("revision %q is %d chars, want %d", rev, len(rev), revisionHexLen)
+	}
+	return rev
+}
+
+// TestRevision_ChangesWith walks every input spec §5 says the revision must
+// react to — paths, probe parameters, the real server's address (which
+// reaches the builder as changed direct material) and a panel revision that
+// actually changed the items — and the one it must not react to: an inbound
+// remark, which is not part of the document at all.
+func TestRevision_ChangesWith(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(t *testing.T, b *ConfigBuilder, st *store.Store, r *Registry, mat *fakeMaterial, id string)
+		want   bool // true: the revision must change
+	}{
+		{
+			name: "paths",
+			mutate: func(t *testing.T, b *ConfigBuilder, st *store.Store, r *Registry, mat *fakeMaterial, id string) {
+				if err := r.Update(context.Background(), id, "ams-1", "", []string{store.PathProxy}); err != nil {
+					t.Fatalf("Update: %v", err)
+				}
+			},
+			want: true,
+		},
+		{
+			name: "probe parameters",
+			mutate: func(t *testing.T, b *ConfigBuilder, st *store.Store, r *Registry, mat *fakeMaterial, id string) {
+				set, err := st.LoadSettings()
+				if err != nil {
+					t.Fatalf("LoadSettings: %v", err)
+				}
+				set.BudgetMs = 25000
+				if err := st.SaveSettings(set); err != nil {
+					t.Fatalf("SaveSettings: %v", err)
+				}
+			},
+			want: true,
+		},
+		{
+			name: "realHost",
+			mutate: func(t *testing.T, b *ConfigBuilder, st *store.Store, r *Registry, mat *fakeMaterial, id string) {
+				m := mat.m
+				m.Revision = "rev-2"
+				m.Direct = []panel.ProbeItem{
+					{Kind: store.InboundKindXray, InboundId: 12, Link: "vless://probe@other.example.net:443#probe-12"},
+					{Kind: store.InboundKindAwg, InboundId: 0, Conf: "[Peer]\nEndpoint = other.example.net:51820\n"},
+				}
+				mat.m = m
+			},
+			want: true,
+		},
+		{
+			name: "panel revision with new items",
+			mutate: func(t *testing.T, b *ConfigBuilder, st *store.Store, r *Registry, mat *fakeMaterial, id string) {
+				m := mat.m
+				m.Revision = "rev-3"
+				m.Direct = append(append([]panel.ProbeItem(nil), m.Direct...),
+					panel.ProbeItem{Kind: store.InboundKindXray, InboundId: 13, Link: "vless://probe@real.example.net:8443#probe-13"})
+				mat.m = m
+			},
+			want: true,
+		},
+		{
+			name: "remark only",
+			mutate: func(t *testing.T, b *ConfigBuilder, st *store.Store, r *Registry, mat *fakeMaterial, id string) {
+				savePanelInbound(t, st, store.PanelInbound{
+					InboundKind: store.InboundKindXray, InboundId: 12,
+					Protocol: "vless", Port: 443, Remark: "renamed in the panel", Enable: true,
+				})
+				m := mat.m
+				m.Revision = "rev-4"
+				mat.m = m
+			},
+			want: false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b, r, st, clk, mat := newTestBuilder(t)
+			mc := approve(t, r, clk, "ams-1", nil)
+			if err := b.RebuildAll(context.Background()); err != nil {
+				t.Fatalf("RebuildAll: %v", err)
+			}
+			before := mustRevision(t, b, mc.Id)
+
+			tc.mutate(t, b, st, r, mat, mc.Id)
+			if err := b.RebuildAll(context.Background()); err != nil {
+				t.Fatalf("RebuildAll (after mutation): %v", err)
+			}
+			after := mustRevision(t, b, mc.Id)
+
+			if tc.want && before == after {
+				t.Fatalf("revision unchanged (%q) after changing %s", before, tc.name)
+			}
+			if !tc.want && before != after {
+				t.Fatalf("revision changed (%q → %q) after changing %s, which is not part of the document", before, after, tc.name)
+			}
+		})
+	}
+}
+
+// --- Current / CurrentRevision / TargetKeys ---
+
+// TestCurrent_NoMaterialIsErrNoConfig checks the state a freshly installed
+// mon-server is in before its first successful panel poll: there is nothing
+// to answer GET /v1/config with (spec §5).
+func TestCurrent_NoMaterialIsErrNoConfig(t *testing.T) {
+	r, st, clk := newTestRegistry(t)
+	b := NewConfigBuilder(st, clk, &fakeMaterial{}, testProbeURL)
+	mc := approve(t, r, clk, "ams-1", nil)
+
+	if err := b.RebuildAll(context.Background()); err != nil {
+		t.Fatalf("RebuildAll with no material: %v", err)
+	}
+	if _, err := b.Current(context.Background(), mc.Id); !errors.Is(err, ErrNoConfig) {
+		t.Fatalf("Current err = %v, want ErrNoConfig", err)
+	}
+	rev, err := b.CurrentRevision(context.Background(), mc.Id)
+	if err != nil || rev != "" {
+		t.Fatalf("CurrentRevision = (%q, %v), want (\"\", nil)", rev, err)
+	}
+	keys, err := b.TargetKeys(context.Background(), mc.Id)
+	if err != nil || keys != nil {
+		t.Fatalf("TargetKeys = (%v, %v), want (nil, nil)", keys, err)
+	}
+}
+
+// TestCurrent_BuildsOnDemand checks a mon-client approved between two panel
+// revisions still gets a document on its very first GET /v1/config, without
+// waiting for the next material change to rebuild everything.
+func TestCurrent_BuildsOnDemand(t *testing.T) {
+	b, r, st, clk, _ := newTestBuilder(t)
+	mc := approve(t, r, clk, "ams-1", nil)
+
+	doc := mustCurrent(t, b, mc.Id)
+	if len(doc.Targets) == 0 {
+		t.Fatal("built document has no targets")
+	}
+	var n int64
+	if err := st.DB.Model(&store.ClientConfig{}).Where("mon_client_id = ?", mc.Id).Count(&n).Error; err != nil {
+		t.Fatalf("count client_configs: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("client_configs rows = %d, want 1 (Current must persist what it built)", n)
+	}
+}
+
+// TestTargetKeys_MatchesDocument checks step 6/8's view of the config (the
+// heartbeat's unknown-target filter, the probe handler's) is exactly the
+// document's target list.
+func TestTargetKeys_MatchesDocument(t *testing.T) {
+	b, r, _, clk, _ := newTestBuilder(t)
+	mc := approve(t, r, clk, "ams-1", nil)
+	doc := mustCurrent(t, b, mc.Id)
+
+	keys, err := b.TargetKeys(context.Background(), mc.Id)
+	if err != nil {
+		t.Fatalf("TargetKeys: %v", err)
+	}
+	if len(keys) != len(doc.Targets) {
+		t.Fatalf("TargetKeys len = %d, doc targets = %d", len(keys), len(doc.Targets))
+	}
+	for i, k := range keys {
+		tgt := doc.Targets[i]
+		if k != (TargetKey{InboundKind: tgt.InboundKind, InboundID: tgt.InboundID, Path: tgt.Path}) {
+			t.Fatalf("key %d = %+v, want %+v", i, k, tgt)
+		}
+	}
+}
+
+// --- Hooks and the snapshot adapter ---
+
+// TestApproveRunsApprovedHook checks the hook step 5 adds so a brand-new
+// mon-client has a config document the moment it is approved, not a panel
+// poll later (spec §5).
+func TestApproveRunsApprovedHook(t *testing.T) {
+	b, r, _, clk, _ := newTestBuilder(t)
+	var approved []string
+	r.SetHooks(Hooks{Approved: func(ctx context.Context, id string) error {
+		approved = append(approved, id)
+		return b.Rebuild(ctx, id)
+	}})
+
+	mc := approve(t, r, clk, "ams-1", nil)
+	if len(approved) != 1 || approved[0] != mc.Id {
+		t.Fatalf("Approved hook calls = %v, want [%q]", approved, mc.Id)
+	}
+	if rev := mustRevision(t, b, mc.Id); rev == "" {
+		t.Fatal("no config built by the Approved hook")
+	}
+
+	// And again for the replacement path (spec §6).
+	clk.Advance(rateLimitWindow)
+	out := register(t, r, "ams-1", "", "198.51.100.9")
+	if _, err := r.ApproveAsReplacement(context.Background(), out.RequestID, mc.Id); err != nil {
+		t.Fatalf("ApproveAsReplacement: %v", err)
+	}
+	if len(approved) != 2 {
+		t.Fatalf("Approved hook calls = %v, want one more after ApproveAsReplacement", approved)
+	}
+}
+
+// TestSnapshotSource maps the registry rows onto the panel's own snapshot
+// type (contract §4.3), including the "never heartbeated" case.
+func TestSnapshotSource(t *testing.T) {
+	r, st, clk := newTestRegistry(t)
+	mc := approve(t, r, clk, "ams-1", nil)
+
+	snap, err := r.SnapshotSource().Snapshot(context.Background())
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if len(snap) != 1 {
+		t.Fatalf("snapshot len = %d, want 1", len(snap))
+	}
+	if snap[0].Id != mc.Id || snap[0].State != store.MonClientNever || snap[0].LastHeartbeat != 0 {
+		t.Fatalf("snapshot[0] = %+v, want id %q, state NEVER, lastHeartbeat 0", snap[0], mc.Id)
+	}
+
+	hb := int64(1750000000000)
+	if err := st.DB.Model(&store.MonClient{}).Where("id = ?", mc.Id).
+		Updates(map[string]any{"last_heartbeat": hb, "state": store.MonClientOnline, "region": "NL"}).Error; err != nil {
+		t.Fatalf("update mon-client: %v", err)
+	}
+	snap, err = r.SnapshotSource().Snapshot(context.Background())
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if snap[0].LastHeartbeat != hb || snap[0].State != store.MonClientOnline || snap[0].Region != "NL" {
+		t.Fatalf("snapshot[0] = %+v, want the updated heartbeat/state/region", snap[0])
+	}
+}
+
+// --- End to end through the real poller and a panel stub ---
+
+// TestRebuildAllThroughPoller drives the whole seam spec §4 step 3
+// describes: the poller reads a panel revision, hands the material to this
+// builder, and a later revision with different items produces a new config
+// revision for the mon-client.
+func TestRebuildAllThroughPoller(t *testing.T) {
+	stub := paneltest.NewStub(t)
+	st, err := store.Open(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	clk := clock.NewFake(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+	st.Clock = clk
+
+	set := store.DefaultSettings()
+	set.PanelURL = stub.URL()
+	set.MonToken = stub.Token()
+	set.RealHost = "real.example.net"
+	if err := st.SaveSettings(set); err != nil {
+		t.Fatalf("SaveSettings: %v", err)
+	}
+	stub.SetInbounds([]panel.Inbound{
+		{Kind: store.InboundKindXray, InboundId: 12, Tag: "inbound-443", Protocol: "vless", Port: 443, Enable: true},
+	})
+	stub.SetOverride(true, "front.example.net")
+	stub.SetItems("direct", []panel.ProbeItem{{Kind: store.InboundKindXray, InboundId: 12, Link: "vless://direct-1"}})
+	stub.SetItems("proxy", []panel.ProbeItem{{Kind: store.InboundKindXray, InboundId: 12, Link: "vless://proxy-1"}})
+
+	r := New(st, clk)
+	poller := panel.NewPoller(panel.PollerDeps{Store: st, Clock: clk, Notifier: tg.Nop{}})
+	b := NewConfigBuilder(st, clk, poller, testProbeURL)
+	poller.SetConfigs(b)
+	poller.SetSnapshot(r.SnapshotSource())
+
+	mc := approve(t, r, clk, "ams-1", nil)
+
+	if err := poller.Poll(context.Background()); err != nil {
+		t.Fatalf("Poll: %v", err)
+	}
+	first := mustRevision(t, b, mc.Id)
+	doc := mustCurrent(t, b, mc.Id)
+	if len(doc.Targets) != 2 {
+		t.Fatalf("targets = %v, want one per path", keysOf(doc))
+	}
+
+	// A panel revision that changes the material: new links on both paths.
+	stub.SetItems("direct", []panel.ProbeItem{{Kind: store.InboundKindXray, InboundId: 12, Link: "vless://direct-2"}})
+	stub.SetItems("proxy", []panel.ProbeItem{{Kind: store.InboundKindXray, InboundId: 12, Link: "vless://proxy-2"}})
+	stub.SetInbounds([]panel.Inbound{
+		{Kind: store.InboundKindXray, InboundId: 12, Tag: "inbound-443", Protocol: "vless", Port: 443, Enable: true},
+		{Kind: store.InboundKindXray, InboundId: 13, Tag: "inbound-8443", Protocol: "vless", Port: 8443, Enable: true},
+	})
+	if err := poller.Poll(context.Background()); err != nil {
+		t.Fatalf("Poll (second): %v", err)
+	}
+	if second := mustRevision(t, b, mc.Id); second == first {
+		t.Fatalf("config revision unchanged (%q) after a panel revision with new material", first)
+	}
+}

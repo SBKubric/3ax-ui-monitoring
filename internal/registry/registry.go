@@ -16,6 +16,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"regexp"
 	"slices"
@@ -151,9 +152,9 @@ func (e *RateLimitError) Error() string {
 }
 
 // Hooks are the callbacks later steps install so registry's own DB work
-// (paths changing, a mon-client being disabled) triggers their side of the
+// (paths changing, a mon-client being disabled or approved) triggers their side of the
 // system, without registry importing those packages and creating an import
-// cycle (architecture brief §3.5). Both fields are nil-safe: a Registry with
+// cycle (architecture brief §3.5). Every field is nil-safe: a Registry with
 // no hooks set (as in this step's own tests, and briefly at process start
 // before internal/app wires them) just skips the callback.
 type Hooks struct {
@@ -165,6 +166,12 @@ type Hooks struct {
 	// state engine can drive that mon-client's targets to UNKNOWN with
 	// reason "mon_client_disabled" (spec §6).
 	Disabled func(ctx context.Context, monClientID string) error
+	// Approved is called after Approve or ApproveAsReplacement commits, so
+	// step 5's config builder can give the brand-new (or re-tokened)
+	// mon-client a config document straight away (spec §5). Without it a
+	// freshly approved mon-client's very first GET /v1/config would depend
+	// on whenever the next panel revision happens to land.
+	Approved func(ctx context.Context, monClientID string) error
 }
 
 // Registry is mon-server's registration desk and mon-client directory. It
@@ -594,6 +601,7 @@ func (r *Registry) Approve(ctx context.Context, requestID string, in ApproveInpu
 	if err != nil {
 		return nil, err
 	}
+	r.notifyApproved(ctx, mc.Id)
 	return mc, nil
 }
 
@@ -648,7 +656,24 @@ func (r *Registry) ApproveAsReplacement(ctx context.Context, requestID, existing
 	if err != nil {
 		return nil, err
 	}
+	r.notifyApproved(ctx, mc.Id)
 	return mc, nil
+}
+
+// notifyApproved runs Hooks.Approved for a mon-client whose approval has
+// just committed. A hook failure is logged, not returned: the approval
+// itself succeeded and the token has been minted, so reporting an error to
+// the administrator would suggest it did not — and the one thing the hook
+// does (build a config document) is redone by the next panel revision's
+// RebuildAll anyway, as well as on demand by GET /v1/config itself.
+func (r *Registry) notifyApproved(ctx context.Context, monClientID string) {
+	if r.hooks.Approved == nil {
+		return
+	}
+	if err := r.hooks.Approved(ctx, monClientID); err != nil {
+		slog.Warn("registry: building the config of a newly approved mon-client failed",
+			"monClientId", monClientID, "err", err)
+	}
 }
 
 // Reject marks a pending request "rejected" (protocol §2.2); the
