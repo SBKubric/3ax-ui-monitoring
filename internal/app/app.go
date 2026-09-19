@@ -234,6 +234,11 @@ func newApp(d Deps, readTimeout, writeTimeout time.Duration) (*App, error) {
 	api.ConfigRoutes(srv.V1, reg, configs)
 	api.HeartbeatRoutes(srv.V1, reg, engine)
 
+	// Step 8's tunnel probe (spec §7.5, protocol §5.2): it shares the same
+	// config builder as GET /v1/config, since "is this target one I handed
+	// out" is exactly ConfigBuilder.TargetKeys.
+	api.ProbeRoutes(srv.V1, reg, configs, d.Store)
+
 	httpSrv := &http.Server{
 		Handler:   srv.Engine,
 		TLSConfig: tlsCfg,

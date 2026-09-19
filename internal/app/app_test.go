@@ -772,3 +772,53 @@ func TestStats_WiredIntoServer(t *testing.T) {
 		t.Fatalf("latencyAvgMs = %v, want 42 from the probe's tlsMs", got.LatencyAvgMs)
 	}
 }
+
+// TestProbe_WiredIntoServer checks step 8's wiring end to end: GET
+// /v1/probe is mounted behind the client-token middleware on the App's own
+// listener and answers spec §7.5's echo, using the same real, approved
+// token TestConfigs_WiredIntoServer uses for /v1/config.
+func TestProbe_WiredIntoServer(t *testing.T) {
+	a, clientTLS := newTestApp(t)
+
+	ctx := context.Background()
+	reg := a.Registry()
+	out, err := reg.Register(ctx, registry.RegisterInput{PairingCode: "ABCDEF", Hostname: "h", RemoteIP: "198.51.100.7"})
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if _, err := reg.Approve(ctx, out.RequestID, registry.ApproveInput{Name: "ams-1"}); err != nil {
+		t.Fatalf("Approve: %v", err)
+	}
+	poll, err := reg.Poll(ctx, out.RequestID)
+	if err != nil {
+		t.Fatalf("Poll: %v", err)
+	}
+	if poll.Token == "" {
+		t.Fatal("Poll handed out no client token")
+	}
+
+	addr, err := a.Start()
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	client := &http.Client{Transport: &http.Transport{TLSClientConfig: clientTLS}}
+	req, err := http.NewRequest(http.MethodGet, "https://"+addr+"/v1/probe?target=xray:12:proxy&n=abc123", nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+poll.Token)
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("GET /v1/probe: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", resp.StatusCode, body)
+	}
+	if !bytes.Contains(body, []byte(`"nonce":"abc123"`)) {
+		t.Fatalf("body = %s, want the echoed nonce", body)
+	}
+}

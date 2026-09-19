@@ -356,6 +356,13 @@ type ProbeSeen struct {
 	Path        string `json:"path" gorm:"column:path;not null;size:16"`
 	EgressIp    string `json:"egressIp" gorm:"column:egress_ip"`
 	SeenAt      int64  `json:"seenAt" gorm:"column:seen_at;not null;index:idx_ms_probe_seen_seen_at"`
+	// UnknownTarget marks a probe whose (inboundKind, inboundId, path) is
+	// not among the targets this mon-client's current config document
+	// names (spec §7.5). It never blocks the probe response — a mon-client
+	// only needs to hear back "the tunnel reached mon-server" — it is only
+	// a diagnostic flag for a config that has drifted out from under a
+	// running mon-client.
+	UnknownTarget bool `json:"unknownTarget" gorm:"column:unknown_target;not null;default:false"`
 }
 
 func (ProbeSeen) TableName() string { return "probe_seen" }
