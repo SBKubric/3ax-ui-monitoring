@@ -603,3 +603,160 @@ func TestLoop_RunStopsOnContextCancellation(t *testing.T) {
 		t.Fatalf("%d heartbeats, want none from a cancelled run", len(got))
 	}
 }
+
+// withApplier builds a second Loop over this harness's stub, state
+// directory and buffer but with a different Applier — how a test drives
+// the loop against the real RevisionApplier (apply_test.go).
+func (h *harness) withApplier(t *testing.T, applier Applier) *Loop {
+	t.Helper()
+	return NewLoop(Deps{
+		API:       h.client,
+		State:     h.dir,
+		File:      h.file,
+		Buffer:    h.buffer,
+		Runner:    probe.NewRunner(slog.New(slog.NewTextHandler(h.logs, nil))),
+		Applier:   applier,
+		Clock:     h.clk,
+		Sleep:     func(ctx context.Context, d time.Duration) error { return ctx.Err() },
+		Rand:      mrand.New(mrand.NewPCG(5, 6)),
+		Log:       slog.New(slog.NewTextHandler(h.logs, nil)),
+		Version:   "0.1.0",
+		StartedAt: h.clk.Now(),
+	})
+}
+
+// guardedApplier is a fakeApplier that also implements CycleGuard, with the
+// same read/write lock RevisionApplier uses. It is how the loop's half of
+// the "применение между циклами" contract is tested without a child
+// process: the loop must hold the guard for the whole cycle.
+type guardedApplier struct {
+	*fakeApplier
+	cycle sync.RWMutex
+}
+
+func (a *guardedApplier) Apply(ctx context.Context, doc *proto.ConfigDoc) error {
+	a.cycle.Lock()
+	defer a.cycle.Unlock()
+	return a.fakeApplier.Apply(ctx, doc)
+}
+
+func (a *guardedApplier) BeginCycle() { a.cycle.RLock() }
+func (a *guardedApplier) EndCycle()   { a.cycle.RUnlock() }
+
+// TestLoop_ApplyWaitsForTheCycleInFlight is spec §4 step 3 seen from the
+// loop: a cycle that is already probing finishes before an apply arriving
+// from another goroutine is allowed to swap anything.
+func TestLoop_ApplyWaitsForTheCycleInFlight(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+
+	// events is the order the test asserts on; a mutex rather than two
+	// timestamps because the probe and the apply run in two goroutines.
+	var mu sync.Mutex
+	var events []string
+	note := func(what string) {
+		mu.Lock()
+		defer mu.Unlock()
+		events = append(events, what)
+	}
+
+	slow := func(ctx context.Context, k proto.TargetKey) proto.Result {
+		close(started)
+		<-release
+		note("probe")
+		return proto.Result{TargetKey: k, Ok: true}
+	}
+
+	h := newHarness(t, map[proto.TargetKey]probe.Fn{targetKey(): slow})
+	// The apply comes from a second goroutine here, which production never
+	// does (Once calls Apply itself) — so the applier under test gets its
+	// own state.File rather than the loop's, which the loop reads from its
+	// own goroutine while building the heartbeat.
+	guarded := &guardedApplier{fakeApplier: &fakeApplier{file: &state.File{}, probes: h.applier.probes}}
+	loop := h.withApplier(t, guarded)
+	h.stub.SetConfig(doc("rev1"))
+	h.stub.SetRevision("rev1")
+
+	done := make(chan error, 1)
+	go func() { done <- loop.Once(context.Background()) }()
+
+	<-started
+	applied := make(chan struct{})
+	go func() {
+		defer close(applied)
+		if err := guarded.Apply(context.Background(), doc("rev2")); err != nil {
+			t.Errorf("Apply: %v", err)
+		}
+		note("apply")
+	}()
+
+	// Give the apply a chance to run early if the guard does not hold.
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+
+	if err := <-done; err != nil {
+		t.Fatalf("Once: %v", err)
+	}
+	<-applied
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(events) != 2 || events[0] != "probe" || events[1] != "apply" {
+		t.Fatalf("events = %v, want the probe in flight to finish before the apply", events)
+	}
+}
+
+// TestLoop_ResultsOfRemovedTargetsAreDropped is spec §4 step 3's "грейса
+// нет: результаты по удалённым targets отбрасываются" — a revision that
+// drops a target stops it appearing in heartbeats at once.
+func TestLoop_ResultsOfRemovedTargetsAreDropped(t *testing.T) {
+	gone := proto.TargetKey{InboundKind: "xray", InboundID: 12, Path: "direct"}
+	h := newHarness(t, map[proto.TargetKey]probe.Fn{targetKey(): okProbe, gone: okProbe})
+	two := doc("rev1")
+	two.Targets = append(two.Targets, proto.Target{TargetKey: gone, Protocol: "trojan", Link: "trojan://x"})
+	h.stub.SetConfig(two)
+	h.stub.SetRevision("rev2") // a newer revision is waiting
+
+	if err := h.loop.Once(context.Background()); err != nil {
+		t.Fatalf("Once: %v", err)
+	}
+	if got := h.stub.Heartbeats()[0].Cycles[0].Results; len(got) != 2 {
+		t.Fatalf("%d results in the first cycle, want both targets", len(got))
+	}
+
+	// rev2 drops the second target: the applier installs a probe set
+	// without it.
+	h.applier.mu.Lock()
+	h.applier.probes = map[proto.TargetKey]probe.Fn{targetKey(): okProbe}
+	h.applier.mu.Unlock()
+	h.stub.SetConfig(doc("rev2"))
+
+	if err := h.loop.Once(context.Background()); err != nil {
+		t.Fatalf("Once: %v", err)
+	}
+	results := h.stub.Heartbeats()[1].Cycles[0].Results
+	if len(results) != 1 || results[0].TargetKey != targetKey() {
+		t.Fatalf("results = %+v, want only the surviving target", results)
+	}
+}
+
+// TestLoop_ResultsForUnknownTargetsAreFiltered is the belt-and-braces half
+// of the same rule: even a probe that hands back a result for a key the
+// applied document does not have must not reach a heartbeat.
+func TestLoop_ResultsForUnknownTargetsAreFiltered(t *testing.T) {
+	stale := proto.TargetKey{InboundKind: "xray", InboundID: 99, Path: "stale"}
+	impostor := func(_ context.Context, _ proto.TargetKey) proto.Result {
+		return proto.Result{TargetKey: stale, Ok: true}
+	}
+
+	h := newHarness(t, map[proto.TargetKey]probe.Fn{targetKey(): impostor})
+	h.stub.SetConfig(doc("rev1"))
+	h.stub.SetRevision("rev1")
+
+	if err := h.loop.Once(context.Background()); err != nil {
+		t.Fatalf("Once: %v", err)
+	}
+	if got := h.stub.Heartbeats()[0].Cycles[0].Results; len(got) != 0 {
+		t.Fatalf("results = %+v, want the foreign result dropped", got)
+	}
+}

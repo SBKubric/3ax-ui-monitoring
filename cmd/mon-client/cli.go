@@ -26,6 +26,7 @@ import (
 	"github.com/SBKubric/3ax-ui-monitoring/internal/client/probe"
 	"github.com/SBKubric/3ax-ui-monitoring/internal/client/register"
 	"github.com/SBKubric/3ax-ui-monitoring/internal/client/state"
+	"github.com/SBKubric/3ax-ui-monitoring/internal/client/xray"
 	"github.com/SBKubric/3ax-ui-monitoring/internal/version"
 )
 
@@ -118,7 +119,6 @@ func runRun(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "mon-client: unexpected argument %q\n\n%s\n", fs.Arg(0), usage())
 		return 2
 	}
-	_ = xrayBin // wired into internal/client/xray from step 4 on
 
 	serverURL := *server
 	if serverURL == "" {
@@ -209,22 +209,41 @@ func runRun(args []string, stdout, stderr io.Writer) int {
 	client := api.New(serverURL, hc)
 	client.Token = f.Token
 
-	// ProvisionalApplier is step 7's stand-in: it builds the probes but
-	// writes no xray.json and starts no xray child (step 8 does both), so
-	// --xray-bin still has nothing to run and xrayVersion is reported
-	// empty in every heartbeat until then.
-	applier := app.NewProvisionalApplier(&probe.Prober{Logger: logger}, &awg.Prober{Log: logger}, dir, f, logger)
+	// The xray child is optional: spec §1 has mon-client probe AWG-targets
+	// in-process, so a box with no xray binary installed is a working
+	// mon-client for those targets. A missing binary is therefore a warning
+	// and a nil child (the applier then refuses any document carrying
+	// xray-targets, with that refusal as configError), not a failed start.
+	child := openXray(*xrayBin, logger)
+	applier := app.NewRevisionApplier(app.ApplierDeps{
+		XrayProber: &probe.Prober{Logger: logger},
+		AWGProber:  &awg.Prober{Log: logger},
+		Xray:       child,
+		Dir:        dir,
+		File:       f,
+		Log:        logger,
+	})
+	// Spec §9/§6: whatever ends the run — a signal, a 401, a 403 — must not
+	// leave an xray child behind holding the socks ports.
+	defer func() {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), xrayStopTimeout)
+		defer stopCancel()
+		if err := applier.Stop(stopCtx); err != nil {
+			logger.Warn("xray not stopped cleanly", "error", err)
+		}
+	}()
 
 	loop := app.NewLoop(app.Deps{
-		API:       client,
-		State:     dir,
-		File:      f,
-		Buffer:    buffer,
-		Runner:    probe.NewRunner(logger),
-		Applier:   applier,
-		Log:       logger,
-		Version:   version.Version(),
-		StartedAt: time.Now(),
+		API:         client,
+		State:       dir,
+		File:        f,
+		Buffer:      buffer,
+		Runner:      probe.NewRunner(logger),
+		Applier:     applier,
+		Log:         logger,
+		Version:     version.Version(),
+		XrayVersion: xrayVersion(ctx, child, logger),
+		StartedAt:   time.Now(),
 	})
 
 	if beforeLoopForTests != nil {
@@ -276,3 +295,40 @@ func parseLogLevel(s string) (slog.Level, bool) {
 		return 0, false
 	}
 }
+
+// xrayStopTimeout is how long the shutdown path waits for the xray child
+// to exit on SIGTERM before killing it (xray.Process.Stop escalates when
+// the context ends). A child that has not gone in five seconds is stuck,
+// and mon-client must still exit.
+const xrayStopTimeout = 5 * time.Second
+
+// openXray returns the xray child process, or nil when --xray-bin does not
+// point at an executable. See the call site for why that is not fatal.
+func openXray(bin string, logger *slog.Logger) *xray.Process {
+	if _, err := os.Stat(bin); err != nil {
+		logger.Warn("no xray binary, xray-targets cannot be probed", "path", bin, "error", err)
+		return nil
+	}
+	return xray.New(bin, logger)
+}
+
+// xrayVersion reads the child binary's version once, at start, for the
+// heartbeat's client.xrayVersion (protocol §5.3). Once, because the binary
+// does not change under a running mon-client and asking it per heartbeat
+// would fork a process a minute for a string that never moves.
+func xrayVersion(ctx context.Context, child *xray.Process, logger *slog.Logger) func() string {
+	if child == nil {
+		return nil
+	}
+	vctx, cancel := context.WithTimeout(ctx, xrayVersionTimeout)
+	defer cancel()
+	v, err := child.Version(vctx)
+	if err != nil {
+		logger.Warn("xray version unavailable", "error", err)
+	}
+	return func() string { return v }
+}
+
+// xrayVersionTimeout bounds that one `xray version` call: a binary that
+// does not answer in a second is not going to be asked again.
+const xrayVersionTimeout = time.Second

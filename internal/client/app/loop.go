@@ -17,7 +17,6 @@ import (
 	"fmt"
 	"log/slog"
 	mrand "math/rand/v2"
-	"strings"
 	"time"
 
 	"github.com/SBKubric/3ax-ui-monitoring/internal/client/api"
@@ -71,6 +70,22 @@ const maxConfigError = 256
 type Applier interface {
 	Apply(ctx context.Context, doc *proto.ConfigDoc) error
 	Applied() (doc *proto.ConfigDoc, probes map[proto.TargetKey]probe.Fn, err error)
+}
+
+// CycleGuard is an optional extension of Applier for an applier that has
+// to know when probes are in flight. Spec §4 step 3 says a revision is
+// applied "между циклами: дождаться проб в полёте" — with Once and Apply
+// called from one goroutine that is already true, but an applier that
+// restarts the xray child every probe dials through cannot rely on its
+// caller's goroutine discipline for that. RevisionApplier implements it
+// with a read/write lock: every cycle takes the read side, an apply the
+// write side.
+//
+// Once calls the pair around the cycle when the Applier implements it;
+// an applier that does not (the tests' fake) is simply not guarded.
+type CycleGuard interface {
+	BeginCycle()
+	EndCycle()
 }
 
 // Deps are everything the loop needs and does not build itself. Every
@@ -197,10 +212,7 @@ func (l *Loop) Once(ctx context.Context) error {
 		}
 	}
 
-	doc, probes, configErr := l.d.Applier.Applied()
-
-	ts := clock.Ms(l.d.Clock.Now())
-	results := l.d.Runner.Cycle(ctx, probes, probe.BudgetsFrom(probeParams(doc)))
+	doc, results, ts, configErr := l.cycle(ctx)
 	l.d.Buffer.Add(ts, results)
 
 	hb := &proto.HeartbeatRequest{
@@ -249,6 +261,42 @@ func (l *Loop) Once(ctx context.Context) error {
 	return nil
 }
 
+// cycle runs one probe cycle against whatever is applied and returns it
+// together with the applied document, the configError and the cycle's
+// start timestamp.
+//
+// It is a method of its own because of the guard around it: while the
+// cycle runs, an Applier that is a CycleGuard cannot swap the probe set
+// under it (spec §4 step 3). The results are then filtered against that
+// same probe set: spec §4 step 3 gives removed targets no grace ("грейса
+// нет: результаты по удалённым targets отбрасываются"), and while the
+// runner only ever probes what it was handed, a result for a key the
+// applied document no longer has must not reach a heartbeat even if some
+// future applier hands one back.
+func (l *Loop) cycle(ctx context.Context) (doc *proto.ConfigDoc, results []proto.Result, ts int64, configErr error) {
+	if g, ok := l.d.Applier.(CycleGuard); ok {
+		g.BeginCycle()
+		defer g.EndCycle()
+	}
+	doc, probes, configErr := l.d.Applier.Applied()
+	ts = clock.Ms(l.d.Clock.Now())
+	results = l.d.Runner.Cycle(ctx, probes, probe.BudgetsFrom(probeParams(doc)))
+	return doc, applied(results, probes), ts, configErr
+}
+
+// applied drops every result whose target is not in the applied probe set
+// (spec §4 step 3). The slice stays non-nil when empty: a cycle with no
+// results encodes as [], not null (protocol §5.3).
+func applied(results []proto.Result, probes map[proto.TargetKey]probe.Fn) []proto.Result {
+	kept := make([]proto.Result, 0, len(results))
+	for _, r := range results {
+		if _, ok := probes[r.TargetKey]; ok {
+			kept = append(kept, r)
+		}
+	}
+	return kept
+}
+
 // fetchAndApply performs spec §4.1's GET /v1/config and hands the document
 // to the Applier.
 //
@@ -282,7 +330,9 @@ func (l *Loop) fetchAndApply(ctx context.Context) error {
 		l.log().Warn("config not applied", "error", err)
 		return nil
 	}
-	l.log().Info(fmt.Sprintf("applied revision %s", doc.ConfigRevision))
+	// The spec §7 line for a successful apply is written by the Applier,
+	// which is the only thing that knows what the revision turned into
+	// (how many xray- and AWG-targets, and whether the child restarted).
 	return nil
 }
 
@@ -380,13 +430,7 @@ func configErrorText(err error) *string {
 	if err == nil {
 		return nil
 	}
-	text := err.Error()
-	if i := strings.IndexByte(text, '\n'); i >= 0 {
-		text = text[:i]
-	}
-	if len(text) > maxConfigError {
-		text = text[:maxConfigError]
-	}
+	text := firstLine(err.Error())
 	return &text
 }
 
