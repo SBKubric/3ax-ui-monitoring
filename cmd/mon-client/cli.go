@@ -7,7 +7,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -27,24 +26,34 @@ import (
 	"github.com/SBKubric/3ax-ui-monitoring/internal/client/register"
 	"github.com/SBKubric/3ax-ui-monitoring/internal/client/state"
 	"github.com/SBKubric/3ax-ui-monitoring/internal/client/xray"
+	"github.com/SBKubric/3ax-ui-monitoring/internal/clock"
 	"github.com/SBKubric/3ax-ui-monitoring/internal/version"
 )
 
-// httpClientForTests, when non-nil, replaces the plain *http.Client `run`
-// otherwise builds for internal/client/api.New. Production never touches
-// it; this package's own tests set it to a client trusting a
-// servertest.Stub's self-signed certificate, so `run` can be driven all
-// the way through registration against a stub without either a real
-// mon-server or any flag/CA-file plumbing of its own (issue #16's brief:
-// "keep it simple").
-var httpClientForTests *http.Client
-
-// beforeLoopForTests, when non-nil, is called with the run's cancel
-// function after registration and just before the probe loop starts.
-// Production never touches it; this package's own tests use it to stop a
-// run that would otherwise only end on SIGINT/SIGTERM, so a CLI test still
-// asserts on everything `run` does without waiting out a probe interval.
-var beforeLoopForTests func(cancel context.CancelFunc)
+// hooks are this package's test seams, threaded through runCtx as a
+// parameter rather than kept in package-level variables: a CLI test that
+// mutated globals could not run alongside another one, and `run` is the
+// only thing in mon-client that has no injection of its own.
+//
+// Production passes the zero value, which means "no hooks": a plain
+// http.Client, the real clock, real timers, and nothing between
+// registration and the probe loop.
+type hooks struct {
+	// HTTP replaces the *http.Client every api.Client is built over.
+	// Tests set it to a client trusting a servertest.Stub's self-signed
+	// certificate, so `run` goes through a full registration against a
+	// stub without either a real mon-server or any CA-file flag.
+	HTTP *http.Client
+	// Clock and Sleep are the supervisor's and registration's time seams
+	// (see app.SupervisorDeps). Tests inject an instant Sleep so a CLI
+	// test does not wait out registration's 10-second poll cadence.
+	Clock clock.Clock
+	Sleep func(ctx context.Context, d time.Duration) error
+	// BeforeLoop is called with the run's cancel function each time a loop
+	// has been built and is about to run. Tests use it to stop a run that
+	// would otherwise only end on SIGINT/SIGTERM.
+	BeforeLoop func(cancel context.CancelFunc)
+}
 
 // envServerURL is spec §2's ENV alternative to --server.
 const envServerURL = "MON_SERVER_URL"
@@ -62,6 +71,13 @@ const (
 // real os.Args. It returns the process exit code; main's only job is to
 // pass that to os.Exit.
 func run(args []string, stdout, stderr io.Writer) int {
+	return runCtx(context.Background(), args, stdout, stderr, hooks{})
+}
+
+// runCtx is run with its context and test seams supplied — the form this
+// package's own tests drive, so they can cancel a run and hand it a stub's
+// HTTP client without touching any global.
+func runCtx(ctx context.Context, args []string, stdout, stderr io.Writer, h hooks) int {
 	if len(args) == 0 {
 		fmt.Fprintln(stderr, usage())
 		return 2
@@ -76,13 +92,13 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stdout, usage())
 		return 0
 	case cmd == "run":
-		return runRun(args[1:], stdout, stderr)
+		return runRun(ctx, args[1:], stdout, stderr, h)
 	case strings.HasPrefix(cmd, "-"):
 		// spec: "run" is the default command when args start with flags —
 		// `mon-client --server ...` is shorthand for `mon-client run
 		// --server ...`, since run is the only thing mon-client normally
 		// does.
-		return runRun(args, stdout, stderr)
+		return runRun(ctx, args, stdout, stderr, h)
 	default:
 		fmt.Fprintf(stderr, "mon-client: unknown command %q\n\n%s\n", cmd, usage())
 		return 2
@@ -101,11 +117,12 @@ func usage() string {
 --log-level is one of debug, info, warn, error (default ` + defaultLogLevel + `)`
 }
 
-// runRun parses run's flags, opens the state directory, and reports
-// whether this box is already registered (issue #15: the loop itself
-// arrives in step 7 — for now, `run` just proves the state file round-trips
-// end to end and exits).
-func runRun(args []string, stdout, stderr io.Writer) int {
+// runRun parses run's flags and hands the box to the supervisor, which is
+// mon-client's whole life cycle: register if needed, probe and heartbeat,
+// re-register on a 401, wait out a 403 (spec §6). Everything this function
+// still owns is process-level: flags, the logger, the state directory, the
+// signal handling, and how a loop is built out of this box's xray binary.
+func runRun(ctx context.Context, args []string, stdout, stderr io.Writer, h hooks) int {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	server := fs.String("server", "", "mon-server URL, e.g. https://203.0.113.10:443 (or "+envServerURL+")")
@@ -145,117 +162,96 @@ func runRun(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
-	f, err := dir.Load()
-	needsRegistration := false
-	switch {
-	case err == nil:
-		logger.Info(fmt.Sprintf("state loaded (mon-client %s)", f.MonClientID))
-	case errors.Is(err, state.ErrNoState):
-		logger.Info("no state, registration required")
-		needsRegistration = true
-	default:
-		// A corrupt state file (spec §2: "Пропал или 401 — стереть и
-		// регистрироваться заново" — the same recovery applies to a state
-		// file that is present but unreadable) is treated the same as no
-		// state at all, once the operator has been told why.
-		logger.Warn("state file unreadable, clearing it", "error", err)
-		if clearErr := dir.Clear(); clearErr != nil {
-			fmt.Fprintf(stderr, "mon-client: %v\n", clearErr)
-			return 1
-		}
-		logger.Info("no state, registration required")
-		needsRegistration = true
-	}
-
-	// Spec §6/§9: the loop runs until the box is stopped, so everything
+	// Spec §6/§9: the run lasts until the box is stopped, so everything
 	// below hangs off one context a SIGINT or SIGTERM cancels — including
 	// the registration wait, which is otherwise the longest thing a
 	// mon-client can be sitting in.
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	sigCtx, cancel := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	hc := httpClientForTests
-	if hc == nil {
-		hc = &http.Client{}
+	clk := h.Clock
+	if clk == nil {
+		clk = clock.Real{}
 	}
-
-	if needsRegistration {
-		hostname, err := os.Hostname()
-		if err != nil {
-			hostname = ""
-		}
-		f, err = register.Run(ctx, register.Deps{
-			API:      api.New(serverURL, hc),
-			State:    dir,
-			Log:      logger,
-			Hostname: hostname,
-			Version:  version.Version(),
-			PublicIP: register.PublicIPFromDial(serverURL),
-		})
-		if err != nil {
-			fmt.Fprintf(stderr, "mon-client: register: %v\n", err)
-			return 1
-		}
-	}
-
-	logger.Info(fmt.Sprintf("registered as %s", f.MonClientID))
-
-	buffer, err := openBuffer(dir, logger)
+	hostname, err := os.Hostname()
 	if err != nil {
-		fmt.Fprintf(stderr, "mon-client: %v\n", err)
-		return 1
+		hostname = ""
 	}
 
-	client := api.New(serverURL, hc)
-	client.Token = f.Token
-
-	// The xray child is optional: spec §1 has mon-client probe AWG-targets
-	// in-process, so a box with no xray binary installed is a working
-	// mon-client for those targets. A missing binary is therefore a warning
-	// and a nil child (the applier then refuses any document carrying
-	// xray-targets, with that refusal as configError), not a failed start.
-	child := openXray(*xrayBin, logger)
-	applier := app.NewRevisionApplier(app.ApplierDeps{
-		XrayProber: &probe.Prober{Logger: logger},
-		AWGProber:  &awg.Prober{Log: logger},
-		Xray:       child,
-		Dir:        dir,
-		File:       f,
-		Log:        logger,
-	})
-	// Spec §9/§6: whatever ends the run — a signal, a 401, a 403 — must not
-	// leave an xray child behind holding the socks ports.
-	defer func() {
-		stopCtx, stopCancel := context.WithTimeout(context.Background(), xrayStopTimeout)
-		defer stopCancel()
-		if err := applier.Stop(stopCtx); err != nil {
-			logger.Warn("xray not stopped cleanly", "error", err)
-		}
-	}()
-
-	loop := app.NewLoop(app.Deps{
-		API:         client,
-		State:       dir,
-		File:        f,
-		Buffer:      buffer,
-		Runner:      probe.NewRunner(logger),
-		Applier:     applier,
-		Log:         logger,
-		Version:     version.Version(),
-		XrayVersion: xrayVersion(ctx, child, logger),
-		StartedAt:   time.Now(),
-	})
-
-	if beforeLoopForTests != nil {
-		beforeLoopForTests(cancel)
-	}
-	if err := loop.Run(ctx); err != nil {
-		// Spec §6's 401/403 branches are step 9's; until then, saying
-		// exactly why mon-client stopped is the whole of the handling.
+	if err := app.RunSupervisor(sigCtx, app.SupervisorDeps{
+		ServerURL: serverURL,
+		HTTP:      h.HTTP,
+		Dir:       dir,
+		Clock:     clk,
+		Sleep:     h.Sleep,
+		Log:       logger,
+		Version:   version.Version(),
+		Hostname:  hostname,
+		PublicIP:  register.PublicIPFromDial(serverURL),
+		NewLoop:   newLoop(sigCtx, cancel, dir, *xrayBin, logger, clk, h),
+	}); err != nil {
 		fmt.Fprintf(stderr, "mon-client: %v\n", err)
 		return 1
 	}
 	return 0
+}
+
+// newLoop is the production app.LoopFactory: everything a running identity
+// needs, rebuilt from scratch each time the supervisor starts one.
+//
+// Rebuilding rather than reusing is the point. A loop that comes back
+// after a 401 belongs to a different mon-client with a different token,
+// and one that comes back after a 403 may have been suspended for hours —
+// in both cases a fresh cycles buffer handle, a fresh applier and a fresh
+// xray child are cheaper to reason about than any attempt to carry state
+// across the gap.
+func newLoop(ctx context.Context, cancel context.CancelFunc, dir *state.Dir, xrayBin string, logger *slog.Logger, clk clock.Clock, h hooks) app.LoopFactory {
+	startedAt := clk.Now()
+	return func(f *state.File, client *api.Client) (*app.Loop, func(context.Context) error, error) {
+		buffer, err := openBuffer(dir, logger)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		// The xray child is optional: spec §1 has mon-client probe
+		// AWG-targets in-process, so a box with no xray binary installed
+		// is a working mon-client for those targets. A missing binary is
+		// therefore a warning and a nil child (the applier then refuses
+		// any document carrying xray-targets, with that refusal as
+		// configError), not a failed start.
+		child := openXray(xrayBin, logger)
+		applier := app.NewRevisionApplier(app.ApplierDeps{
+			XrayProber: &probe.Prober{Logger: logger},
+			AWGProber:  &awg.Prober{Log: logger},
+			Xray:       child,
+			Dir:        dir,
+			File:       f,
+			Log:        logger,
+		})
+
+		loop := app.NewLoop(app.Deps{
+			API:         client,
+			State:       dir,
+			File:        f,
+			Buffer:      buffer,
+			Runner:      probe.NewRunner(logger),
+			Applier:     applier,
+			Clock:       clk,
+			Sleep:       h.Sleep,
+			Log:         logger,
+			Version:     version.Version(),
+			XrayVersion: xrayVersion(ctx, child, logger),
+			StartedAt:   startedAt,
+		})
+
+		if h.BeforeLoop != nil {
+			h.BeforeLoop(cancel)
+		}
+		// Spec §9/§6: whatever ends the run — a signal, a 401, a 403 —
+		// must not leave an xray child behind holding the socks ports, and
+		// the applier is what started it.
+		return loop, applier.Stop, nil
+	}
 }
 
 // openBuffer opens cycles.json, recovering from a file that cannot be
@@ -295,12 +291,6 @@ func parseLogLevel(s string) (slog.Level, bool) {
 		return 0, false
 	}
 }
-
-// xrayStopTimeout is how long the shutdown path waits for the xray child
-// to exit on SIGTERM before killing it (xray.Process.Stop escalates when
-// the context ends). A child that has not gone in five seconds is stuck,
-// and mon-client must still exit.
-const xrayStopTimeout = 5 * time.Second
 
 // openXray returns the xray child process, or nil when --xray-bin does not
 // point at an executable. See the call site for why that is not fatal.

@@ -21,27 +21,36 @@ func clearEnv(t *testing.T) {
 	os.Unsetenv(envServerURL)
 }
 
-// stubHTTPClientForTest points httpClientForTests at stub for the
-// duration of t, restoring it afterwards — the unexported hook issue #16's
-// brief calls for so `run` can be driven through a real registration
-// against servertest.Stub without any CLI flag of its own.
-func stubHTTPClientForTest(t *testing.T, stub *servertest.Stub) {
-	t.Helper()
-	old := httpClientForTests
-	httpClientForTests = stub.HTTPClient()
-	t.Cleanup(func() { httpClientForTests = old })
+// fastSleep is the hooks.Sleep every CLI test injects: it honours
+// cancellation exactly like the production timer but compresses every wait
+// to a millisecond, so a test drives registration's 10-second poll cadence
+// and the supervisor's 5-minute disabled cadence in real time without
+// waiting for either.
+func fastSleep(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return ctx.Err()
+	}
+	t := time.NewTimer(time.Millisecond)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
 }
 
-// stopLoopForTest makes `run` stop as soon as it reaches the probe loop,
-// through cli.go's beforeLoopForTests hook. Every test that drives a
-// successful `run` needs it: since step 7 the loop only ends on
-// SIGINT/SIGTERM, and a CLI test asserting on registration has no interest
-// in waiting out a probe interval.
-func stopLoopForTest(t *testing.T) {
-	t.Helper()
-	old := beforeLoopForTests
-	beforeLoopForTests = func(cancel context.CancelFunc) { cancel() }
-	t.Cleanup(func() { beforeLoopForTests = old })
+// stopAtLoop is the hooks value most tests use: a stub's HTTP client,
+// instant waits, and a run that ends the moment it reaches the probe loop.
+// Since step 7 the loop only ends on SIGINT/SIGTERM, and a CLI test
+// asserting on registration has no interest in waiting out a probe
+// interval.
+func stopAtLoop(stub *servertest.Stub) hooks {
+	h := hooks{Sleep: fastSleep, BeforeLoop: func(cancel context.CancelFunc) { cancel() }}
+	if stub != nil {
+		h.HTTP = stub.HTTPClient()
+	}
+	return h
 }
 
 // waitForPollRequest waits for stub to have received a GET
@@ -50,12 +59,7 @@ func stopLoopForTest(t *testing.T) {
 // test to approve.
 func waitForPollRequest(t *testing.T, stub *servertest.Stub) string {
 	t.Helper()
-	// register.Run uses a real timer for its pollAfter wait here (`run`
-	// wires no Sleep override — this is production code, not
-	// internal/client/register's own tests), and the stub always answers
-	// 202 with a 10s pollAfter, so the first poll genuinely does not
-	// happen for about 10 real seconds.
-	deadline := time.Now().Add(15 * time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		for _, req := range stub.Requests() {
 			if req.Method == "GET" && strings.HasPrefix(req.Path, "/v1/register/") {
@@ -73,20 +77,17 @@ func waitForPollRequest(t *testing.T, stub *servertest.Stub) string {
 // request has been approved.
 func waitForExitCode(t *testing.T, codeCh <-chan int) int {
 	t.Helper()
-	// Approval can land just after a "pending" poll answer, in which case
-	// `run` (using the real pollAfter cadence, unlike register's own
-	// tests) does not notice until its *next* poll roughly 10s later.
 	select {
 	case code := <-codeCh:
 		return code
-	case <-time.After(30 * time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("run did not return after approval")
 		return -1
 	}
 }
 
 // TestRun_Version checks `mon-client version` prints the expected line and
-// exits 0.
+// exits 0 (spec §10 step 9: the version command).
 func TestRun_Version(t *testing.T) {
 	clearEnv(t)
 	var stdout, stderr bytes.Buffer
@@ -129,14 +130,14 @@ func TestRun_NoArgsIsUsageError(t *testing.T) {
 // MON_SERVER_URL"), and that `run` carries a state-less box all the way
 // through registration (issue #16) once approved.
 func TestRun_ServerFromEnv(t *testing.T) {
-	stopLoopForTest(t)
 	stub := servertest.NewStub(t)
-	stubHTTPClientForTest(t, stub)
 	t.Setenv(envServerURL, stub.URL())
 
 	var stdout, stderr bytes.Buffer
 	codeCh := make(chan int, 1)
-	go func() { codeCh <- run([]string{"run", "--state-dir", t.TempDir()}, &stdout, &stderr) }()
+	go func() {
+		codeCh <- runCtx(context.Background(), []string{"run", "--state-dir", t.TempDir()}, &stdout, &stderr, stopAtLoop(stub))
+	}()
 
 	id := waitForPollRequest(t, stub)
 	stub.Approve(id, "ams-1", "tok")
@@ -154,21 +155,13 @@ func TestRun_ServerFromEnv(t *testing.T) {
 // args start with flags)"). It uses a pre-existing state file rather than
 // a stub registration — dispatch to runRun is the thing under test here,
 // and TestRun_ServerFromEnv/TestRun_CorruptStateIsClearedAndRegistersAgain
-// already exercise the (real-timer, ~20s) registration path itself.
+// already exercise the registration path itself.
 func TestRun_DefaultCommandIsRun(t *testing.T) {
-	stopLoopForTest(t)
 	clearEnv(t)
-	dir := t.TempDir()
-	d, err := state.Open(dir)
-	if err != nil {
-		t.Fatalf("state.Open: %v", err)
-	}
-	if err := d.Save(&state.File{MonClientID: "ams-1", Token: "tok", ServerURL: "https://x", AppliedRevision: "rev1"}); err != nil {
-		t.Fatalf("Save: %v", err)
-	}
+	dir := registeredStateDir(t)
 
 	var stdout, stderr bytes.Buffer
-	code := run([]string{"--server", "https://203.0.113.10:443", "--state-dir", dir}, &stdout, &stderr)
+	code := runCtx(context.Background(), []string{"--server", "https://203.0.113.10:443", "--state-dir", dir}, &stdout, &stderr, stopAtLoop(nil))
 	if code != 0 {
 		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr.String())
 	}
@@ -203,19 +196,11 @@ func TestRun_InvalidLogLevelIsUsageError(t *testing.T) {
 // log requirement: an existing, valid state.json logs the mon-client id
 // and skips registration entirely (no network call needed to reach exit 0).
 func TestRun_StateLoadedLogsMonClientID(t *testing.T) {
-	stopLoopForTest(t)
 	clearEnv(t)
-	dir := t.TempDir()
-	d, err := state.Open(dir)
-	if err != nil {
-		t.Fatalf("state.Open: %v", err)
-	}
-	if err := d.Save(&state.File{MonClientID: "ams-1", Token: "tok", ServerURL: "https://x", AppliedRevision: "rev1"}); err != nil {
-		t.Fatalf("Save: %v", err)
-	}
+	dir := registeredStateDir(t)
 
 	var stdout, stderr bytes.Buffer
-	code := run([]string{"run", "--server", "https://x", "--state-dir", dir}, &stdout, &stderr)
+	code := runCtx(context.Background(), []string{"run", "--server", "https://x", "--state-dir", dir}, &stdout, &stderr, stopAtLoop(nil))
 	if code != 0 {
 		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr.String())
 	}
@@ -232,7 +217,6 @@ func TestRun_StateLoadedLogsMonClientID(t *testing.T) {
 // cleared (spec §2: "стереть и регистрироваться заново"), and that `run`
 // then actually completes a fresh registration against a stub.
 func TestRun_CorruptStateIsClearedAndRegistersAgain(t *testing.T) {
-	stopLoopForTest(t)
 	clearEnv(t)
 	dir := t.TempDir()
 	if _, err := state.Open(dir); err != nil {
@@ -243,12 +227,11 @@ func TestRun_CorruptStateIsClearedAndRegistersAgain(t *testing.T) {
 	}
 
 	stub := servertest.NewStub(t)
-	stubHTTPClientForTest(t, stub)
 
 	var stdout, stderr bytes.Buffer
 	codeCh := make(chan int, 1)
 	go func() {
-		codeCh <- run([]string{"run", "--server", stub.URL(), "--state-dir", dir}, &stdout, &stderr)
+		codeCh <- runCtx(context.Background(), []string{"run", "--server", stub.URL(), "--state-dir", dir}, &stdout, &stderr, stopAtLoop(stub))
 	}()
 
 	id := waitForPollRequest(t, stub)
@@ -267,4 +250,19 @@ func TestRun_CorruptStateIsClearedAndRegistersAgain(t *testing.T) {
 	if _, statErr := os.Stat(filepath.Join(dir, "state.json")); statErr != nil {
 		t.Fatalf("state.json should exist after registration, stat err = %v", statErr)
 	}
+}
+
+// registeredStateDir is a state directory holding a valid state.json — an
+// already-registered box, so a test can reach the loop without a stub.
+func registeredStateDir(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	d, err := state.Open(dir)
+	if err != nil {
+		t.Fatalf("state.Open: %v", err)
+	}
+	if err := d.Save(&state.File{MonClientID: "ams-1", Token: "tok", ServerURL: "https://x", AppliedRevision: "rev1"}); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	return dir
 }
