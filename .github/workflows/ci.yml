@@ -51,3 +51,12 @@ jobs:
 
             - name: Test with the race detector
               run: go test -race -count=1 ./...
+
+            # mon-client generates xray.json itself (spec §4 step 2), so the
+            # generated config is checked by the real core, the same
+            # `xray -test` mon-client runs before every restart.
+            - name: Pull the xray-core image
+              run: docker pull ghcr.io/xtls/xray-core:latest
+
+            - name: Integration tests against xray-core
+              run: go test -count=1 ./internal/client/config/... -run Integration

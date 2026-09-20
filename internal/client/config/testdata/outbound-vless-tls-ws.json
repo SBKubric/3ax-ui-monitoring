@@ -1,0 +1,36 @@
+{
+  "mux": {
+    "enabled": false
+  },
+  "protocol": "vless",
+  "settings": {
+    "vnext": [
+      {
+        "address": "front.example.com",
+        "port": 8443,
+        "users": [
+          {
+            "encryption": "none",
+            "id": "8c1ef5c2-2c09-4f3a-93f2-3b5c1a4d6e70"
+          }
+        ]
+      }
+    ]
+  },
+  "streamSettings": {
+    "network": "ws",
+    "security": "tls",
+    "tlsSettings": {
+      "alpn": [
+        "h2",
+        "http/1.1"
+      ],
+      "fingerprint": "firefox",
+      "serverName": "front.example.com"
+    },
+    "wsSettings": {
+      "host": "front.example.com",
+      "path": "/probe"
+    }
+  }
+}
