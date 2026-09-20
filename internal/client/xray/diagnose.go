@@ -1,0 +1,194 @@
+package xray
+
+import (
+	"net"
+	"net/netip"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+)
+
+const (
+	// maxDetail is the protocol's cap on a result's detail (spec §4 step 3,
+	// §5: "≤ 256 символов"). Counted in runes, because xray's error chains
+	// carry non-ASCII hostnames and a byte cut could split one.
+	maxDetail = 256
+
+	// dialMarker is the line xray writes just before it opens the TCP
+	// connection of a session (research §2.4): it is the only place the
+	// session id and the target's address+port appear together, so it is how
+	// a probe finds "its" lines among every other target's.
+	dialMarker = "dialing TCP to "
+
+	// realityMarker is the Error line xray writes when the TLS certificate
+	// coming back is a real one instead of a Reality-signed one — the target
+	// is MITM'd, redirected, or simply not the Reality server any more
+	// (research §2.4). It is the only stderr signal that maps to a reason of
+	// its own (spec §5: reality_real_cert).
+	realityMarker = "REALITY: received real certificate"
+
+	// outboundFailMarker is the Info line that ends a failed outbound: it
+	// carries the whole chain of causes (dial timeout, connection refused,
+	// invalid Reality connection) and is what we put in detail when there is
+	// no dedicated reason (research §2.4, spec §5).
+	outboundFailMarker = "failed to process outbound traffic"
+)
+
+// ReasonRealityRealCert is the probe reason for a Reality handshake that got
+// a real certificate (contract §4.6, spec §5). It is duplicated here rather
+// than imported from internal/client/proto so that this package depends on
+// the standard library and internal/clock only (brief §1).
+const ReasonRealityRealCert = "reality_real_cert"
+
+// Match is what the stderr window says about one probe: a reason when xray
+// named a failure mode we have a dictionary entry for, and always the line
+// itself as the human-readable detail (spec §5).
+type Match struct {
+	// Reason is the probe reason dictionary entry, or "" when the lines only
+	// explain the failure without classifying it (a plain failed outbound —
+	// the probe keeps whatever reason its own error produced).
+	Reason string
+	// Detail is the matched line with xray's timestamp/level/session prefix
+	// stripped, at most 256 runes (spec §5).
+	Detail string
+}
+
+// logPrefix matches xray's line prefix: "2026/09/12 15:44:06.887083 [Error]
+// [1645185437] ". Diagnose strips it from detail so the heartbeat carries the
+// message, not the container's clock, and matches the session id from it.
+var logPrefix = regexp.MustCompile(`^(?:\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?\s+)?(?:\[[A-Za-z]+\]\s+)?(?:\[(\d+)\]\s+)?`)
+
+// Diagnose explains a probe to a target at addr:port from the child's stderr
+// window (spec §5): it finds the `dialing TCP to tcp:<addr>:<port>` lines
+// written inside the probe's [since, until] window, takes the session ids
+// xray printed on them, and returns the last `REALITY: received real
+// certificate` / `failed to process outbound traffic` line belonging to one
+// of those sessions. Sessions of other targets — same buffer, different
+// address — are ignored, which is the whole point of matching on the session
+// id rather than on time alone.
+//
+// It is pure by design: the caller (internal/client/probe) hands it a
+// Ring.Snapshot and the probe's own start/end times, so the matching is
+// testable against the log samples from research §2.4 without a process.
+// The bool is false when nothing in the window belongs to this target.
+func Diagnose(lines []Line, addr string, port int, since, until time.Time) (Match, bool) {
+	sessions := make(map[string]bool)
+	for _, l := range lines {
+		if !inWindow(l.At, since, until) || !strings.Contains(l.Text, dialMarker) {
+			continue
+		}
+		if !dialsTo(l.Text, addr, port) {
+			continue
+		}
+		if id := sessionID(l.Text); id != "" {
+			sessions[id] = true
+		}
+	}
+	if len(sessions) == 0 {
+		return Match{}, false
+	}
+
+	var (
+		found  bool
+		reason string
+		detail string
+	)
+	for _, l := range lines {
+		if !inWindow(l.At, since, until) {
+			continue
+		}
+		isReality := strings.Contains(l.Text, realityMarker)
+		if !isReality && !strings.Contains(l.Text, outboundFailMarker) {
+			continue
+		}
+		if !sessions[sessionID(l.Text)] {
+			continue
+		}
+		found = true
+		// The last line of either kind wins as detail (spec §5), while a
+		// Reality certificate anywhere in the session fixes the reason: the
+		// retry chain that follows it says "invalid connection", which is a
+		// consequence, not a second diagnosis.
+		detail = trimDetail(stripPrefix(l.Text))
+		if isReality {
+			reason = ReasonRealityRealCert
+		}
+	}
+	if !found {
+		return Match{}, false
+	}
+	return Match{Reason: reason, Detail: detail}, true
+}
+
+// inWindow reports whether t lies in the closed probe window. The bounds are
+// inclusive because the first dial happens in the same millisecond the probe
+// opens its SOCKS connection (research §2.3).
+func inWindow(t, since, until time.Time) bool {
+	return !t.Before(since) && !t.After(until)
+}
+
+// sessionID returns the `[N]` session id xray prints between the level and
+// the module, or "" when the line has none.
+func sessionID(text string) string {
+	m := logPrefix.FindStringSubmatch(text)
+	if m == nil {
+		return ""
+	}
+	return m[1]
+}
+
+// stripPrefix removes xray's timestamp/level/session prefix from a line.
+func stripPrefix(text string) string {
+	return strings.TrimSpace(logPrefix.ReplaceAllString(strings.TrimSpace(text), ""))
+}
+
+// trimDetail caps a detail at maxDetail runes (spec §5).
+func trimDetail(s string) string {
+	r := []rune(s)
+	if len(r) <= maxDetail {
+		return s
+	}
+	return string(r[:maxDetail])
+}
+
+// dialsTo reports whether a `dialing TCP to …` line names this target. xray
+// writes the destination as `tcp:<host>:<port>` with the host exactly as the
+// outbound has it — a hostname for a domain-fronted target, an IP for a bare
+// one — so the comparison is string-wise for hostnames and value-wise for
+// IPs (127.0.0.1 and ::ffff:127.0.0.1 are the same host).
+func dialsTo(text, addr string, port int) bool {
+	i := strings.Index(text, dialMarker)
+	if i < 0 {
+		return false
+	}
+	dest := strings.TrimSpace(text[i+len(dialMarker):])
+	if j := strings.Index(dest, " "); j >= 0 {
+		dest = dest[:j]
+	}
+	// Xray prefixes the destination with its network ("tcp:"); accept the
+	// bare form too so a future log format change does not blind us.
+	if rest, ok := strings.CutPrefix(dest, "tcp:"); ok {
+		dest = rest
+	}
+	host, portStr, err := net.SplitHostPort(dest)
+	if err != nil {
+		return false
+	}
+	p, err := strconv.Atoi(portStr)
+	if err != nil || p != port {
+		return false
+	}
+	return sameHost(host, addr)
+}
+
+// sameHost compares two hosts, as IP addresses when both parse as one and
+// case-insensitively otherwise (hostnames are case-insensitive in DNS).
+func sameHost(a, b string) bool {
+	ipA, errA := netip.ParseAddr(strings.Trim(a, "[]"))
+	ipB, errB := netip.ParseAddr(strings.Trim(b, "[]"))
+	if errA == nil && errB == nil {
+		return ipA.Unmap() == ipB.Unmap()
+	}
+	return strings.EqualFold(a, b)
+}

@@ -1,0 +1,161 @@
+// Command fakexray is a stand-in for the real xray binary in the tests of
+// internal/client/xray. It speaks the three command lines mon-client uses —
+// `-test -c <cfg>`, `run -c <cfg>` and `version` — and reproduces the
+// behaviours the spec and research pin down: exit 23 with an error line on a
+// bad config (research §2.2), "Configuration OK." on a good one, socks ports
+// that come up after a delay, research-style log lines on stderr (§2.4), and
+// a clean exit on SIGTERM.
+//
+// It lives under testdata so `go test ./...` never builds it by accident; the
+// test's TestMain compiles it once into a temp dir. Tests that need the real
+// binary use docker and skip when it is unavailable.
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"net"
+	"os"
+	"os/signal"
+	"strconv"
+	"syscall"
+	"time"
+)
+
+// config is the subset of a generated xray.json the fake understands, plus a
+// "fake" section the tests use to script it.
+type config struct {
+	Inbounds []struct {
+		Port int `json:"port"`
+	} `json:"inbounds"`
+	Fake struct {
+		// TestFail makes `-test` fail with this line and exit 23.
+		TestFail string `json:"testFail"`
+		// ExitNow makes `run` print ExitMsg and exit before listening.
+		ExitNow bool   `json:"exitNow"`
+		ExitMsg string `json:"exitMsg"`
+		// DelayMs delays binding the inbound ports, so a test can prove
+		// Start waits for readiness instead of returning early.
+		DelayMs int `json:"delayMs"`
+		// Stderr lines are printed before the ports come up, Stderr2 after.
+		Stderr  []string `json:"stderr"`
+		Stderr2 []string `json:"stderr2"`
+		// IgnoreSIGTERM makes `run` ignore SIGTERM, so a test can prove Stop
+		// escalates to SIGKILL when its context ends.
+		IgnoreSIGTERM bool `json:"ignoreSigterm"`
+	} `json:"fake"`
+}
+
+func main() {
+	args := os.Args[1:]
+	if len(args) == 0 {
+		fail("fakexray: no command")
+	}
+	switch args[0] {
+	case "version":
+		banner()
+		return
+	case "-test":
+		banner()
+		path := flagValue(args, "-c")
+		fmt.Printf("%s [Info] infra/conf/serial: Reading config: &{Name:%s Format:json}\n", stamp(), path)
+		cfg := load(path)
+		if cfg.Fake.TestFail != "" {
+			fmt.Fprintln(os.Stderr, cfg.Fake.TestFail)
+			os.Exit(23)
+		}
+		fmt.Println("Configuration OK.")
+		return
+	case "run":
+		banner()
+		path := flagValue(args, "-c")
+		fmt.Printf("%s [Info] infra/conf/serial: Reading config: &{Name:%s Format:json}\n", stamp(), path)
+		run(load(path))
+	default:
+		fail("fakexray: unknown command " + args[0])
+	}
+}
+
+// banner reproduces the two lines the real xray prints before anything else
+// (verified against ghcr.io/xtls/xray-core:latest): mon-client must look past
+// them for the line that explains a failure.
+func banner() {
+	fmt.Println("Xray 26.3.27 (Xray, Penetrates Everything.) Custom (go1.26.0 linux/amd64)")
+	fmt.Println("A unified platform for anti-censorship.")
+}
+
+func stamp() string { return time.Now().Format("2006/01/02 15:04:05.000000") }
+
+func run(cfg *config) {
+	if cfg.Fake.ExitNow {
+		msg := cfg.Fake.ExitMsg
+		if msg == "" {
+			msg = "Failed to start: main: failed to load config files"
+		}
+		fmt.Fprintln(os.Stderr, msg)
+		os.Exit(23)
+	}
+	for _, l := range cfg.Fake.Stderr {
+		fmt.Fprintln(os.Stderr, l)
+	}
+	if cfg.Fake.DelayMs > 0 {
+		time.Sleep(time.Duration(cfg.Fake.DelayMs) * time.Millisecond)
+	}
+	for _, in := range cfg.Inbounds {
+		ln, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(in.Port)))
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Failed to start: "+err.Error())
+			os.Exit(23)
+		}
+		go accept(ln)
+	}
+	for _, l := range cfg.Fake.Stderr2 {
+		fmt.Fprintln(os.Stderr, l)
+	}
+	sig := make(chan os.Signal, 1)
+	if cfg.Fake.IgnoreSIGTERM {
+		signal.Ignore(syscall.SIGTERM)
+		select {}
+	}
+	signal.Notify(sig, syscall.SIGTERM, syscall.SIGINT)
+	<-sig
+}
+
+func accept(ln net.Listener) {
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		_ = conn.Close()
+	}
+}
+
+func load(path string) *config {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "Failed to read config file: "+err.Error())
+		os.Exit(23)
+	}
+	cfg := &config{}
+	if err := json.Unmarshal(b, cfg); err != nil {
+		fmt.Fprintln(os.Stderr, "Failed to load config: "+err.Error())
+		os.Exit(23)
+	}
+	return cfg
+}
+
+func flagValue(args []string, name string) string {
+	for i, a := range args {
+		if a == name && i+1 < len(args) {
+			return args[i+1]
+		}
+	}
+	fail("fakexray: missing " + name)
+	return ""
+}
+
+func fail(msg string) {
+	fmt.Fprintln(os.Stderr, msg)
+	os.Exit(23)
+}
