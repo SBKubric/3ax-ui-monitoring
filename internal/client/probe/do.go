@@ -111,7 +111,18 @@ func Do(ctx context.Context, transport *http.Transport, probeURL, token string, 
 	transport.DisableKeepAlives = true
 	transport.TLSHandshakeTimeout = b.TLS
 	transport.ResponseHeaderTimeout = b.Headers
-	transport.DialContext = (&net.Dialer{Timeout: b.Connect}).DialContext
+	// Only install a dialer when the caller did not bring one: the AWG probe
+	// (step 6) hands Do a transport whose DialContext already points at a
+	// pre-dialed, handed-over netstack connection (an onceDialer wrapping
+	// dev.DialContext) — overwriting it here would silently redial through
+	// the tunnel a second time and throw away the manually measured connect
+	// phase that the AWG probe reports instead of Do's own (loopback- or
+	// netstack-meaningless) ConnectMs. TLSClientConfig is left alone for the
+	// same reason: Do never sets it, so a caller's trust store (production's
+	// nil for system CAs, a test's pinned pool) always wins.
+	if transport.DialContext == nil {
+		transport.DialContext = (&net.Dialer{Timeout: b.Connect}).DialContext
+	}
 
 	ctx, cancel := context.WithTimeout(ctx, b.Budget)
 	defer cancel()

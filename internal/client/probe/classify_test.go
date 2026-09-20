@@ -75,6 +75,14 @@ func TestClassify(t *testing.T) {
 			want: proto.ReasonTCPRefused,
 		},
 		{
+			// gVisor's netstack (internal/client/awg's dialer) words a
+			// refused dial differently from the kernel; both must classify
+			// the same way so the AWG probe benefits from this table too.
+			name: "gvisor dial refused",
+			err:  errors.New("dial tcp 10.66.66.1:8443: connection was refused"),
+			want: proto.ReasonTCPRefused,
+		},
+		{
 			name: "broken exchange after tls",
 			err:  errors.New("unexpected EOF"),
 			ph:   Phases{ConnectMs: ms(1), TlsMs: ms(40)},

@@ -45,9 +45,12 @@ func Classify(err error, ph Phases, b Budgets) (reason, detail string) {
 		// 200 или чужой nonce"). The tunnel itself is fine.
 		return proto.ReasonHTTPError, detail
 
-	case errors.Is(err, syscall.ECONNREFUSED), strings.Contains(text, "connection refused"):
+	case errors.Is(err, syscall.ECONNREFUSED), strings.Contains(text, "connection refused"), strings.Contains(text, "connection was refused"):
 		// Nothing is listening: the local socks port (xray is down or never
-		// started this inbound) or, through the tunnel, the far side.
+		// started this inbound) or, through the tunnel, the far side. The
+		// kernel words this "connection refused"; gVisor's netstack (the
+		// AWG probe's dialer, step 6) words the identical condition
+		// "connection was refused" — both name the same reason.
 		return proto.ReasonTCPRefused, detail
 
 	case strings.Contains(text, tlsTimeoutText):
