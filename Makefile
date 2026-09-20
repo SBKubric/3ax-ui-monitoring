@@ -1,11 +1,14 @@
 MODULE  := github.com/SBKubric/3ax-ui-monitoring
 VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
-LDFLAGS := -X $(MODULE)/internal/config.version=$(VERSION)
+LDFLAGS := -X $(MODULE)/internal/config.version=$(VERSION) -X $(MODULE)/internal/version.version=$(VERSION)
 
-.PHONY: build test vet fmt lint check e2e
+.PHONY: build build-client test vet fmt lint check e2e
 
 build:
 	go build -ldflags "$(LDFLAGS)" -o mon-server ./cmd/mon-server
+
+build-client:
+	go build -ldflags "$(LDFLAGS)" -o mon-client ./cmd/mon-client
 
 test:
 	go test -race -count=1 ./...
