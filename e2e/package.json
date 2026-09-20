@@ -1,0 +1,14 @@
+{
+  "name": "3ax-ui-monitoring-e2e",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Playwright e2e harness for mon-server's admin UI, against the repo's own Docker image.",
+  "scripts": {
+    "test": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.63.0",
+    "@types/node": "26.5.1",
+    "typescript": "5.9.3"
+  }
+}

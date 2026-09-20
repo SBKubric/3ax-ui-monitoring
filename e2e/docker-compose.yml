@@ -1,0 +1,51 @@
+# Compose file for the Playwright e2e harness. Builds the repo's own image
+# and starts one mon-server instance with a fresh, throwaway database — never
+# a developer's or production /var/lib/mon-server. See docs/agents/testing.md
+# ("E2E tests") and `make e2e`.
+services:
+  mon-server:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    environment:
+      TZ: UTC
+      MON_LISTEN: ":443"
+      MON_PUBLIC_IP: "127.0.0.1"
+      MON_DATA_DIR: "/var/lib/mon-server"
+      MON_TLS_MODE: "files"
+      MON_TLS_CERT: "/var/lib/mon-server/e2e-cert.pem"
+      MON_TLS_KEY: "/var/lib/mon-server/e2e-key.pem"
+      E2E_USERNAME: ${E2E_USERNAME:-e2e}
+      MON_ADMIN_PASSWORD: ${E2E_PASSWORD:-e2e-password}
+    # The image's own entrypoint (/app/mon-server) just execs `run`. Override
+    # it with a small shell that, on this fresh database/volume: mints a
+    # self-signed certificate for 127.0.0.1 (tls.mode=acme-ip would try to
+    # reach Let's Encrypt over the real internet, which e2e must never do —
+    # architecture brief §1, "no network, no real ACME"), stamps the admin
+    # login mon-server's own CLI (`admin set`, MON_ADMIN_PASSWORD for the
+    # non-interactive path — cmd/mon-server/cli.go), then hands off to the
+    # real entrypoint.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 1 \
+          -keyout "$$MON_TLS_KEY" -out "$$MON_TLS_CERT" \
+          -subj /CN=127.0.0.1 -addext subjectAltName=IP:127.0.0.1
+        /app/mon-server admin set "$$E2E_USERNAME"
+        exec /app/mon-server run
+    ports:
+      - "${E2E_PORT:-8443}:443"
+    # Anonymous volume: a fresh /var/lib/mon-server (database, cert, key)
+    # every time this compose project is brought up, never a host
+    # bind-mount. `make e2e` runs `docker compose down -v` on teardown so the
+    # volume never survives a run.
+    volumes:
+      - /var/lib/mon-server
+    healthcheck:
+      test: ["CMD", "curl", "-fsSk", "https://127.0.0.1:443/healthz"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
