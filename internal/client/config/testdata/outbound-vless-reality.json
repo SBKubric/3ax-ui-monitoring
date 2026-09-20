@@ -1,0 +1,33 @@
+{
+  "mux": {
+    "enabled": false
+  },
+  "protocol": "vless",
+  "settings": {
+    "vnext": [
+      {
+        "address": "198.51.100.10",
+        "port": 443,
+        "users": [
+          {
+            "encryption": "none",
+            "flow": "xtls-rprx-vision",
+            "id": "8c1ef5c2-2c09-4f3a-93f2-3b5c1a4d6e70"
+          }
+        ]
+      }
+    ]
+  },
+  "streamSettings": {
+    "network": "tcp",
+    "realitySettings": {
+      "fingerprint": "chrome",
+      "publicKey": "jNXHt1yRo0vDuchQlIP6Z0ZvjT3KtzVI-T4E7RoLJS0",
+      "serverName": "www.microsoft.com",
+      "shortId": "6ba85179e30d4fc2",
+      "show": false,
+      "spiderX": "/KmSmLBwPvOvfmd"
+    },
+    "security": "reality"
+  }
+}

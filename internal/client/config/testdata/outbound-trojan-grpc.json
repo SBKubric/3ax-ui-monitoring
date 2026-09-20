@@ -1,0 +1,26 @@
+{
+  "mux": {
+    "enabled": false
+  },
+  "protocol": "trojan",
+  "settings": {
+    "servers": [
+      {
+        "address": "198.51.100.20",
+        "password": "s3cr3t-p4ssw0rd",
+        "port": 443
+      }
+    ]
+  },
+  "streamSettings": {
+    "grpcSettings": {
+      "multiMode": true,
+      "serviceName": "probesvc"
+    },
+    "network": "grpc",
+    "security": "tls",
+    "tlsSettings": {
+      "serverName": "trojan.example.org"
+    }
+  }
+}

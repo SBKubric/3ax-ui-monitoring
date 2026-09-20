@@ -1,0 +1,20 @@
+{
+  "mux": {
+    "enabled": false
+  },
+  "protocol": "shadowsocks",
+  "settings": {
+    "servers": [
+      {
+        "address": "198.51.100.30",
+        "method": "aes-256-gcm",
+        "password": "hunter2hunter2",
+        "port": 8388
+      }
+    ]
+  },
+  "streamSettings": {
+    "network": "tcp",
+    "security": "none"
+  }
+}

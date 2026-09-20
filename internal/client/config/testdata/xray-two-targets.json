@@ -1,0 +1,114 @@
+{
+  "inbounds": [
+    {
+      "listen": "127.0.0.1",
+      "port": 10801,
+      "protocol": "socks",
+      "settings": {
+        "auth": "noauth",
+        "udp": false
+      },
+      "tag": "in-xray-12-proxy"
+    },
+    {
+      "listen": "127.0.0.1",
+      "port": 10802,
+      "protocol": "socks",
+      "settings": {
+        "auth": "noauth",
+        "udp": false
+      },
+      "tag": "in-xray-12-direct"
+    }
+  ],
+  "log": {
+    "access": "none",
+    "loglevel": "info"
+  },
+  "outbounds": [
+    {
+      "mux": {
+        "enabled": false
+      },
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "198.51.100.10",
+            "port": 443,
+            "users": [
+              {
+                "encryption": "none",
+                "flow": "xtls-rprx-vision",
+                "id": "8c1ef5c2-2c09-4f3a-93f2-3b5c1a4d6e70"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "realitySettings": {
+          "fingerprint": "chrome",
+          "publicKey": "jNXHt1yRo0vDuchQlIP6Z0ZvjT3KtzVI-T4E7RoLJS0",
+          "serverName": "www.microsoft.com",
+          "shortId": "6ba85179e30d4fc2",
+          "show": false,
+          "spiderX": "/KmSmLBwPvOvfmd"
+        },
+        "security": "reality"
+      },
+      "tag": "out-xray-12-proxy"
+    },
+    {
+      "mux": {
+        "enabled": false
+      },
+      "protocol": "trojan",
+      "settings": {
+        "servers": [
+          {
+            "address": "198.51.100.20",
+            "password": "s3cr3t-p4ssw0rd",
+            "port": 443
+          }
+        ]
+      },
+      "streamSettings": {
+        "grpcSettings": {
+          "multiMode": true,
+          "serviceName": "probesvc"
+        },
+        "network": "grpc",
+        "security": "tls",
+        "tlsSettings": {
+          "serverName": "trojan.example.org"
+        }
+      },
+      "tag": "out-xray-12-direct"
+    },
+    {
+      "protocol": "blackhole",
+      "tag": "block"
+    }
+  ],
+  "routing": {
+    "domainStrategy": "AsIs",
+    "rules": [
+      {
+        "inboundTag": [
+          "in-xray-12-proxy"
+        ],
+        "outboundTag": "out-xray-12-proxy",
+        "type": "field"
+      },
+      {
+        "inboundTag": [
+          "in-xray-12-direct"
+        ],
+        "outboundTag": "out-xray-12-direct",
+        "type": "field"
+      }
+    ]
+  }
+}
