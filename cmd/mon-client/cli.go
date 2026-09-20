@@ -14,9 +14,16 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
+	"time"
 
 	"github.com/SBKubric/3ax-ui-monitoring/internal/client/api"
+	"github.com/SBKubric/3ax-ui-monitoring/internal/client/app"
+	"github.com/SBKubric/3ax-ui-monitoring/internal/client/awg"
+	"github.com/SBKubric/3ax-ui-monitoring/internal/client/heartbeat"
+	"github.com/SBKubric/3ax-ui-monitoring/internal/client/probe"
 	"github.com/SBKubric/3ax-ui-monitoring/internal/client/register"
 	"github.com/SBKubric/3ax-ui-monitoring/internal/client/state"
 	"github.com/SBKubric/3ax-ui-monitoring/internal/version"
@@ -30,6 +37,13 @@ import (
 // mon-server or any flag/CA-file plumbing of its own (issue #16's brief:
 // "keep it simple").
 var httpClientForTests *http.Client
+
+// beforeLoopForTests, when non-nil, is called with the run's cancel
+// function after registration and just before the probe loop starts.
+// Production never touches it; this package's own tests use it to stop a
+// run that would otherwise only end on SIGINT/SIGTERM, so a CLI test still
+// asserts on everything `run` does without waiting out a probe interval.
+var beforeLoopForTests func(cancel context.CancelFunc)
 
 // envServerURL is spec §2's ENV alternative to --server.
 const envServerURL = "MON_SERVER_URL"
@@ -153,16 +167,24 @@ func runRun(args []string, stdout, stderr io.Writer) int {
 		needsRegistration = true
 	}
 
+	// Spec §6/§9: the loop runs until the box is stopped, so everything
+	// below hangs off one context a SIGINT or SIGTERM cancels — including
+	// the registration wait, which is otherwise the longest thing a
+	// mon-client can be sitting in.
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
+	hc := httpClientForTests
+	if hc == nil {
+		hc = &http.Client{}
+	}
+
 	if needsRegistration {
-		hc := httpClientForTests
-		if hc == nil {
-			hc = &http.Client{}
-		}
 		hostname, err := os.Hostname()
 		if err != nil {
 			hostname = ""
 		}
-		f, err = register.Run(context.Background(), register.Deps{
+		f, err = register.Run(ctx, register.Deps{
 			API:      api.New(serverURL, hc),
 			State:    dir,
 			Log:      logger,
@@ -178,10 +200,62 @@ func runRun(args []string, stdout, stderr io.Writer) int {
 
 	logger.Info(fmt.Sprintf("registered as %s", f.MonClientID))
 
-	// The config/probe/heartbeat loop arrives in step 7
-	// (internal/client/app.Loop); this step only carries mon-client
-	// through registration and proves it end to end against a stub.
+	buffer, err := openBuffer(dir, logger)
+	if err != nil {
+		fmt.Fprintf(stderr, "mon-client: %v\n", err)
+		return 1
+	}
+
+	client := api.New(serverURL, hc)
+	client.Token = f.Token
+
+	// ProvisionalApplier is step 7's stand-in: it builds the probes but
+	// writes no xray.json and starts no xray child (step 8 does both), so
+	// --xray-bin still has nothing to run and xrayVersion is reported
+	// empty in every heartbeat until then.
+	applier := app.NewProvisionalApplier(&probe.Prober{Logger: logger}, &awg.Prober{Log: logger}, dir, f, logger)
+
+	loop := app.NewLoop(app.Deps{
+		API:       client,
+		State:     dir,
+		File:      f,
+		Buffer:    buffer,
+		Runner:    probe.NewRunner(logger),
+		Applier:   applier,
+		Log:       logger,
+		Version:   version.Version(),
+		StartedAt: time.Now(),
+	})
+
+	if beforeLoopForTests != nil {
+		beforeLoopForTests(cancel)
+	}
+	if err := loop.Run(ctx); err != nil {
+		// Spec §6's 401/403 branches are step 9's; until then, saying
+		// exactly why mon-client stopped is the whole of the handling.
+		fmt.Fprintf(stderr, "mon-client: %v\n", err)
+		return 1
+	}
 	return 0
+}
+
+// openBuffer opens cycles.json, recovering from a file that cannot be
+// decoded. heartbeat.OpenBuffer refuses such a file on purpose (starting
+// over would reuse cycle seqs mon-server has already acknowledged), but
+// refusing to start a mon-client over a corrupt statistics buffer is the
+// worse trade: the operator is told, the file is moved out of the way, and
+// the box goes back to probing.
+func openBuffer(dir *state.Dir, logger *slog.Logger) (*heartbeat.Buffer, error) {
+	path := dir.Path("cycles.json")
+	buf, err := heartbeat.OpenBuffer(path)
+	if err == nil {
+		return buf, nil
+	}
+	logger.Warn("cycles buffer unreadable, starting a fresh one", "error", err)
+	if rmErr := os.Remove(path); rmErr != nil {
+		return nil, rmErr
+	}
+	return heartbeat.OpenBuffer(path)
 }
 
 // parseLogLevel maps --log-level's four accepted spellings (issue #15) onto

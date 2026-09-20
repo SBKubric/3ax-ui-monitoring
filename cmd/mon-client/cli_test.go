@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -29,6 +30,18 @@ func stubHTTPClientForTest(t *testing.T, stub *servertest.Stub) {
 	old := httpClientForTests
 	httpClientForTests = stub.HTTPClient()
 	t.Cleanup(func() { httpClientForTests = old })
+}
+
+// stopLoopForTest makes `run` stop as soon as it reaches the probe loop,
+// through cli.go's beforeLoopForTests hook. Every test that drives a
+// successful `run` needs it: since step 7 the loop only ends on
+// SIGINT/SIGTERM, and a CLI test asserting on registration has no interest
+// in waiting out a probe interval.
+func stopLoopForTest(t *testing.T) {
+	t.Helper()
+	old := beforeLoopForTests
+	beforeLoopForTests = func(cancel context.CancelFunc) { cancel() }
+	t.Cleanup(func() { beforeLoopForTests = old })
 }
 
 // waitForPollRequest waits for stub to have received a GET
@@ -116,6 +129,7 @@ func TestRun_NoArgsIsUsageError(t *testing.T) {
 // MON_SERVER_URL"), and that `run` carries a state-less box all the way
 // through registration (issue #16) once approved.
 func TestRun_ServerFromEnv(t *testing.T) {
+	stopLoopForTest(t)
 	stub := servertest.NewStub(t)
 	stubHTTPClientForTest(t, stub)
 	t.Setenv(envServerURL, stub.URL())
@@ -142,6 +156,7 @@ func TestRun_ServerFromEnv(t *testing.T) {
 // and TestRun_ServerFromEnv/TestRun_CorruptStateIsClearedAndRegistersAgain
 // already exercise the (real-timer, ~20s) registration path itself.
 func TestRun_DefaultCommandIsRun(t *testing.T) {
+	stopLoopForTest(t)
 	clearEnv(t)
 	dir := t.TempDir()
 	d, err := state.Open(dir)
@@ -188,6 +203,7 @@ func TestRun_InvalidLogLevelIsUsageError(t *testing.T) {
 // log requirement: an existing, valid state.json logs the mon-client id
 // and skips registration entirely (no network call needed to reach exit 0).
 func TestRun_StateLoadedLogsMonClientID(t *testing.T) {
+	stopLoopForTest(t)
 	clearEnv(t)
 	dir := t.TempDir()
 	d, err := state.Open(dir)
@@ -216,6 +232,7 @@ func TestRun_StateLoadedLogsMonClientID(t *testing.T) {
 // cleared (spec §2: "стереть и регистрироваться заново"), and that `run`
 // then actually completes a fresh registration against a stub.
 func TestRun_CorruptStateIsClearedAndRegistersAgain(t *testing.T) {
+	stopLoopForTest(t)
 	clearEnv(t)
 	dir := t.TempDir()
 	if _, err := state.Open(dir); err != nil {
