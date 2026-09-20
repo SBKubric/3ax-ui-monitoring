@@ -11,10 +11,12 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/SBKubric/3ax-ui-monitoring/internal/panel"
 	"github.com/SBKubric/3ax-ui-monitoring/internal/panel/paneltest"
 	"github.com/SBKubric/3ax-ui-monitoring/internal/state"
 
@@ -648,5 +650,125 @@ func TestState_WiredIntoServer(t *testing.T) {
 	}
 	if mc.State != store.MonClientOnline {
 		t.Fatalf("mon-client state = %s, want ONLINE after a heartbeat over the listener", mc.State)
+	}
+}
+
+// TestStats_WiredIntoServer checks step 7's wiring end to end, on the App's
+// own listener and against a real panel stub: a heartbeat's probe results
+// become a 5-minute bucket (spec §7.4), and once the bucket has closed —
+// five minutes of window plus the one-minute grace, stepped through on the
+// Fake clock — the next poll cycle sends it to POST /stats (spec §4 step 4).
+// Nothing here reaches into the buckets directly, so it fails if either
+// half of the wiring (engine Stats sink, poller StatsFlusher) is missing.
+func TestStats_WiredIntoServer(t *testing.T) {
+	dir := t.TempDir()
+	certPath, keyPath := tlsxtest.WriteSelfSigned(t, dir)
+	st, err := store.Open(filepath.Join(dir, "t.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	clk := clock.NewFake(time.Date(2025, 9, 12, 10, 0, 0, 0, time.UTC))
+	cfg := &config.Config{
+		Listen:  "127.0.0.1:0",
+		DataDir: dir,
+		TLS:     config.TLSConfig{Mode: config.TLSModeFiles, Cert: certPath, Key: keyPath},
+	}
+	a, err := New(Deps{Cfg: cfg, Store: st, Clock: clk, Notifier: tg.Nop{}})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = a.Shutdown(ctx)
+	})
+	certPEM, err := os.ReadFile(certPath)
+	if err != nil {
+		t.Fatalf("read cert: %v", err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(certPEM) {
+		t.Fatal("AppendCertsFromPEM: failed to parse test cert")
+	}
+	clientTLS := &tls.Config{RootCAs: pool}
+
+	// A panel with one xray inbound and its probe material, so the config
+	// builder has a target to hand the mon-client at all.
+	stub := paneltest.NewStub(t)
+	stub.SetInbounds([]panel.Inbound{{Kind: store.InboundKindXray, InboundId: 12, Tag: "inbound-443", Protocol: "vless", Port: 443, Enable: true}})
+	stub.SetItems(store.PathDirect, []panel.ProbeItem{{Kind: store.InboundKindXray, InboundId: 12, Link: "vless://probe"}})
+	set := store.DefaultSettings()
+	set.PanelURL = stub.URL()
+	set.MonToken = stub.Token()
+	if err := st.SaveSettings(set); err != nil {
+		t.Fatalf("SaveSettings: %v", err)
+	}
+
+	ctx := context.Background()
+	reg := a.Registry()
+	out, err := reg.Register(ctx, registry.RegisterInput{PairingCode: "ABCDEF", Hostname: "h", RemoteIP: "198.51.100.9"})
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if _, err := reg.Approve(ctx, out.RequestID, registry.ApproveInput{Name: "ams-1"}); err != nil {
+		t.Fatalf("Approve: %v", err)
+	}
+	poll, err := reg.Poll(ctx, out.RequestID)
+	if err != nil {
+		t.Fatalf("Poll: %v", err)
+	}
+
+	addr, err := a.Start()
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	// One cycle so the poller has probe material and the config builder has
+	// given this mon-client its target; without it the heartbeat's results
+	// are stripped as unknown targets (spec §7.1).
+	if err := a.Poller().Poll(ctx); err != nil {
+		t.Fatalf("first Poll: %v", err)
+	}
+
+	body := `{"monClientId":"ams-1","configRevision":"","client":{"version":"0.1.0"},"cycles":[` +
+		`{"seq":1,"ts":` + strconv.FormatInt(clock.Ms(clk.Now()), 10) + `,"unverified":false,"results":[` +
+		`{"inboundKind":"xray","inboundId":12,"path":"direct","ok":true,"tlsMs":42}]}]}`
+	req, err := http.NewRequest(http.MethodPost, "https://"+addr+"/v1/heartbeat", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+poll.Token)
+	req.Header.Set("Content-Type", "application/json")
+	client := &http.Client{Transport: &http.Transport{TLSClientConfig: clientTLS}}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("POST /v1/heartbeat: %v", err)
+	}
+	respBody, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", resp.StatusCode, respBody)
+	}
+
+	if got := len(stub.Stats()); got != 0 {
+		t.Fatalf("panel already holds %d stat rows, but the bucket has not closed yet", got)
+	}
+
+	// Five minutes of window plus the one-minute grace (spec §7.4).
+	clk.Advance(6 * time.Minute)
+	if err := a.Poller().Poll(ctx); err != nil {
+		t.Fatalf("second Poll: %v", err)
+	}
+
+	stats := stub.Stats()
+	if len(stats) != 1 {
+		t.Fatalf("panel holds %d stat rows (%+v), want the one closed bucket", len(stats), stats)
+	}
+	got := stats[0]
+	if got.MonClientId != "ams-1" || got.InboundKind != store.InboundKindXray || got.InboundId != 12 ||
+		got.Path != store.PathDirect || got.NOk != 1 || got.NFail != 0 {
+		t.Fatalf("stat = %+v, want the heartbeat's one successful direct probe", got)
+	}
+	if got.LatencyAvgMs == nil || *got.LatencyAvgMs != 42 {
+		t.Fatalf("latencyAvgMs = %v, want 42 from the probe's tlsMs", got.LatencyAvgMs)
 	}
 }

@@ -325,6 +325,19 @@ type StatsBucket struct {
 	LatMax      *int64 `json:"latMax" gorm:"column:lat_max"`
 	HandshakeMs *int64 `json:"handshakeMs" gorm:"column:handshake_ms"`
 
+	// LatSum and LatN are the bookkeeping behind LatAvg, not part of the
+	// wire form (contract §4.7 sends only min/avg/max). A bucket is built
+	// incrementally — a heartbeat five minutes late adds cycles to a bucket
+	// that already holds others (spec §7.4) — and an average cannot be
+	// merged from an average alone: recomputing it from the stored mean
+	// would need the sample count, and keeping only the mean would drift
+	// with every rounding. Storing the exact sum and the number of samples
+	// makes LatAvg = LatSum/LatN exact at every step, no matter how the
+	// cycles arrive. LatN counts only successful probes that actually
+	// carried a tlsMs, which is why it is not simply NOk.
+	LatSum int64 `json:"-" gorm:"column:lat_sum;not null;default:0"`
+	LatN   int   `json:"-" gorm:"column:lat_n;not null;default:0"`
+
 	SentAt *int64 `json:"sentAt" gorm:"column:sent_at;index:idx_ms_stats_buckets_sent_at"`
 }
 

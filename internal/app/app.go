@@ -208,15 +208,24 @@ func newApp(d Deps, readTimeout, writeTimeout time.Duration) (*App, error) {
 	// (spec §4.1). The poller hands it the panel's inbound list so a
 	// disabled or vanished inbound pauses its targets (spec §4 step 3), and
 	// the registry tells it when an administrator disables a mon-client
-	// (spec §6). Stats stays nil until step 7 wires its buckets in.
+	// (spec §6).
+	//
+	// Step 7's 5-minute buckets sit on both sides of the same seam: the
+	// engine hands them every accepted cycle (spec §7.4) and the poller
+	// flushes the closed ones to POST /stats at the end of each cycle (§4
+	// step 4). They are built here, before the engine, because the engine
+	// takes them as a dependency.
+	buckets := state.NewBuckets(d.Store, d.Clock)
 	engine := state.New(state.Deps{
 		Store:     d.Store,
 		Clock:     d.Clock,
 		Notifier:  d.Notifier,
 		PanelDown: poller.PanelDown,
 		Configs:   configs,
+		Stats:     buckets,
 	})
 	poller.SetInbounds(engine)
+	poller.SetStats(buckets)
 	reg.SetHooks(registry.Hooks{
 		PathsChanged: configs.Rebuild,
 		Approved:     configs.Rebuild,
