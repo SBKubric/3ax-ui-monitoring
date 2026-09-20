@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/SBKubric/3ax-ui-monitoring/internal/client/proto"
 )
 
 const (
@@ -35,11 +37,12 @@ const (
 	outboundFailMarker = "failed to process outbound traffic"
 )
 
-// ReasonRealityRealCert is the probe reason for a Reality handshake that got
-// a real certificate (contract §4.6, spec §5). It is duplicated here rather
-// than imported from internal/client/proto so that this package depends on
-// the standard library and internal/clock only (brief §1).
-const ReasonRealityRealCert = "reality_real_cert"
+// ReasonRealityRealCert is the probe reason for a Reality handshake that
+// got a real certificate (contract §4.6, spec §5). It is an alias of the
+// protocol's own constant rather than a second copy of the string: this
+// package names it because Diagnose returns it, and every caller compares
+// against the same value proto defines.
+const ReasonRealityRealCert = proto.ReasonRealityRealCert
 
 // Match is what the stderr window says about one probe: a reason when xray
 // named a failure mode we have a dictionary entry for, and always the line

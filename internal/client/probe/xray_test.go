@@ -77,7 +77,7 @@ func (f *probeFixture) probeURL() string { return f.stub.URL() + "/v1/probe" }
 // asked about (config.XrayPlan, step 3).
 func plan(socksPort int) config.XrayPlan {
 	return config.XrayPlan{
-		Key:        config.TargetKey(testKey),
+		Key:        testKey,
 		SocksPort:  socksPort,
 		InboundTag: "in-xray-12-proxy",
 		ServerAddr: "real.example",

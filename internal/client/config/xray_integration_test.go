@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/SBKubric/3ax-ui-monitoring/internal/client/proto"
 )
 
 // xrayImage is the official image, the tag the brief pins for every test that
@@ -24,19 +26,19 @@ const xrayImage = "ghcr.io/xtls/xray-core:latest"
 func TestIntegrationXrayAcceptsGeneratedConfig(t *testing.T) {
 	cases := []struct {
 		name    string
-		targets []Target
+		targets []proto.Target
 	}{
 		// The two-target golden: what a mon-client with one inbound and
 		// both paths actually runs.
 		{"two targets", twoTargets(t)},
 		// One target per supported protocol, so every branch of ParseLink
 		// is validated by the core and not only by a golden.
-		{"every protocol", []Target{
-			{InboundKind: "xray", InboundID: 1, Path: "proxy", Protocol: "vless", Link: vlessRealityLink},
-			{InboundKind: "xray", InboundID: 2, Path: "proxy", Protocol: "vless", Link: vlessTLSWSLink},
-			{InboundKind: "xray", InboundID: 3, Path: "proxy", Protocol: "trojan", Link: trojanGRPCLink},
-			{InboundKind: "xray", InboundID: 4, Path: "proxy", Protocol: "shadowsocks", Link: ssLink},
-			{InboundKind: "xray", InboundID: 5, Path: "proxy", Protocol: "vmess", Link: vmessLink()},
+		{"every protocol", []proto.Target{
+			{TargetKey: proto.TargetKey{InboundKind: "xray", InboundID: 1, Path: "proxy"}, Protocol: "vless", Link: vlessRealityLink},
+			{TargetKey: proto.TargetKey{InboundKind: "xray", InboundID: 2, Path: "proxy"}, Protocol: "vless", Link: vlessTLSWSLink},
+			{TargetKey: proto.TargetKey{InboundKind: "xray", InboundID: 3, Path: "proxy"}, Protocol: "trojan", Link: trojanGRPCLink},
+			{TargetKey: proto.TargetKey{InboundKind: "xray", InboundID: 4, Path: "proxy"}, Protocol: "shadowsocks", Link: ssLink},
+			{TargetKey: proto.TargetKey{InboundKind: "xray", InboundID: 5, Path: "proxy"}, Protocol: "vmess", Link: vmessLink()},
 		}},
 		// A mon-client whose config has no xray-targets still writes a
 		// config file, and the core has to accept it (spec §4 step 4).

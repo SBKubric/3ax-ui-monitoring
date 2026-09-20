@@ -5,17 +5,19 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+
+	"github.com/SBKubric/3ax-ui-monitoring/internal/client/proto"
 )
 
 // twoTargets is the fixture every xray.json test uses: two xray-targets of one
 // inbound (the two paths of spec §4) plus an AWG-target, which must not reach
 // the xray config at all.
-func twoTargets(t *testing.T) []Target {
+func twoTargets(t *testing.T) []proto.Target {
 	t.Helper()
-	return []Target{
-		{InboundKind: "xray", InboundID: 12, Path: "proxy", Protocol: "vless", Link: vlessRealityLink},
-		{InboundKind: "xray", InboundID: 12, Path: "direct", Protocol: "trojan", Link: trojanGRPCLink},
-		{InboundKind: "awg", InboundID: 0, Path: "proxy", Protocol: "awg", Conf: readConf(t)},
+	return []proto.Target{
+		{TargetKey: proto.TargetKey{InboundKind: "xray", InboundID: 12, Path: "proxy"}, Protocol: "vless", Link: vlessRealityLink},
+		{TargetKey: proto.TargetKey{InboundKind: "xray", InboundID: 12, Path: "direct"}, Protocol: "trojan", Link: trojanGRPCLink},
+		{TargetKey: proto.TargetKey{InboundKind: "awg", InboundID: 0, Path: "proxy"}, Protocol: "awg", Conf: readConf(t)},
 	}
 }
 
@@ -31,14 +33,14 @@ func TestBuildXrayGolden(t *testing.T) {
 
 	want := []XrayPlan{
 		{
-			Key:        TargetKey{InboundKind: "xray", InboundID: 12, Path: "proxy"},
+			Key:        proto.TargetKey{InboundKind: "xray", InboundID: 12, Path: "proxy"},
 			SocksPort:  10801,
 			InboundTag: "in-xray-12-proxy",
 			ServerAddr: "198.51.100.10",
 			ServerPort: 443,
 		},
 		{
-			Key:        TargetKey{InboundKind: "xray", InboundID: 12, Path: "direct"},
+			Key:        proto.TargetKey{InboundKind: "xray", InboundID: 12, Path: "direct"},
 			SocksPort:  10802,
 			InboundTag: "in-xray-12-direct",
 			ServerAddr: "198.51.100.20",
@@ -104,9 +106,10 @@ func TestBuildXrayEmpty(t *testing.T) {
 // target key in the message, because that text becomes `configError` and the
 // operator has to know which target is broken (spec §4 step 3).
 func TestBuildXrayErrorNamesTarget(t *testing.T) {
-	targets := []Target{{
-		InboundKind: "xray", InboundID: 7, Path: "proxy", Protocol: "vless",
-		Link: "vless://id@198.51.100.10:443?security=reality&pbk=k", // no fp
+	targets := []proto.Target{{
+		TargetKey: proto.TargetKey{InboundKind: "xray", InboundID: 7, Path: "proxy"},
+		Protocol:  "vless",
+		Link:      "vless://id@198.51.100.10:443?security=reality&pbk=k", // no fp
 	}}
 	_, _, err := BuildXray(targets, FirstSocksPort)
 	if err == nil {

@@ -350,7 +350,7 @@ func (a *RevisionApplier) buildProbes(doc *proto.ConfigDoc, plans []config.XrayP
 		diag = a.d.Xray
 	}
 	for _, plan := range plans {
-		probes[proto.TargetKey(plan.Key)] = func(ctx context.Context, k proto.TargetKey) proto.Result {
+		probes[plan.Key] = func(ctx context.Context, k proto.TargetKey) proto.Result {
 			return a.d.XrayProber.Xray(ctx, doc.ProbeURL, token, k, plan, budgets, diag)
 		}
 	}
@@ -378,19 +378,7 @@ func (a *RevisionApplier) token() string {
 // The first target that will not parse fails the whole document, naming
 // itself — that text is the configError an operator reads (spec §4 step 3).
 func parseDoc(doc *proto.ConfigDoc) ([]byte, []config.XrayPlan, map[proto.TargetKey]*config.AWGConfig, error) {
-	targets := make([]config.Target, 0, len(doc.Targets))
-	for _, t := range doc.Targets {
-		targets = append(targets, config.Target{
-			InboundKind: t.InboundKind,
-			InboundID:   t.InboundID,
-			Path:        t.Path,
-			Protocol:    t.Protocol,
-			Link:        t.Link,
-			Conf:        t.Conf,
-		})
-	}
-
-	cfgJSON, plans, err := config.BuildXray(targets, config.FirstSocksPort)
+	cfgJSON, plans, err := config.BuildXray(doc.Targets, config.FirstSocksPort)
 	if err != nil {
 		return nil, nil, nil, err
 	}

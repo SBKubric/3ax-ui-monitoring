@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+
+	"github.com/SBKubric/3ax-ui-monitoring/internal/client/proto"
 )
 
 const (
@@ -25,7 +27,7 @@ const (
 // server address the xray stderr reader has to match `dialing TCP to
 // tcp:<addr>:<port>` against (research §2.4).
 type XrayPlan struct {
-	Key        TargetKey
+	Key        proto.TargetKey
 	SocksPort  int
 	InboundTag string
 	ServerAddr string
@@ -45,7 +47,7 @@ type XrayPlan struct {
 //
 // An error names the offending target key and the field at fault so that the
 // run loop can send it as `configError` (spec §4 step 3).
-func BuildXray(targets []Target, firstPort int) ([]byte, []XrayPlan, error) {
+func BuildXray(targets []proto.Target, firstPort int) ([]byte, []XrayPlan, error) {
 	if firstPort <= 0 {
 		firstPort = FirstSocksPort
 	}
@@ -60,7 +62,7 @@ func BuildXray(targets []Target, firstPort int) ([]byte, []XrayPlan, error) {
 		if t.Link == "" {
 			continue
 		}
-		key := t.Key()
+		key := t.TargetKey
 		outbound, addr, serverPort, err := ParseLink(t.Link)
 		if err != nil {
 			return nil, nil, fmt.Errorf("target %s: %w", key, err)
@@ -110,12 +112,12 @@ func BuildXray(targets []Target, firstPort int) ([]byte, []XrayPlan, error) {
 
 // InboundTag is the socks inbound's tag, "in-<kind>-<inboundId>-<path>"
 // (spec §4 step 2). The xray log reader and the routing rules both use it.
-func InboundTag(k TargetKey) string { return tag("in", k) }
+func InboundTag(k proto.TargetKey) string { return tag("in", k) }
 
 // outboundTag mirrors InboundTag for the outbound side.
-func outboundTag(k TargetKey) string { return tag("out", k) }
+func outboundTag(k proto.TargetKey) string { return tag("out", k) }
 
-func tag(prefix string, k TargetKey) string {
+func tag(prefix string, k proto.TargetKey) string {
 	return strings.Join([]string{prefix, k.InboundKind, strconv.Itoa(k.InboundID), k.Path}, "-")
 }
 
