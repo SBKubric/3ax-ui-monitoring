@@ -412,3 +412,57 @@ func TestSupervisor_RevokedWhileDisabledRegistersAgain(t *testing.T) {
 	h.waitFor("state.json to be cleared", func() bool { return !h.stateExists() })
 	h.waitFor("a new registration request", func() bool { return len(h.pairingCodes()) > 0 })
 }
+
+// TestSupervisor_TokenRevokedClearsCycles pins the other half of spec §6's
+// 401 branch: the cycles buffered under the revoked identity must not be
+// delivered under the new one. mon-server tracks ackSeq per mon-client
+// (protocol §5.3), so the first heartbeat of the new identity has to start
+// at seq 1 and carry nothing older.
+func TestSupervisor_TokenRevokedClearsCycles(t *testing.T) {
+	h := newSupHarness(t)
+	stop := h.run()
+	defer stop()
+
+	h.waitFor("the first registration poll", func() bool { return len(h.pollIDs()) > 0 })
+	h.stub.Approve(h.pollIDs()[0], "ams-1", "tok1")
+
+	// Let the first identity buffer cycles that are never acknowledged, so
+	// there is something on disk for the 401 to throw away.
+	h.stub.DropNextHeartbeats(3)
+	h.waitFor("unacknowledged cycles", func() bool { return h.heartbeats() >= 3 })
+	if _, err := os.Stat(h.dir.Path("cycles.json")); err != nil {
+		t.Fatalf("cycles.json was never written: %v", err)
+	}
+
+	h.stub.SetTokenStatus(http.StatusUnauthorized)
+	h.waitFor("state.json to be cleared", func() bool { return !h.stateExists() })
+	if _, err := os.Stat(h.dir.Path("cycles.json")); !os.IsNotExist(err) {
+		t.Fatalf("cycles.json survived the 401: %v", err)
+	}
+
+	// The new identity: approve it and read its first heartbeat.
+	h.waitFor("a second registration poll", func() bool { return len(h.pollIDs()) > 1 })
+	h.stub.SetTokenStatus(0)
+	h.stub.Approve(h.pollIDs()[1], "ams-2", "tok2")
+
+	h.waitFor("a heartbeat from the new identity", func() bool {
+		for _, hb := range h.stub.Heartbeats() {
+			if hb.MonClientID == "ams-2" {
+				return true
+			}
+		}
+		return false
+	})
+	for _, hb := range h.stub.Heartbeats() {
+		if hb.MonClientID != "ams-2" {
+			continue
+		}
+		if len(hb.Cycles) == 0 {
+			t.Fatal("the new identity's heartbeat carried no cycles at all")
+		}
+		if got := hb.Cycles[0].Seq; got != 1 {
+			t.Fatalf("the new identity's first cycle has seq %d, want 1", got)
+		}
+		break
+	}
+}

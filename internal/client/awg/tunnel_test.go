@@ -14,6 +14,8 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -35,29 +37,35 @@ const serverPort = 8443
 // that is the tunnel address the packets really came from, and all four
 // timings measured (spec §5, protocol §5.3).
 func TestProbeThroughTunnel(t *testing.T) {
-	t.Parallel()
+	// Not parallel, and neither is its sibling below: each test holds two
+	// netstack devices talking over loopback UDP, and running them side by
+	// side only adds scheduling noise to measurements the test then
+	// asserts on.
 
 	serverPrivB64, serverPubB64, _ := keypair(t)
 	clientPrivB64, clientPubB64, _ := keypair(t)
-	port := freeUDPPort(t)
 
 	// The far end: a device listening on loopback UDP that knows our
-	// public key, with an HTTPS echo of GET /v1/probe behind it.
+	// public key, with an HTTPS echo of GET /v1/probe behind it. It binds
+	// ListenPort 0 and is asked afterwards which port it actually got —
+	// picking a "free" port by opening and closing a socket first would be
+	// a race every other test on the machine can win.
 	serverCfg := parseConf(t, fmt.Sprintf(`[Interface]
 Address = %s/32
 PrivateKey = %s
-ListenPort = %d
+ListenPort = 0
 %s
 
 [Peer]
 PublicKey = %s
 AllowedIPs = %s/32
-`, serverTunnelIP, serverPrivB64, port, awgObfuscation, clientPubB64, clientTunnelIP))
+`, serverTunnelIP, serverPrivB64, awgObfuscation, clientPubB64, clientTunnelIP))
 	server, err := Open(serverCfg)
 	if err != nil {
 		t.Fatalf("open server device: %v", err)
 	}
 	defer server.Close()
+	port := listenPort(t, server)
 
 	cert, pool := selfSigned(t, serverTunnelIP)
 	ln, err := server.tnet.ListenTCP(&net.TCPAddr{IP: net.ParseIP(serverTunnelIP), Port: serverPort})
@@ -65,8 +73,13 @@ AllowedIPs = %s/32
 		t.Fatalf("listen inside the tunnel: %v", err)
 	}
 	httpSrv := &http.Server{Handler: http.HandlerFunc(probeEcho)}
-	go httpSrv.Serve(tls.NewListener(ln, &tls.Config{Certificates: []tls.Certificate{cert}}))
+	serving := make(chan struct{})
+	go func() {
+		close(serving)
+		_ = httpSrv.Serve(tls.NewListener(ln, &tls.Config{Certificates: []tls.Certificate{cert}}))
+	}()
 	t.Cleanup(func() { _ = httpSrv.Close() })
+	<-serving
 
 	// The near end: exactly the config mon-client would get from
 	// mon-server, pointing at the far end's loopback endpoint.
@@ -84,7 +97,11 @@ Endpoint = 127.0.0.1:%d
 
 	p := Prober{Log: silent(), tlsConfig: &tls.Config{RootCAs: pool}}
 	key := proto.TargetKey{InboundKind: "awg", InboundID: 7, Path: "direct"}
-	b := probe.Budgets{Budget: 20 * time.Second, Connect: 5 * time.Second, TLS: 5 * time.Second, Headers: 5 * time.Second}
+	// Generous budgets: this is not a latency test, and a loaded CI box
+	// can take seconds to get two netstacks and an AWG handshake going —
+	// a probe that ran out of connect budget would be reported as a tunnel
+	// failure rather than a slow machine.
+	b := probe.Budgets{Budget: 60 * time.Second, Connect: 20 * time.Second, TLS: 20 * time.Second, Headers: 20 * time.Second}
 
 	res := p.Probe(context.Background(), fmt.Sprintf("https://%s:%d/v1/probe", serverTunnelIP, serverPort), "tok", key, clientCfg, b)
 	if !res.Ok {
@@ -119,27 +136,25 @@ Endpoint = 127.0.0.1:%d
 // answered, but with someone else's nonce, so the response cannot be
 // attributed to this probe.
 func TestProbeThroughTunnelWrongNonce(t *testing.T) {
-	t.Parallel()
-
 	serverPrivB64, serverPubB64, _ := keypair(t)
 	clientPrivB64, clientPubB64, _ := keypair(t)
-	port := freeUDPPort(t)
 
 	serverCfg := parseConf(t, fmt.Sprintf(`[Interface]
 Address = %s/32
 PrivateKey = %s
-ListenPort = %d
+ListenPort = 0
 %s
 
 [Peer]
 PublicKey = %s
 AllowedIPs = %s/32
-`, serverTunnelIP, serverPrivB64, port, awgObfuscation, clientPubB64, clientTunnelIP))
+`, serverTunnelIP, serverPrivB64, awgObfuscation, clientPubB64, clientTunnelIP))
 	server, err := Open(serverCfg)
 	if err != nil {
 		t.Fatalf("open server device: %v", err)
 	}
 	defer server.Close()
+	port := listenPort(t, server)
 
 	cert, pool := selfSigned(t, serverTunnelIP)
 	ln, err := server.tnet.ListenTCP(&net.TCPAddr{IP: net.ParseIP(serverTunnelIP), Port: serverPort})
@@ -149,8 +164,13 @@ AllowedIPs = %s/32
 	httpSrv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		writeEcho(w, r, "someone-elses-nonce")
 	})}
-	go httpSrv.Serve(tls.NewListener(ln, &tls.Config{Certificates: []tls.Certificate{cert}}))
+	serving := make(chan struct{})
+	go func() {
+		close(serving)
+		_ = httpSrv.Serve(tls.NewListener(ln, &tls.Config{Certificates: []tls.Certificate{cert}}))
+	}()
 	t.Cleanup(func() { _ = httpSrv.Close() })
+	<-serving
 
 	clientCfg := parseConf(t, fmt.Sprintf(`[Interface]
 Address = %s/32
@@ -166,7 +186,7 @@ Endpoint = 127.0.0.1:%d
 	p := Prober{Log: silent(), tlsConfig: &tls.Config{RootCAs: pool}}
 	res := p.Probe(context.Background(), fmt.Sprintf("https://%s:%d/v1/probe", serverTunnelIP, serverPort), "tok",
 		proto.TargetKey{InboundKind: "awg", InboundID: 7, Path: "direct"}, clientCfg,
-		probe.Budgets{Budget: 20 * time.Second, Connect: 5 * time.Second, TLS: 5 * time.Second, Headers: 5 * time.Second})
+		probe.Budgets{Budget: 60 * time.Second, Connect: 20 * time.Second, TLS: 20 * time.Second, Headers: 20 * time.Second})
 
 	if res.Ok {
 		t.Fatal("a probe whose nonce was not echoed back counted as a success")
@@ -202,15 +222,28 @@ func parseConf(t *testing.T, conf string) *config.AWGConfig {
 	return cfg
 }
 
-// freeUDPPort picks a loopback UDP port the far-end device can listen on.
-func freeUDPPort(t *testing.T) int {
+// listenPort asks a device which UDP port its bind actually got, out of
+// the UAPI dump amneziawg-go answers `get=1` with. It is how a test can
+// let the kernel choose the far end's port (ListenPort 0) and still point
+// the near end at it, without ever holding a port open just to find out
+// that it was free a moment ago.
+func listenPort(t *testing.T, d *Device) int {
 	t.Helper()
-	c, err := net.ListenPacket("udp", "127.0.0.1:0")
+	dump, err := d.dev.IpcGet()
 	if err != nil {
-		t.Fatalf("pick a udp port: %v", err)
+		t.Fatalf("uapi get: %v", err)
 	}
-	defer c.Close()
-	return c.LocalAddr().(*net.UDPAddr).Port
+	for _, line := range strings.Split(dump, "\n") {
+		if value, ok := strings.CutPrefix(strings.TrimSpace(line), "listen_port="); ok {
+			port, err := strconv.Atoi(value)
+			if err != nil {
+				t.Fatalf("listen_port %q: %v", value, err)
+			}
+			return port
+		}
+	}
+	t.Fatalf("no listen_port in the uapi dump:\n%s", dump)
+	return 0
 }
 
 // selfSigned mints a throwaway certificate for an IP, plus the pool that

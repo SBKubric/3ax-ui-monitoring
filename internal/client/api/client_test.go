@@ -257,3 +257,52 @@ func TestClient_HeartbeatSendsBearerToken(t *testing.T) {
 		t.Fatalf("AckSeq = %d, want 42", resp.AckSeq)
 	}
 }
+
+// TestNew_IgnoresEnvironmentProxy pins spec §6's "свой Transport без
+// прокси": a box whose HTTP(S)_PROXY points at something dead (here a
+// loopback port with nothing behind it — the shape of a misconfigured or
+// tunnel-local proxy on a real VPS) must still reach mon-server directly.
+// A zero-value *http.Client would use http.DefaultTransport, which reads
+// those variables, so this is a test of what New builds, not of net/http.
+func TestNew_IgnoresEnvironmentProxy(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(proto.RegisterResponse{RequestID: "req-1", PollAfterMs: 10000})
+	}))
+	defer srv.Close()
+
+	// A closed loopback port: any request routed through it fails.
+	dead, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	proxyURL := "http://" + dead.Addr().String()
+	if err := dead.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	t.Setenv("HTTP_PROXY", proxyURL)
+	t.Setenv("HTTPS_PROXY", proxyURL)
+	t.Setenv("http_proxy", proxyURL)
+	t.Setenv("https_proxy", proxyURL)
+
+	c := New(srv.URL, nil)
+	resp, err := c.Register(context.Background(), proto.RegisterRequest{PairingCode: "ABC234"})
+	if err != nil {
+		t.Fatalf("Register through a proxy-free transport: %v", err)
+	}
+	if resp.RequestID != "req-1" {
+		t.Fatalf("requestId = %q, want req-1", resp.RequestID)
+	}
+}
+
+// TestNew_KeepsCallerTransport checks the other half of New's contract: a
+// caller that brought its own transport (servertest's, trusting its own
+// certificate) keeps it.
+func TestNew_KeepsCallerTransport(t *testing.T) {
+	tr := &http.Transport{}
+	c := New("https://example.invalid", &http.Client{Transport: tr})
+	if c.HTTP.Transport != tr {
+		t.Fatalf("transport = %#v, want the caller's own", c.HTTP.Transport)
+	}
+}

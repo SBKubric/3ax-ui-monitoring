@@ -47,6 +47,7 @@ type Script struct {
 const ScriptEnv = "FAKEXRAY_SCRIPT"
 
 var (
+	buildMu   sync.Mutex
 	buildOnce sync.Once
 	buildBin  string
 	buildErr  error
@@ -61,11 +62,27 @@ var (
 // the first caller's t finished would break the rest.
 func Build(t *testing.T) string {
 	t.Helper()
+	buildMu.Lock()
+	defer buildMu.Unlock()
 	buildOnce.Do(func() { buildBin, buildErr = build() })
 	if buildErr != nil {
 		t.Skipf("fakexray unavailable: %v", buildErr)
 	}
 	return buildBin
+}
+
+// Cleanup removes the directory Build compiled into, if it compiled one.
+// It belongs in the TestMain of every package that calls Build: the binary
+// has to outlive each individual test (they share one build), so the only
+// place left to remove it is after the whole test binary is done — and
+// os.Exit, which TestMain ends with, runs no deferred function.
+func Cleanup() {
+	buildMu.Lock()
+	defer buildMu.Unlock()
+	if buildBin != "" {
+		_ = os.RemoveAll(filepath.Dir(buildBin))
+		buildBin = ""
+	}
 }
 
 // Scripted points fakexray at s for the duration of the test. It uses

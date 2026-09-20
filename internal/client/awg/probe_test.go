@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"testing"
 	"time"
 
@@ -137,4 +138,39 @@ func TestTruncateDetail(t *testing.T) {
 	if n := len([]rune(deref(res.Detail))); n != maxDetail {
 		t.Errorf("detail is %d runes, want %d", n, maxDetail)
 	}
+}
+
+// TestOnceConnClosesUnderlyingOnce pins the guard around the connection a
+// probe hands over to http.Transport: both owners close it (the probe's
+// own defer and the transport, which has keep-alives disabled), and the
+// second Close must not reach the gVisor endpoint — where it would surface
+// as "use of closed network connection" on a probe that had already
+// succeeded.
+func TestOnceConnClosesUnderlyingOnce(t *testing.T) {
+	t.Parallel()
+
+	inner := &countingConn{}
+	c := &onceConn{Conn: inner}
+	if err := c.Close(); err != nil {
+		t.Fatalf("first Close: %v", err)
+	}
+	if err := c.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+	if inner.closes != 1 {
+		t.Fatalf("underlying Close called %d times, want 1", inner.closes)
+	}
+}
+
+// countingConn is a net.Conn that only counts its own Close; every other
+// method would panic, which is exactly right — nothing but Close is under
+// test here.
+type countingConn struct {
+	net.Conn
+	closes int
+}
+
+func (c *countingConn) Close() error {
+	c.closes++
+	return nil
 }

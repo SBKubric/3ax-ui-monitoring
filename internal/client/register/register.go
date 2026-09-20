@@ -156,15 +156,24 @@ const rejectedWait = 1 * time.Hour
 // (issue #16: "опрос ... каждые pollAfter до ... (default 10 s if 0)").
 const defaultPollAfter = 10 * time.Second
 
-// backoff is the single escalating counter Run keeps for the life of one
-// call: every retryable failure (a 410, or a network/5xx/429 error on
-// either Register or Poll) advances it, and it is never reset while Run is
-// still trying to land the same eventual approval — spec §3.2's sequence
-// "1 → 2 → 5 → 5 → …" describes the whole unsuccessful stretch of a
-// registration attempt, not just one request's lifetime, so a request that
-// keeps expiring without an operator ever approving it keeps climbing
-// (and then holding at 5 minutes) rather than restarting at 1 minute every
-// time a fresh requestId is minted.
+// backoff is one escalating counter over spec §3.2's "1 → 2 → 5 мин,
+// дальше каждые 5 мин" sequence. Run keeps two of them, because the two
+// things that can go wrong during a registration are unrelated failures
+// and must not share a streak:
+//
+//   - expiry — the request was filed and then expired (a 410, or this
+//     box's own clock reaching expiresAt). Consecutive expiries keep
+//     climbing: nobody is approving this box, so asking again ever more
+//     slowly is the point of the ladder.
+//   - transient — Register or Poll did not get an answer at all (network
+//     error, 5xx, 429). This streak is over the moment mon-server answers:
+//     a request that was accepted (202) proves the link works, so the next
+//     hiccup starts again at one minute rather than inheriting the wait of
+//     an outage that is already over.
+//
+// A rejected request resets both (see Run): the operator has seen this box
+// and said no, the fixed hour of spec §3.2 is the whole wait, and whatever
+// went wrong before that is ancient history.
 type backoff struct {
 	idx int
 }
@@ -181,6 +190,10 @@ func (b *backoff) delay() time.Duration {
 
 // advance moves to the next step (idempotently capped by delay once there).
 func (b *backoff) advance() { b.idx++ }
+
+// reset puts the ladder back on its first step, for the streak-ending
+// events described on the type.
+func (b *backoff) reset() { b.idx = 0 }
 
 // waitFor picks the wait for a failed Register/Poll call: a 429's own
 // Retry-After when it carries one (protocol §2.1), else the current
@@ -203,7 +216,8 @@ func (b *backoff) waitFor(err error) time.Duration {
 // a background goroutine.
 func Run(ctx context.Context, deps Deps) (*state.File, error) {
 	d := deps.fillDefaults()
-	bo := &backoff{}
+	transient := &backoff{}
+	expiry := &backoff{}
 
 	for {
 		if err := ctx.Err(); err != nil {
@@ -215,7 +229,7 @@ func Run(ctx context.Context, deps Deps) (*state.File, error) {
 			return nil, err
 		}
 
-		reg, err := submitRegister(ctx, d, code, bo)
+		reg, err := submitRegister(ctx, d, code, transient)
 		if err != nil {
 			return nil, err
 		}
@@ -223,7 +237,7 @@ func Run(ctx context.Context, deps Deps) (*state.File, error) {
 		// to know which code to type into the admin UI.
 		d.Log.Info(fmt.Sprintf("registration request sent, pairing code %s", code))
 
-		outcome, err := pollUntilResolved(ctx, d, reg, bo)
+		outcome, err := pollUntilResolved(ctx, d, reg, transient, expiry)
 		if err != nil {
 			return nil, err
 		}
@@ -244,7 +258,11 @@ func Run(ctx context.Context, deps Deps) (*state.File, error) {
 			return f, nil
 		case statusRejected:
 			// Spec §3.2: wait a fixed hour, then file a wholly new request
-			// (new code) — not part of the escalating backoff at all.
+			// (new code) — not part of the escalating backoff at all. The
+			// ladders start over with it: the next request is a fresh
+			// attempt at being adopted, not the continuation of a streak.
+			transient.reset()
+			expiry.reset()
 			if err := d.Sleep(ctx, rejectedWait); err != nil {
 				return nil, err
 			}
@@ -271,6 +289,9 @@ func submitRegister(ctx context.Context, d Deps, code string, bo *backoff) (*pro
 		req.PublicIP = d.publicIP(ctx)
 		resp, err := d.API.Register(ctx, req)
 		if err == nil {
+			// Accepted (202): mon-server is reachable, so whatever streak
+			// of transport failures preceded this is over.
+			bo.reset()
 			return resp, nil
 		}
 		if ctxErr := ctx.Err(); ctxErr != nil {
@@ -278,6 +299,12 @@ func submitRegister(ctx context.Context, d Deps, code string, bo *backoff) (*pro
 		}
 		wait := bo.waitFor(err)
 		bo.advance()
+		// Spec §7: without this line a box whose POST /v1/register keeps
+		// failing prints nothing at all — no pairing code, no error — and
+		// an operator watching `docker logs` has no way to tell a
+		// mon-client that cannot reach mon-server from one that is simply
+		// slow to start.
+		d.Log.Warn(fmt.Sprintf("registration request failed: %v, retrying in %s", err, wait))
 		if err := d.Sleep(ctx, wait); err != nil {
 			return nil, err
 		}
@@ -311,7 +338,7 @@ type pollOutcome struct {
 // call never abandons the request — it just waits out the backoff and
 // polls the same requestId again, since the request itself is still alive
 // on mon-server's side for up to its 5-minute TTL (protocol §2.1).
-func pollUntilResolved(ctx context.Context, d Deps, reg *proto.RegisterResponse, bo *backoff) (*pollOutcome, error) {
+func pollUntilResolved(ctx context.Context, d Deps, reg *proto.RegisterResponse, transient, expiry *backoff) (*pollOutcome, error) {
 	pollAfter := time.Duration(reg.PollAfterMs) * time.Millisecond
 	if pollAfter <= 0 {
 		pollAfter = defaultPollAfter
@@ -325,7 +352,7 @@ func pollUntilResolved(ctx context.Context, d Deps, reg *proto.RegisterResponse,
 		}
 
 		if !d.Clock.Now().Before(expiresAt) {
-			return expireLocally(ctx, d, bo)
+			return expireLocally(ctx, d, expiry)
 		}
 
 		resp, err := d.API.Poll(ctx, reg.RequestID)
@@ -334,12 +361,14 @@ func pollUntilResolved(ctx context.Context, d Deps, reg *proto.RegisterResponse,
 				return nil, ctxErr
 			}
 			if errors.Is(err, api.ErrRequestExpired) {
-				return expireLocally(ctx, d, bo)
+				return expireLocally(ctx, d, expiry)
 			}
-			wait = bo.waitFor(err)
-			bo.advance()
+			wait = transient.waitFor(err)
+			transient.advance()
 			continue
 		}
+		// An answer, whatever it says: the transport streak is over.
+		transient.reset()
 
 		switch resp.Status {
 		case "approved":
@@ -355,7 +384,8 @@ func pollUntilResolved(ctx context.Context, d Deps, reg *proto.RegisterResponse,
 	}
 }
 
-// expireLocally applies the 410 backoff (spec §3.2) and reports statusExpired,
+// expireLocally applies the 410 backoff (spec §3.2, the expiry ladder) and
+// reports statusExpired,
 // shared by both the explicit-410 and locally-detected-expiry paths so
 // they behave identically.
 func expireLocally(ctx context.Context, d Deps, bo *backoff) (*pollOutcome, error) {

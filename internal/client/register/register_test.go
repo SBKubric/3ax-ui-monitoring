@@ -703,3 +703,148 @@ func TestPublicIPFromDial_NilOnEmptyDeps(t *testing.T) {
 		t.Fatalf("got %q, want empty from a nil PublicIP", got)
 	}
 }
+
+// --- Run: the backoff ladders reset ---------------------------------------
+
+// waitForBackoffWaits blocks until at least n non-pollAfter waits have been
+// recorded and returns them, so a test can pin a ladder's steps without
+// racing the goroutine Run is on.
+func waitForBackoffWaits(t *testing.T, waits func() []time.Duration, n int) []time.Duration {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if got := filterBackoffWaits(waits()); len(got) >= n {
+			return got
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %d backoff waits; got %v", n, filterBackoffWaits(waits()))
+	return nil
+}
+
+// wantWaits checks the recorded ladder steps begin with want.
+func wantWaits(t *testing.T, waits func() []time.Duration, want ...time.Duration) {
+	t.Helper()
+	got := waitForBackoffWaits(t, waits, len(want))
+	for i, w := range want {
+		if got[i] != w {
+			t.Fatalf("backoff step %d = %v, want %v (all: %v)", i, got[i], w, got)
+		}
+	}
+}
+
+// TestRun_AcceptedRequestResetsBackoff pins the transient ladder's reset: a
+// streak of failed POST /v1/register climbs 1 → 2 min, but once a request
+// is accepted (202) the link is proven, so the next transport failure —
+// here a 5xx on the poll — starts again at one minute instead of
+// inheriting the 5-minute step the streak was heading for (spec §3.2's
+// ladder is per failure streak, not per Run call).
+func TestRun_AcceptedRequestResetsBackoff(t *testing.T) {
+	stub := servertest.NewStub(t)
+	d, _, _, waits := newTestDeps(t, stub)
+	stub.FailNextRegisters(2, http.StatusInternalServerError)
+	stub.FailNextPolls(1, http.StatusInternalServerError)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	resCh := make(chan *state.File, 1)
+	go func() {
+		f, err := Run(ctx, d)
+		if err != nil {
+			t.Errorf("Run: %v", err)
+			return
+		}
+		resCh <- f
+	}()
+
+	// Two failed registrations (1 min, 2 min), then a 202 that resets the
+	// ladder, then one failed poll — which must wait 1 min, not 5.
+	wantWaits(t, waits, 1*time.Minute, 2*time.Minute, 1*time.Minute)
+
+	id := pendingRequestID(t, stub)
+	stub.Approve(id, "ams-1", "tok")
+	select {
+	case <-resCh:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run did not return after approval")
+	}
+}
+
+// TestRun_RejectedResetsBackoff pins the other reset: after a rejection the
+// box waits its fixed hour (spec §3.2) and then files a wholly new request
+// — a fresh attempt at being adopted, so the first failure of that attempt
+// waits one minute, not the step the pre-rejection failures had climbed to.
+func TestRun_RejectedResetsBackoff(t *testing.T) {
+	stub := servertest.NewStub(t)
+	d, _, _, waits := newTestDeps(t, stub)
+	// Two failed polls climb the transient ladder to its second step; the
+	// third poll sees whatever state the request is in by then.
+	stub.FailNextPolls(2, http.StatusInternalServerError)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	resCh := make(chan *state.File, 1)
+	go func() {
+		f, err := Run(ctx, d)
+		if err != nil {
+			t.Errorf("Run: %v", err)
+			return
+		}
+		resCh <- f
+	}()
+
+	firstID := pendingRequestID(t, stub)
+	// Armed before the rejection, which is what sets the rest in motion:
+	// the registration that follows the hour-long wait fails once.
+	stub.FailNextRegisters(1, http.StatusInternalServerError)
+	stub.Reject(firstID)
+
+	wantWaits(t, waits, 1*time.Minute, 2*time.Minute, rejectedWait, 1*time.Minute)
+
+	secondID := waitForNewRequestID(t, stub, map[string]bool{firstID: true})
+	stub.Approve(secondID, "ams-1", "tok2")
+	select {
+	case <-resCh:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run did not return after the second approval")
+	}
+}
+
+// TestRun_FailedRegisterLogsWarnPerAttempt checks spec §7's operator view:
+// a POST /v1/register that fails must say so once per attempt, with the
+// error and the wait, so `docker logs` explains why no pairing code has
+// appeared.
+func TestRun_FailedRegisterLogsWarnPerAttempt(t *testing.T) {
+	stub := servertest.NewStub(t)
+	d, _, logBuf, waits := newTestDeps(t, stub)
+	stub.FailNextRegisters(2, http.StatusInternalServerError)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	resCh := make(chan *state.File, 1)
+	go func() {
+		f, err := Run(ctx, d)
+		if err != nil {
+			t.Errorf("Run: %v", err)
+			return
+		}
+		resCh <- f
+	}()
+
+	wantWaits(t, waits, 1*time.Minute, 2*time.Minute)
+	id := pendingRequestID(t, stub)
+	stub.Approve(id, "ams-1", "tok")
+	select {
+	case <-resCh:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run did not return after approval")
+	}
+
+	lines := regexp.MustCompile(`registration request failed: [^\n]*retrying in ([0-9a-z]+)`).FindAllStringSubmatch(logBuf.String(), -1)
+	if len(lines) != 2 {
+		t.Fatalf("expected one warn line per failed attempt, got %d: %q", len(lines), logBuf.String())
+	}
+	if lines[0][1] != "1m0s" || lines[1][1] != "2m0s" {
+		t.Fatalf("logged waits = %q, %q, want 1m0s, 2m0s", lines[0][1], lines[1][1])
+	}
+}

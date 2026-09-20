@@ -213,7 +213,12 @@ func (l *Loop) Once(ctx context.Context) error {
 	}
 
 	doc, results, ts, configErr := l.cycle(ctx)
-	l.d.Buffer.Add(ts, results)
+	if _, err := l.d.Buffer.Add(ts, results); err != nil {
+		// The cycle is in the buffer, just not on disk: the heartbeat
+		// below still carries it, and only a restart before the next
+		// successful save would lose it (spec §6).
+		l.log().Error("cycles buffer not persisted", "error", err)
+	}
 
 	hb := &proto.HeartbeatRequest{
 		MonClientID:    l.d.File.MonClientID,

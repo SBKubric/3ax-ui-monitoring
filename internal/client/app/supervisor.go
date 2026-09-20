@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/SBKubric/3ax-ui-monitoring/internal/client/api"
@@ -280,12 +281,28 @@ func (s *supervisor) serve(ctx context.Context, file *state.File, client *api.Cl
 	}
 }
 
+// cyclesFileName is the buffer's file in the state directory (spec §2),
+// named here because the 401 branch has to throw it away and the buffer
+// package's own path comes from the same state.Dir.
+const cyclesFileName = "cycles.json"
+
 // clearState is spec §6's 401 answer: the token is gone, so the file that
 // holds it goes too, and the box says so before it starts over.
+//
+// cycles.json goes with it. Those cycles were probed by the *old*
+// identity, and the next heartbeat will be sent under a new monClientId
+// with a seq counter mon-server has never seen: delivering them would
+// attribute one mon-client's measurements to another and replay seqs from
+// a counter that has just restarted at 1 (protocol §5.3's ackSeq is
+// per-mon-client). Losing them is the right trade — a revoked mon-client's
+// statistics are not worth mixing into its successor's.
 func (s *supervisor) clearState() error {
 	s.d.Log.Info("token revoked, re-registering")
 	if err := s.d.Dir.Clear(); err != nil {
 		return fmt.Errorf("clear state: %w", err)
+	}
+	if err := os.Remove(s.d.Dir.Path(cyclesFileName)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("clear cycles: %w", err)
 	}
 	return nil
 }

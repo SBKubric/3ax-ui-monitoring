@@ -61,6 +61,10 @@ type Stub struct {
 	// registration (protocol §2)
 	registerStatus     int // 0 = normal 202; else a forced status (e.g. 429)
 	registerRetryAfter time.Duration
+	failRegisterN      int // >0: this many POST /v1/register answer failRegisterStatus
+	failRegisterStatus int
+	failPollN          int // >0: this many polls answer failPollStatus
+	failPollStatus     int
 	registrations      map[string]*registration
 	validTokens        map[string]string // token -> monClientId, for authenticate
 
@@ -124,6 +128,28 @@ func (s *Stub) RegisterStatus(status int, retryAfter time.Duration) {
 	defer s.mu.Unlock()
 	s.registerStatus = status
 	s.registerRetryAfter = retryAfter
+}
+
+// FailNextRegisters makes the next n POST /v1/register answer status and
+// the ones after that behave normally — the counted twin of
+// RegisterStatus. Counted rather than sticky because spec §3.2's backoff
+// ladder is about a *streak* of failures ending: a test that has to flip a
+// sticky knob back mid-flight races the loop it is driving, while "the
+// next two fail" is decided before the loop starts and cannot race.
+func (s *Stub) FailNextRegisters(n, status int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.failRegisterN, s.failRegisterStatus = n, status
+}
+
+// FailNextPolls is FailNextRegisters for GET /v1/register/<requestId>: the
+// next n polls answer status (a 5xx from a mon-server that is up but
+// unhappy), whatever the request's real state is. A 410 is better spelled
+// Expire, which is what mon-server would really do.
+func (s *Stub) FailNextPolls(n, status int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.failPollN, s.failPollStatus = n, status
 }
 
 // Approve marks requestID approved, to be handed out with monClientID and
@@ -284,6 +310,13 @@ func (s *Stub) serve(w http.ResponseWriter, r *http.Request) {
 // handleRegister implements POST /v1/register (protocol §2.1).
 func (s *Stub) handleRegister(w http.ResponseWriter, body []byte) {
 	s.mu.Lock()
+	if s.failRegisterN > 0 {
+		s.failRegisterN--
+		status := s.failRegisterStatus
+		s.mu.Unlock()
+		writeErr(w, status, injectedCode(status), "injected failure")
+		return
+	}
 	if s.registerStatus != 0 {
 		status, retry := s.registerStatus, s.registerRetryAfter
 		s.mu.Unlock()
@@ -319,6 +352,12 @@ func (s *Stub) handleRegister(w http.ResponseWriter, body []byte) {
 func (s *Stub) handlePoll(w http.ResponseWriter, requestID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if s.failPollN > 0 {
+		s.failPollN--
+		writeErr(w, s.failPollStatus, injectedCode(s.failPollStatus), "injected failure")
+		return
+	}
 
 	reg, ok := s.registrations[requestID]
 	if !ok {

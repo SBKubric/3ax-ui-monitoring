@@ -19,6 +19,16 @@ import (
 	"github.com/SBKubric/3ax-ui-monitoring/internal/client/xray/xraytest"
 )
 
+// TestMain removes the fake xray binary xraytest built for this package's
+// tests: Build has to leave it in place for the whole run (every test
+// shares one build), so the only moment left to clean up is here, and
+// os.Exit runs no deferred function.
+func TestMain(m *testing.M) {
+	code := m.Run()
+	xraytest.Cleanup()
+	os.Exit(code)
+}
+
 // Sample material in the shapes the panel generates (the same links
 // internal/client/config's own tests use): documentation addresses and
 // throwaway keys only.
@@ -432,5 +442,61 @@ func TestLoop_ConfigErrorFromARealApplyReachesTheHeartbeat(t *testing.T) {
 	// child's socks ports, which is the whole point of the restart.
 	if got := hbs[2].Cycles[0].Results; len(got) != 2 {
 		t.Fatalf("%d results, want one per applied target", len(got))
+	}
+}
+
+// TestApply_StateSaveFailureKeepsOldRevision pins the order apply() works
+// in: appliedRevision reaches state.json before the probe set is swapped,
+// so a state directory that cannot be written (here read-only, the shape a
+// full disk takes) leaves the old revision *fully* in force rather than
+// probing the new targets while reporting the old revision to mon-server
+// (protocol §5.3).
+func TestApply_StateSaveFailureKeepsOldRevision(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	h := newApplierHarness(t, false)
+	ctx := context.Background()
+
+	// An AWG-only document: no xray child is involved, so the only write
+	// this apply does is state.json's.
+	first := revisionDoc("rev1", awgTarget())
+	if err := h.applier.Apply(ctx, first); err != nil {
+		t.Fatalf("apply rev1: %v", err)
+	}
+
+	if err := os.Chmod(h.dir.Path(""), 0o500); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(h.dir.Path(""), 0o700) })
+
+	second := revisionDoc("rev2", awgTarget(), awgTarget2())
+	err := h.applier.Apply(ctx, second)
+	if err == nil {
+		t.Fatal("apply reported success although appliedRevision could not be saved")
+	}
+
+	doc, probes, configErr := h.applier.Applied()
+	if doc != first {
+		t.Errorf("applied doc = %v, want rev1 — the old revision stays in force", doc)
+	}
+	if len(probes) != 1 {
+		t.Errorf("applied probes = %d, want rev1's single target", len(probes))
+	}
+	if configErr == nil || !strings.Contains(configErr.Error(), "save applied revision") {
+		t.Errorf("configError = %v, want the save failure", configErr)
+	}
+	if h.file.AppliedRevision != "rev1" {
+		t.Errorf("appliedRevision = %q, want rev1", h.file.AppliedRevision)
+	}
+}
+
+// awgTarget2 is a second AWG-target, so a revision can differ from another
+// in more than its name.
+func awgTarget2() proto.Target {
+	return proto.Target{
+		TargetKey: proto.TargetKey{InboundKind: "awg", InboundID: 1, Path: "direct"},
+		Protocol:  "awg",
+		Conf:      awgConf,
 	}
 }

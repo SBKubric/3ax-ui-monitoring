@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strconv"
 	"time"
@@ -45,16 +46,55 @@ type Client struct {
 	HTTP    *http.Client
 }
 
+// dialTimeout and tlsHandshakeTimeout bound the two phases of opening a
+// connection to mon-server. They are this client's own numbers rather than
+// the probe budgets from the config document (protocol §4.2): those
+// measure a *tunnel*, while this connection is the plain one to mon-server
+// that has to work for a config document to arrive at all. Ten seconds is
+// the same order as the default heartbeat timeout (spec §5) — long enough
+// for a satellite link, short enough that a black-holed route does not
+// hold a cycle open.
+const (
+	dialTimeout         = 10 * time.Second
+	tlsHandshakeTimeout = 10 * time.Second
+)
+
 // New returns a Client for baseURL (spec §2: "https://<ip>:443"), using hc
-// for every request. A nil hc gets http.DefaultClient's zero-value
-// equivalent — an *http.Client with no special transport — which is enough
-// for production (system CAs, no proxy); tests hand in one that trusts
-// their own server instead.
+// for every request.
+//
+// Whatever hc is, the transport underneath it never consults the
+// environment's proxy variables: spec §6 requires "свой Transport без
+// прокси" for every off-tunnel call, because a box that probes tunnels is
+// exactly the kind of box whose HTTP(S)_PROXY points at something local
+// (or at one of the very proxies being measured), and a heartbeat that
+// travelled through a tunnel would report that tunnel's health rather than
+// this box's. http.DefaultTransport, which a zero-value *http.Client uses,
+// does honour those variables — hence this explicit one.
+//
+// A caller that brings its own *http.Transport keeps it untouched: that is
+// how internal/client/servertest hands in a client trusting its own
+// certificate, and how a future deployment could pin a CA. Anything else
+// (a nil client, or a client with no transport at all) gets the
+// proxy-free transport built here.
 func New(baseURL string, hc *http.Client) *Client {
-	if hc == nil {
-		hc = &http.Client{}
+	switch {
+	case hc == nil:
+		hc = &http.Client{Transport: noProxyTransport()}
+	case hc.Transport == nil:
+		hc.Transport = noProxyTransport()
 	}
 	return &Client{BaseURL: baseURL, HTTP: hc}
+}
+
+// noProxyTransport is spec §6's transport: no proxy, bounded dial and TLS
+// handshake, HTTP/2 when mon-server offers it.
+func noProxyTransport() *http.Transport {
+	return &http.Transport{
+		Proxy:               nil,
+		DialContext:         (&net.Dialer{Timeout: dialTimeout}).DialContext,
+		TLSHandshakeTimeout: tlsHandshakeTimeout,
+		ForceAttemptHTTP2:   true,
+	}
 }
 
 // Register submits a registration request (protocol §2.1, POST

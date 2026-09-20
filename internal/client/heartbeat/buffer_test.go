@@ -32,7 +32,7 @@ func result(ok bool) []proto.Result {
 func TestBuffer_AddAssignsSeqAndPersistsBeforeReturning(t *testing.T) {
 	b, path := tempBuffer(t)
 
-	c := b.Add(1757721600000, result(true))
+	c := add(t, b, 1757721600000, result(true))
 	if c.Seq != 1 {
 		t.Fatalf("first seq = %d, want 1", c.Seq)
 	}
@@ -52,7 +52,7 @@ func TestBuffer_AddAssignsSeqAndPersistsBeforeReturning(t *testing.T) {
 		t.Fatalf("cycles.json = %+v, want the cycle just added", f.Cycles)
 	}
 
-	if next := b.Add(1757721660000, result(false)); next.Seq != 2 {
+	if next := add(t, b, 1757721660000, result(false)); next.Seq != 2 {
 		t.Fatalf("second seq = %d, want 2", next.Seq)
 	}
 	if got := b.Pending(); len(got) != 2 {
@@ -64,9 +64,9 @@ func TestBuffer_AddAssignsSeqAndPersistsBeforeReturning(t *testing.T) {
 // подтверждает всё до него включительно".
 func TestBuffer_AckDropsAcknowledgedCycles(t *testing.T) {
 	b, _ := tempBuffer(t)
-	b.Add(1, result(true))
-	b.Add(2, result(true))
-	third := b.Add(3, result(true))
+	add(t, b, 1, result(true))
+	add(t, b, 2, result(true))
+	third := add(t, b, 3, result(true))
 
 	if err := b.Ack(2); err != nil {
 		t.Fatalf("Ack: %v", err)
@@ -91,8 +91,8 @@ func TestBuffer_AckDropsAcknowledgedCycles(t *testing.T) {
 // successes (protocol §5.3).
 func TestBuffer_MarkUnverifiedFlagsEveryPendingCycle(t *testing.T) {
 	b, path := tempBuffer(t)
-	b.Add(1, result(true))
-	b.Add(2, result(false))
+	add(t, b, 1, result(true))
+	add(t, b, 2, result(false))
 
 	if err := b.MarkUnverified(); err != nil {
 		t.Fatalf("MarkUnverified: %v", err)
@@ -119,13 +119,13 @@ func TestBuffer_MarkUnverifiedFlagsEveryPendingCycle(t *testing.T) {
 func TestBuffer_EvictsTheOldestPastMaxCycles(t *testing.T) {
 	b, _ := tempBuffer(t)
 	for i := range MaxCycles {
-		b.Add(int64(i), result(true))
+		add(t, b, int64(i), result(true))
 	}
 	if got := len(b.Pending()); got != MaxCycles {
 		t.Fatalf("len(Pending()) = %d, want %d", got, MaxCycles)
 	}
 
-	b.Add(int64(MaxCycles), result(true))
+	add(t, b, int64(MaxCycles), result(true))
 
 	pending := b.Pending()
 	if len(pending) != MaxCycles {
@@ -145,8 +145,8 @@ func TestBuffer_EvictsTheOldestPastMaxCycles(t *testing.T) {
 // derive the next seq from.
 func TestBuffer_SeqNeverRepeatsAfterRestart(t *testing.T) {
 	b, path := tempBuffer(t)
-	b.Add(1, result(true))
-	last := b.Add(2, result(true))
+	add(t, b, 1, result(true))
+	last := add(t, b, 2, result(true))
 	if err := b.Ack(last.Seq); err != nil {
 		t.Fatalf("Ack: %v", err)
 	}
@@ -158,7 +158,7 @@ func TestBuffer_SeqNeverRepeatsAfterRestart(t *testing.T) {
 	if got := reopened.Pending(); len(got) != 0 {
 		t.Fatalf("Pending() = %+v, want empty after a full ack", got)
 	}
-	if c := reopened.Add(3, result(true)); c.Seq != last.Seq+1 {
+	if c := add(t, reopened, 3, result(true)); c.Seq != last.Seq+1 {
 		t.Fatalf("seq after restart = %d, want %d", c.Seq, last.Seq+1)
 	}
 }
@@ -172,7 +172,7 @@ func TestOpenBuffer_MissingFileIsAFreshBuffer(t *testing.T) {
 	if len(b.Pending()) != 0 {
 		t.Fatal("a fresh buffer must be empty")
 	}
-	if c := b.Add(1, nil); c.Seq != 1 {
+	if c := add(t, b, 1, nil); c.Seq != 1 {
 		t.Fatalf("first seq = %d, want 1", c.Seq)
 	}
 }
@@ -195,7 +195,7 @@ func TestOpenBuffer_CorruptFileIsAnError(t *testing.T) {
 // than null.
 func TestBuffer_AddWithNoResultsEncodesAnEmptyList(t *testing.T) {
 	b, _ := tempBuffer(t)
-	c := b.Add(1, nil)
+	c := add(t, b, 1, nil)
 
 	raw, err := json.Marshal(c)
 	if err != nil {
@@ -208,5 +208,50 @@ func TestBuffer_AddWithNoResultsEncodesAnEmptyList(t *testing.T) {
 	results, ok := decoded["results"].([]any)
 	if !ok || results == nil {
 		t.Fatalf("cycle JSON = %s, want results as an empty list", raw)
+	}
+}
+
+// add is Add with its persist error asserted away: every test in this file
+// writes to a temp directory that works, so a failure there is a broken
+// test rather than the condition under test (TestAdd_PersistFailure covers
+// the other case).
+func add(t *testing.T, b *Buffer, ts int64, results []proto.Result) proto.Cycle {
+	t.Helper()
+	c, err := b.Add(ts, results)
+	if err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	return c
+}
+
+// TestAdd_PersistFailure pins Add's contract when cycles.json cannot be
+// written (here: a state directory that has been made read-only, the shape
+// a full disk or a botched deployment takes). The cycle is still assigned
+// its seq and still buffered in memory — mon-client keeps probing and the
+// next heartbeat carries it (spec §6) — but the caller is told, so the run
+// loop can say so in the log.
+func TestAdd_PersistFailure(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	dir := t.TempDir()
+	b, err := OpenBuffer(filepath.Join(dir, "cycles.json"))
+	if err != nil {
+		t.Fatalf("OpenBuffer: %v", err)
+	}
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+
+	c, err := b.Add(1757721600000, result(true))
+	if err == nil {
+		t.Fatal("Add reported success on a read-only state directory")
+	}
+	if c.Seq != 1 {
+		t.Errorf("cycle seq = %d, want 1 — the cycle is still buffered", c.Seq)
+	}
+	if got := b.Pending(); len(got) != 1 {
+		t.Errorf("pending = %d cycles, want the unpersisted one", len(got))
 	}
 }

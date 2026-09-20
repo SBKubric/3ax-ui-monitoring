@@ -120,12 +120,23 @@ func (p Prober) probe(ctx context.Context, probeURL, token string, key proto.Tar
 		handshakeMs = msPtr(hs.Sub(t0))
 	}
 
-	// The dial is bounded by the same deadline as the handshake poll, so
-	// cancelling here only shortens a wait that is already over.
-	cancelDial()
+	// The dial is waited out rather than cancelled here: it is already
+	// bounded by dialCtx (b.Connect), and the handshake landing is not the
+	// end of the connect — the SYN goes out through the tunnel only once
+	// the handshake is done, so cancelling the moment pollHandshake
+	// returns would abort a connect that had not had a single round trip
+	// to succeed in, and report its abort as a tcp failure.
 	d := <-dialed
+	// The handed-over connection is closed exactly once, however many
+	// owners it ends up with: this defer always runs, and http.Transport
+	// closes the connection it was handed too (DisableKeepAlives). Without
+	// the guard the second Close lands on a gVisor endpoint that is
+	// already gone, which surfaces as a "use of closed network connection"
+	// error on a probe that otherwise succeeded.
+	var conn net.Conn
 	if d.conn != nil {
-		defer d.conn.Close()
+		conn = &onceConn{Conn: d.conn}
+		defer conn.Close()
 	}
 	connectMs := msPtr(d.took)
 
@@ -152,7 +163,7 @@ func (p Prober) probe(ctx context.Context, probeURL, token string, key proto.Tar
 	// keeps this dialer (internal/client/probe/do.go) precisely because it
 	// only installs its own net.Dialer when transport.DialContext is nil.
 	transport := &http.Transport{
-		DialContext:     (&onceDialer{conn: d.conn, fallback: dev.DialContext}).dial,
+		DialContext:     (&onceDialer{conn: conn, fallback: dev.DialContext}).dial,
 		TLSClientConfig: p.tlsConfig,
 	}
 	defer transport.CloseIdleConnections()
@@ -224,6 +235,24 @@ func (o *onceDialer) dial(ctx context.Context, network, address string) (net.Con
 		return c, nil
 	}
 	return o.fallback(ctx, network, address)
+}
+
+// onceConn is a net.Conn whose Close runs at most once, reporting the
+// first Close's result to every later caller. A probe's connection has two
+// owners by construction — the probe itself, which dialed it and defers
+// its Close, and the http.Transport it is handed to, which closes it after
+// the response because keep-alives are disabled — and neither can be
+// dropped: the transport must close it when the request fails early, and
+// the probe must close it when Do never got as far as using it.
+type onceConn struct {
+	net.Conn
+	once sync.Once
+	err  error
+}
+
+func (c *onceConn) Close() error {
+	c.once.Do(func() { c.err = c.Conn.Close() })
+	return c.err
 }
 
 // log writes the one line per probe spec §7 asks for.

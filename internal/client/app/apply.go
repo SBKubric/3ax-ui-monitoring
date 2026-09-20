@@ -173,22 +173,36 @@ func (a *RevisionApplier) apply(ctx context.Context, doc *proto.ConfigDoc) error
 
 	probes := a.buildProbes(doc, plans, awgs)
 
+	// appliedRevision is recorded *before* the probe set is swapped, and a
+	// failure to record it fails the whole apply. The other order looks
+	// harmless and is not: a box whose state.json could not be written
+	// would probe the new revision's targets while every heartbeat
+	// reported the old revision (protocol §5.3's configRevision), and
+	// mon-server would attribute the new targets' results to a config it
+	// believes is not in force. Failing here instead leaves the old
+	// revision fully in force — old doc, old probes — and reports the
+	// write failure as configError, which is what an operator has to see
+	// to go and fix the state directory (spec §4 step 3).
+	if a.d.File != nil {
+		a.mu.Lock()
+		file := *a.d.File
+		a.mu.Unlock()
+		if file.AppliedRevision != doc.ConfigRevision {
+			file.AppliedRevision = doc.ConfigRevision
+			if a.d.Dir != nil {
+				if err := a.d.Dir.Save(&file); err != nil {
+					return fmt.Errorf("save applied revision: %w", err)
+				}
+			}
+			a.mu.Lock()
+			*a.d.File = file
+			a.mu.Unlock()
+		}
+	}
+
 	a.mu.Lock()
 	a.doc, a.probes, a.ports, a.lastErr = doc, probes, ports, nil
-	file := *a.d.File
 	a.mu.Unlock()
-
-	if file.AppliedRevision != doc.ConfigRevision {
-		file.AppliedRevision = doc.ConfigRevision
-		if a.d.Dir != nil {
-			if err := a.d.Dir.Save(&file); err != nil {
-				return fmt.Errorf("save applied revision: %w", err)
-			}
-		}
-		a.mu.Lock()
-		*a.d.File = file
-		a.mu.Unlock()
-	}
 
 	// Spec §7's revision line: what was applied and how much of it.
 	a.d.Log.Info(fmt.Sprintf("applied revision %s: %d xray targets, %d awg targets",
@@ -262,6 +276,17 @@ func (a *RevisionApplier) installConfig(ctx context.Context, cfgJSON []byte, por
 		hasPrev = true
 	}
 	if err := os.Rename(tmpPath, path); err != nil {
+		// The old config has already been moved aside, so the box is one
+		// failed rename away from having no xray.json at all — put it
+		// back before reporting, or a restart (ours or the operator's)
+		// would find nothing to start on.
+		if hasPrev {
+			if restoreErr := os.Rename(prevPath, path); restoreErr != nil {
+				a.d.Log.Error("previous xray.json not restored", "error", restoreErr)
+			} else {
+				a.d.Log.Warn("new xray.json not installed, kept the previous one", "error", err)
+			}
+		}
 		return fmt.Errorf("install xray.json: %w", err)
 	}
 	keep = true
@@ -270,7 +295,13 @@ func (a *RevisionApplier) installConfig(ctx context.Context, cfgJSON []byte, por
 		a.recover(ctx, path, prevPath, hasPrev, err)
 		return err
 	}
-	_ = os.Remove(prevPath)
+	// The new config is running; the copy kept for recovery is not needed
+	// any more. A failure to remove it is harmless (the next apply
+	// overwrites it) but not invisible: a state directory that has stopped
+	// accepting writes is about to fail something that matters.
+	if err := os.Remove(prevPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		a.d.Log.Warn("previous xray.json not cleaned up", "path", prevPath, "error", err)
+	}
 	return nil
 }
 

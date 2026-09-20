@@ -7,14 +7,16 @@
 // written to cycles.json *before* the heartbeat that carries it, so a
 // delivery that never lands costs nothing but a flag on the cycle, and a
 // mon-client that is restarted mid-outage still owes exactly the cycles it
-// owed before.
+// owed before — as long as the write itself worked. That is the whole of
+// the guarantee: what survives a restart is what reached the disk, so a
+// cycle whose save failed (a full or read-only state directory) lives in
+// memory only, and is owed to mon-server until some later save succeeds.
 package heartbeat
 
 import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
@@ -47,8 +49,11 @@ type bufferFile struct {
 
 // Buffer is the opened cycles.json: the cycles not yet acknowledged, in
 // the order they were produced, plus the seq counter. Every mutation is
-// persisted before it is visible to the caller, so a crash can lose a
-// cycle that was never written but never a cycle that was already sent.
+// persisted before it is visible to the caller, and every method that
+// persists reports whether it managed to — a buffer that could not write
+// keeps working from memory, which is a degraded mon-client rather than a
+// stopped one, but the caller is the one that decides how loudly to say
+// so.
 //
 // It is safe for concurrent use. The run loop is single-goroutine today,
 // but the buffer is the one piece of mon-client state a future shutdown
@@ -102,14 +107,13 @@ func OpenBuffer(path string) (*Buffer, error) {
 // heartbeat can claim to have delivered it (spec §6: "цикл добавляется до
 // отправки"). Adding the 61st cycle evicts the oldest (MaxCycles).
 //
-// Add cannot fail from the caller's point of view: the seam this package
-// was designed against (architecture brief §3.9) returns only the cycle,
-// and that is the right call — a cycles.json that could not be written is
-// a degraded mon-client, not a stopped one, since the cycle is in memory
-// and the very next heartbeat will carry it. The write failure is logged
-// through slog.Default() (mon-client's stdout handler, spec §7) rather
-// than swallowed.
-func (b *Buffer) Add(ts int64, results []proto.Result) proto.Cycle {
+// The returned error is the persist error, and it is deliberately not
+// fatal: the cycle is in the buffer either way and the very next heartbeat
+// will carry it, so the run loop logs it and keeps probing (spec §6). It
+// is returned rather than logged here because this package has no logger
+// of its own and the loop does — and because a caller that wanted to stop
+// on a state directory it cannot write should be able to.
+func (b *Buffer) Add(ts int64, results []proto.Result) (proto.Cycle, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
@@ -124,10 +128,7 @@ func (b *Buffer) Add(ts int64, results []proto.Result) proto.Cycle {
 	if len(b.cycles) > MaxCycles {
 		b.cycles = b.cycles[len(b.cycles)-MaxCycles:]
 	}
-	if err := b.save(); err != nil {
-		slog.Default().Error("cycles buffer not persisted", "error", err)
-	}
-	return c
+	return c, b.save()
 }
 
 // Pending returns the cycles owed to mon-server, oldest first — exactly
