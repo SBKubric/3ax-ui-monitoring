@@ -22,13 +22,20 @@ import (
 var fakeBin string
 
 func TestMain(m *testing.M) {
+	dir := ""
 	if path, err := buildFake(); err != nil {
 		fmt.Fprintf(os.Stderr, "fakexray unavailable: %v\n", err)
 	} else {
-		fakeBin = path
-		defer os.RemoveAll(filepath.Dir(path))
+		fakeBin, dir = path, filepath.Dir(path)
 	}
-	os.Exit(m.Run())
+	// os.Exit does not run deferred functions, so the build directory is
+	// removed explicitly: a `go test -count=N` run would otherwise leave N
+	// copies of the fake binary in the system temp directory.
+	code := m.Run()
+	if dir != "" {
+		_ = os.RemoveAll(dir)
+	}
+	os.Exit(code)
 }
 
 func buildFake() (string, error) {

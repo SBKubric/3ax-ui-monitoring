@@ -56,6 +56,12 @@ jobs:
             - name: Pull the xray image used by the mon-client tests
               run: docker pull ghcr.io/xtls/xray-core:latest
 
+            # internal/client/awg holds a real AmneziaWG handshake against
+            # this image (spec §9's open question). The test skips without
+            # docker, so pull the image to make sure CI runs it.
+            - name: Pull the AmneziaWG image used by the mon-client tests
+              run: docker pull amneziavpn/amneziawg-go:latest
+
             - name: Test with the race detector
               run: go test -race -count=1 ./...
 

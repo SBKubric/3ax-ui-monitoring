@@ -95,6 +95,43 @@ WantedBy=multi-user.target
 
 `AmbientCapabilities=CAP_NET_BIND_SERVICE` lets the process bind `:443` without running as root; `StateDirectory=mon-server` gives it `/var/lib/mon-server` (matching `dataDir`'s default) owned by the service user. Adjust `dataDir`/`MON_DATA_DIR` if you point `StateDirectory` elsewhere.
 
+## mon-client
+
+**mon-client** is the box each target region runs: one Go process in one container, with no
+capabilities, that mon-server assigns a set of targets to. For every xray-target it runs a child
+`xray` process (binary from the official image, config written to a file, stderr read over a
+pipe); for every AWG-target it uses an in-process `amneziawg-go`/`netstack` device — no
+`/dev/net/tun`, no routes, no privileges. Once a minute it sends mon-server a tunnel probe through
+each target's tunnel and one heartbeat past them. See
+[docs/spec/mon-client.md](docs/spec/mon-client.md) for the full spec.
+
+Packaging (a container image meant for production, or an installer) is out of scope here too —
+tracked in [SBKubric/3ax-ui-proxy#39](https://github.com/SBKubric/3ax-ui-proxy/issues/39).
+`Dockerfile.mon-client` is a stand sketch: enough to build and run one container by hand for
+manual verification against a real mon-server and panel.
+
+```sh
+make docker-client   # docker build -f Dockerfile.mon-client -t mon-client:dev .
+
+docker run -d --name mon-client \
+  -v mon-client-state:/var/lib/mon-client \
+  -e MON_SERVER_URL=https://<mon-server-ip>:443 \
+  mon-client:dev
+```
+
+The single required parameter is `MON_SERVER_URL` (or `--server`), mon-server's own base URL —
+mon-client dials it with a pairing code, prints that code to `docker logs`, and waits for an
+administrator to approve the resulting request under mon-server's admin UI **Requests** page.
+Everything else it needs (targets, probe accounts, config revisions) comes from mon-server itself.
+
+State — `state.json` (registration), `cycles.json` (unverified heartbeat buffer) and `xray.json`
+(generated xray config) — lives under `/var/lib/mon-client`, which the image declares as a
+`VOLUME` so it survives a container restart.
+
+For the full manual stand checklist (registration, `UP` on both paths, `DOWN` on a stopped
+inbound, `reality_real_cert`, `awg_no_handshake`, buffering through a mon-server outage, `401`
+after Revoke), see [docs/runbooks/mon-client-stand.md](docs/runbooks/mon-client-stand.md).
+
 ## Development
 
 ```sh

@@ -1,7 +1,10 @@
-# Compose file for the Playwright e2e harness. Builds the repo's own image
+# Compose file for the Playwright e2e harness. Builds the repo's own images
 # and starts one mon-server instance with a fresh, throwaway database — never
-# a developer's or production /var/lib/mon-server. See docs/agents/testing.md
-# ("E2E tests") and `make e2e`.
+# a developer's or production /var/lib/mon-server — plus one real mon-client
+# container that registers against it, so tests/mon-client.spec.ts can walk
+# the whole protocol (docs/agents/testing.md: "mon-client and the protocol
+# through Playwright's request context against a stub" — here against the
+# real pair). See `make e2e`.
 services:
   mon-server:
     build:
@@ -25,6 +28,14 @@ services:
     # login mon-server's own CLI (`admin set`, MON_ADMIN_PASSWORD for the
     # non-interactive path — cmd/mon-server/cli.go), then hands off to the
     # real entrypoint.
+    #
+    # The certificate carries DNS:mon-server as well as IP:127.0.0.1, and a
+    # copy of it (never the key) is published on the shared e2e-certs volume:
+    # Playwright reaches this server on the published port as 127.0.0.1 with
+    # ignoreHTTPSErrors, but the mon-client container reaches it by compose
+    # service name and verifies the chain for real (spec §2: "пиннинга нет",
+    # system CAs), so it needs both the name in the SAN and the certificate
+    # in a trust store — see the mon-client service's SSL_CERT_FILE.
     entrypoint:
       - /bin/sh
       - -c
@@ -32,7 +43,9 @@ services:
         set -e
         openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 1 \
           -keyout "$$MON_TLS_KEY" -out "$$MON_TLS_CERT" \
-          -subj /CN=127.0.0.1 -addext subjectAltName=IP:127.0.0.1
+          -subj /CN=127.0.0.1 -addext subjectAltName=IP:127.0.0.1,DNS:mon-server
+        cp "$$MON_TLS_CERT" /certs/mon-server.pem
+        chmod 644 /certs/mon-server.pem
         /app/mon-server admin set "$$E2E_USERNAME"
         exec /app/mon-server run
     ports:
@@ -43,9 +56,57 @@ services:
     # volume never survives a run.
     volumes:
       - /var/lib/mon-server
+      - e2e-certs:/certs
     healthcheck:
       test: ["CMD", "curl", "-fsSk", "https://127.0.0.1:443/healthz"]
       interval: 2s
       timeout: 3s
       retries: 30
       start_period: 10s
+
+  # A real mon-client, built from Dockerfile.mon-client and pointed at the
+  # mon-server above — the protocol's other end, so the e2e suite exercises
+  # registration, config fetch and heartbeat as they actually run rather
+  # than as a spec's request context imitates them. No published port: a
+  # mon-client only ever makes outbound calls (spec §1).
+  mon-client:
+    build:
+      context: ..
+      dockerfile: Dockerfile.mon-client
+    # The name the registration request carries (protocol §2.1, from
+    # os.Hostname) and therefore the one tests/mon-client.spec.ts looks for
+    # on the Requests page. Fixed here so the spec has something to match.
+    hostname: mon-client-e2e
+    depends_on:
+      mon-server:
+        condition: service_healthy
+    environment:
+      TZ: UTC
+      # Spec §2's single mandatory parameter. By service name, over the
+      # compose network, on the same :443 the image exposes.
+      MON_SERVER_URL: "https://mon-server:443"
+      # mon-client has no --insecure and no CA flag (spec §2: it trusts the
+      # system store), so the harness' self-signed certificate is handed to
+      # it the way Go's crypto/x509 accepts one on Linux: SSL_CERT_FILE,
+      # which replaces the system pool with exactly this file. mon-server
+      # is the only host a mon-client ever talks to, so replacing the pool
+      # costs nothing.
+      SSL_CERT_FILE: "/certs/mon-server.pem"
+    # There is no MON_LOG_LEVEL (cmd/mon-client/cli.go has --log-level
+    # only), and debug is what makes `docker compose logs mon-client` worth
+    # reading when a spec fails.
+    command: ["run", "--log-level", "debug"]
+    volumes:
+      # Read-only: mon-server writes the certificate, mon-client only reads
+      # it, and it keeps running as the image's non-root user with no
+      # capabilities either way.
+      - e2e-certs:/certs:ro
+      # Anonymous, like mon-server's: a fresh state.json/cycles.json per run,
+      # so every `make e2e` starts from an unregistered box.
+      - /var/lib/mon-client
+
+# Named because two services share it; anonymous volumes cannot be. `make
+# e2e`'s teardown is `down -v`, which removes it along with the anonymous
+# ones, so no certificate survives a run.
+volumes:
+  e2e-certs:

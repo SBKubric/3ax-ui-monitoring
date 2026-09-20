@@ -1,0 +1,89 @@
+# ========================================================
+# Dockerfile-набросок для ручной проверки mon-client на стенде (issue #23:
+# "Dockerfile-набросок и ручная проверка на стенде"). Это НЕ упаковка —
+# та карта в эпике панели, SBKubric/3ax-ui-proxy#39. Здесь — минимальный
+# образ, достаточный чтобы поднять один mon-client на стенде рядом с
+# mon-server (эпик #1) и панелью (SBKubric/3ax-ui-proxy#43).
+#
+# Форма из спеки §1 и research §7: один контейнер, один Go-процесс без
+# capabilities — AWG-targets идут через встроенный amneziawg-go/netstack
+# (in-process, без /dev/net/tun, без capabilities), xray-targets — через
+# дочерний процесс xray, чей бинарь просто копируется из официального
+# образа (research §2.2: ghcr.io/xtls/xray-core — distroless/static:nonroot,
+# бинарь лежит в /usr/local/bin/xray). Контейнеру не нужны ни capabilities,
+# ни /dev/net/tun, ни особый --network (research §4, §7) — только исходящий
+# TCP/UDP.
+# ========================================================
+
+# --- Stage: xray — только источник бинаря, ничего не собираем здесь.
+# Пиннить на латест сознательно: BRIEF §1 фиксирует ghcr.io/xtls/xray-core:latest
+# = Xray 26.3.27 как версию, с которой проверялась остальная реализация
+# mon-client (research §2.2, BRIEF-client.md §1 "xray").
+FROM ghcr.io/xtls/xray-core:latest AS xray
+
+# ========================================================
+# Stage: builder — компилирует mon-client. В отличие от mon-server,
+# mon-client не тянет gorm.io/driver/sqlite (никакого CGO, BRIEF-client.md:
+# "mon-client has no sqlite"), поэтому CGO_ENABLED=0 и статический бинарь —
+# нормально и даже проще runtime-образа.
+# ========================================================
+FROM golang:1.26-bookworm AS builder
+WORKDIR /src
+
+ARG VERSION=dev
+
+# Кэшируем скачивание модулей отдельно от исходников, как в mon-server's
+# Dockerfile.
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+
+ENV CGO_ENABLED=0
+RUN go build -ldflags "-X github.com/SBKubric/3ax-ui-monitoring/internal/version.version=$VERSION" \
+    -o /out/mon-client ./cmd/mon-client
+
+# ========================================================
+# Stage: runtime — debian-slim, не distroless/scratch: нужны системные CA
+# (mon-client доверяет системным CA, спека §2 "пиннинга нет") для HTTPS до
+# mon-server и tzdata для меток времени; исходный xray-образ сам distroless
+# без shell (research §2.2), поэтому его бинарь просто копируется сюда, а
+# не запускается как отдельная стадия.
+# ========================================================
+FROM debian:bookworm-slim
+WORKDIR /app
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       ca-certificates \
+       tzdata \
+    && rm -rf /var/lib/apt/lists/*
+
+# Non-root, без capabilities: mon-client не слушает никакой порт (только
+# исходящие HTTPS-соединения к mon-server), так что даже
+# CAP_NET_BIND_SERVICE ему не нужен — в отличие от mon-server's Dockerfile.
+RUN groupadd --system mon-client \
+    && useradd --system --gid mon-client --home-dir /var/lib/mon-client --shell /usr/sbin/nologin mon-client
+
+COPY --from=builder /out/mon-client /app/mon-client
+COPY --from=xray /usr/local/bin/xray /usr/local/bin/xray
+
+RUN mkdir -p /var/lib/mon-client && chown -R mon-client:mon-client /var/lib/mon-client
+
+USER mon-client
+
+# state.json, cycles.json, xray.json живут здесь — спека §2's state-dir
+# default.
+VOLUME ["/var/lib/mon-client"]
+
+# Единственный обязательный параметр (спека §2) приходит через ENV или
+# --server; по умолчанию пусто, чтобы отсутствие значения было явной
+# ошибкой запуска (cli.go: "--server or MON_SERVER_URL is required"), а не
+# тихим указанием на example.com.
+ENV MON_SERVER_URL=""
+
+# --state-dir и --xray-bin равны образным путям по умолчанию
+# (cli.go: defaultStateDir=/var/lib/mon-client, defaultXrayBin=/usr/local/bin/xray),
+# так что CMD их не повторяет.
+ENTRYPOINT ["/app/mon-client"]
+CMD ["run"]

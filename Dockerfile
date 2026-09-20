@@ -47,7 +47,13 @@ RUN groupadd --system mon-server \
 
 COPY --from=builder /out/mon-server /app/mon-server
 
-RUN mkdir -p /var/lib/mon-server && chown -R mon-server:mon-server /var/lib/mon-server /app
+# /certs exists, empty and owned by the runtime user, only so that the e2e
+# harness can mount a shared volume there (e2e/docker-compose.yml publishes
+# the self-signed certificate for the mon-client container to trust): Docker
+# seeds a fresh named volume from the image's directory, ownership included,
+# and a root-owned mount point would be unwritable by this non-root process.
+# A production install never touches it.
+RUN mkdir -p /var/lib/mon-server /certs && chown -R mon-server:mon-server /var/lib/mon-server /certs /app
 
 USER mon-server
 

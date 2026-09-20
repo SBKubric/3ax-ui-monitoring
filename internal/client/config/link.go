@@ -3,6 +3,10 @@
 // (spec §4 step 2, research §2.1) and one AmneziaWG UAPI blob per AWG-target
 // (spec §4 step 2, research §3.4).
 //
+// It speaks the protocol's own types (internal/client/proto): a target is a
+// proto.Target and a plan's key a proto.TargetKey, so nothing between the
+// config document and the probe has to copy a target field by field.
+//
 // The package is deliberately pure: it only parses strings and produces bytes,
 // so every rule below is covered by golden tests and the generated config is
 // checked by the real `xray -test` (xray_integration_test.go). Nothing here
@@ -18,37 +22,6 @@ import (
 	"strconv"
 	"strings"
 )
-
-// Target is the subset of a config-document target (protocol §4.2) this package
-// needs. It is a flat copy of proto.Target so that internal/client/config does
-// not depend on internal/client/proto: the run loop converts field by field.
-type Target struct {
-	InboundKind string
-	InboundID   int
-	Path        string
-	Protocol    string
-	Link        string
-	Conf        string
-}
-
-// TargetKey identifies a target inside one mon-client (protocol §4.2). It has
-// the same shape as proto.TargetKey on purpose, so the app layer can convert
-// between the two with a plain Go conversion.
-type TargetKey struct {
-	InboundKind string
-	InboundID   int
-	Path        string
-}
-
-// String is the key's wire form, the probe's ?target= value (protocol §5.2).
-func (k TargetKey) String() string {
-	return k.InboundKind + ":" + strconv.Itoa(k.InboundID) + ":" + k.Path
-}
-
-// Key is the target's identity; the rest of Target is material for the config.
-func (t Target) Key() TargetKey {
-	return TargetKey{InboundKind: t.InboundKind, InboundID: t.InboundID, Path: t.Path}
-}
 
 const (
 	// defaultEncryption is what a vless link without `encryption` means. The
