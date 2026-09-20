@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	mrand "math/rand/v2"
 	"net/http"
@@ -34,10 +35,21 @@ type supHarness struct {
 	logs *lockedBuffer
 	log  *slog.Logger
 
+	// applyErr, when set before run(), is the error every loop's applier
+	// fails Apply with — the box whose config will not apply (spec §4.3),
+	// which must keep reporting that error as configError even while it is
+	// disabled.
+	applyErr error
+
 	mu     sync.Mutex
 	sleeps []time.Duration
 	stops  int
 }
+
+// harnessXrayVersion is what every loop this harness builds reports as
+// client.xrayVersion (protocol §5.3), so a heartbeat that drops it is
+// visible as an empty string rather than as an indistinguishable default.
+const harnessXrayVersion = "Xray 1.8.24"
 
 func newSupHarness(t *testing.T) *supHarness {
 	t.Helper()
@@ -117,6 +129,17 @@ func (h *supHarness) slept(d time.Duration) int {
 	return n
 }
 
+// sleepCount is every wait the supervisor and its loops have asked for,
+// the only clock a supervisor test has: a negative assertion ("no probes
+// happen while X") waits for the machinery to take a known number of steps
+// through this seam rather than for a wall-clock duration that is a race
+// on a loaded machine.
+func (h *supHarness) sleepCount() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return len(h.sleeps)
+}
+
 func (h *supHarness) stopped() int {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -130,20 +153,25 @@ func (h *supHarness) newLoop(f *state.File, c *api.Client) (*Loop, func(context.
 	if err != nil {
 		return nil, nil, err
 	}
-	applier := &fakeApplier{file: f, probes: map[proto.TargetKey]probe.Fn{targetKey(): h.stubProbe(f.Token)}}
+	applier := &fakeApplier{
+		file:     f,
+		probes:   map[proto.TargetKey]probe.Fn{targetKey(): h.stubProbe(f.Token)},
+		applyErr: h.applyErr,
+	}
 	loop := NewLoop(Deps{
-		API:       c,
-		State:     h.dir,
-		File:      f,
-		Buffer:    buf,
-		Runner:    probe.NewRunner(h.log),
-		Applier:   applier,
-		Clock:     h.clk,
-		Sleep:     h.sleep,
-		Rand:      mrand.New(mrand.NewPCG(1, 2)),
-		Log:       h.log,
-		Version:   "0.1.0",
-		StartedAt: h.clk.Now(),
+		API:         c,
+		State:       h.dir,
+		File:        f,
+		Buffer:      buf,
+		Runner:      probe.NewRunner(h.log),
+		Applier:     applier,
+		Clock:       h.clk,
+		Sleep:       h.sleep,
+		Rand:        mrand.New(mrand.NewPCG(1, 2)),
+		Log:         h.log,
+		Version:     "0.1.0",
+		XrayVersion: func() string { return harnessXrayVersion },
+		StartedAt:   h.clk.Now(),
 	})
 	return loop, func(context.Context) error {
 		h.mu.Lock()
@@ -186,6 +214,7 @@ func (h *supHarness) count(method, prefix string) int {
 }
 
 func (h *supHarness) probes() int     { return h.count(http.MethodGet, "/v1/probe") }
+func (h *supHarness) configs() int    { return h.count(http.MethodGet, "/v1/config") }
 func (h *supHarness) heartbeats() int { return h.count(http.MethodPost, "/v1/heartbeat") }
 
 // pairingCodes is every code mon-client has submitted, in order (protocol
@@ -296,10 +325,14 @@ func TestSupervisor_TokenRevokedClearsStateAndRegistersAgain(t *testing.T) {
 		t.Fatal("the loop's stop function was never called; spec §6 wants probing stopped on a 401")
 	}
 
-	// Spec §6: no probes while the box has no identity. Nothing can
-	// resume until the new request is approved, so the count must hold.
+	// Spec §6: no probes while the box has no identity. Nothing can resume
+	// until the new request is approved, so the count must hold — and
+	// "hold" is measured in the waits registration's polling takes through
+	// the harness' sleeper, not in wall-clock time, so the assertion is
+	// the same on an idle machine and a loaded one.
 	probesAtRevoke := h.probes()
-	time.Sleep(50 * time.Millisecond)
+	waitsAtRevoke := h.sleepCount()
+	h.waitFor("several registration polls", func() bool { return h.sleepCount() >= waitsAtRevoke+5 })
 	if got := h.probes(); got != probesAtRevoke {
 		t.Fatalf("%d probes during re-registration, want none (was %d)", got-probesAtRevoke, probesAtRevoke)
 	}
@@ -360,6 +393,7 @@ func TestSupervisor_DisabledHeartbeatsEveryFiveMinutesThenResumes(t *testing.T) 
 	// Re-enabled: the next bare heartbeat is answered 200 and the cycle
 	// resumes on the same identity.
 	acceptedBefore := len(h.stub.Heartbeats())
+	configsWhileDisabled := h.configs()
 	h.stub.SetTokenStatus(0)
 
 	h.waitFor("the bare heartbeat that finds the box enabled", func() bool {
@@ -372,8 +406,20 @@ func TestSupervisor_DisabledHeartbeatsEveryFiveMinutesThenResumes(t *testing.T) 
 	if bare.MonClientID != "ams-1" || bare.Client.Version != "0.1.0" {
 		t.Fatalf("bare heartbeat = %+v, want the client block of ams-1", bare)
 	}
+	// Protocol §5.3: bare or not, the client block is the whole client
+	// block — a disabled box still says which xray it has.
+	if bare.Client.XrayVersion != harnessXrayVersion {
+		t.Fatalf("bare heartbeat xrayVersion = %q, want %q", bare.Client.XrayVersion, harnessXrayVersion)
+	}
+	if bare.Client.UptimeMs <= 0 {
+		t.Fatalf("bare heartbeat uptimeMs = %d, want the process' age", bare.Client.UptimeMs)
+	}
 
 	h.waitFor("probes to resume", func() bool { return h.probes() > probesAtDisable })
+	// Spec §6: a re-enabled box gets a freshly built loop, and a fresh
+	// loop fetches GET /v1/config before its first cycle (spec §4.1) —
+	// the disable may have lasted across any number of revisions.
+	h.waitFor("the config to be fetched again", func() bool { return h.configs() > configsWhileDisabled })
 	h.waitFor("a cycle to be delivered again", func() bool {
 		for _, hb := range h.stub.Heartbeats()[acceptedBefore:] {
 			if len(hb.Cycles) > 0 {
@@ -387,6 +433,48 @@ func TestSupervisor_DisabledHeartbeatsEveryFiveMinutesThenResumes(t *testing.T) 
 	}
 	if h.stateExists() != true {
 		t.Fatal("state.json was cleared on a 403; spec §6 keeps it")
+	}
+}
+
+// TestSupervisor_DisabledHeartbeatCarriesConfigError pins the other half
+// of protocol §5.3's client block on a disabled box: a mon-client whose
+// applied config is broken is very often a mon-client an operator has just
+// disabled *because* it is broken, and the five-minute bare heartbeats are
+// then the only thing still telling them why. So configError rides along
+// with them, exactly as it rides along with an ordinary heartbeat (spec
+// §4.3: "до следующего успешного применения").
+func TestSupervisor_DisabledHeartbeatCarriesConfigError(t *testing.T) {
+	h := newSupHarness(t)
+	h.applyErr = errors.New("xray config rejected: no such outbound\nsecond line")
+	h.registered("ams-1", "tok")
+	stop := h.run()
+	defer stop()
+
+	h.waitFor("the loop to heartbeat", func() bool { return h.heartbeats() > 0 })
+	h.stub.SetTokenStatus(http.StatusForbidden)
+	h.waitFor("the disabled branch", func() bool {
+		return strings.Contains(h.logs.String(), "mon-client disabled, probing stopped")
+	})
+
+	acceptedBefore := len(h.stub.Heartbeats())
+	h.stub.SetTokenStatus(0)
+	h.waitFor("the bare heartbeat that finds the box enabled", func() bool {
+		return len(h.stub.Heartbeats()) > acceptedBefore
+	})
+
+	bare := h.stub.Heartbeats()[acceptedBefore]
+	if len(bare.Cycles) != 0 {
+		t.Fatalf("the disabled heartbeat carried %d cycles, want none", len(bare.Cycles))
+	}
+	if bare.Client.ConfigError == nil {
+		t.Fatalf("bare heartbeat carried no configError; client = %+v", bare.Client)
+	}
+	// Spec §4.3: the first line only.
+	if got, want := *bare.Client.ConfigError, "xray config rejected: no such outbound"; got != want {
+		t.Fatalf("bare heartbeat configError = %q, want %q", got, want)
+	}
+	if bare.Client.XrayVersion != harnessXrayVersion {
+		t.Fatalf("bare heartbeat xrayVersion = %q, want %q", bare.Client.XrayVersion, harnessXrayVersion)
 	}
 }
 

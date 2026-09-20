@@ -223,13 +223,8 @@ func (l *Loop) Once(ctx context.Context) error {
 	hb := &proto.HeartbeatRequest{
 		MonClientID:    l.d.File.MonClientID,
 		ConfigRevision: l.d.File.AppliedRevision,
-		Client: proto.ClientInfo{
-			Version:     l.d.Version,
-			XrayVersion: l.xrayVersion(),
-			UptimeMs:    l.uptimeMs(),
-			ConfigError: configErrorText(configErr),
-		},
-		Cycles: l.d.Buffer.Pending(),
+		Client:         l.clientInfo(configErr),
+		Cycles:         l.d.Buffer.Pending(),
 	}
 
 	hctx, cancel := context.WithTimeout(ctx, l.heartbeatTimeout(doc))
@@ -393,6 +388,33 @@ func (l *Loop) heartbeatTimeout(doc *proto.ConfigDoc) time.Duration {
 		ms = DefaultHeartbeatTimeoutMs
 	}
 	return time.Duration(ms) * time.Millisecond
+}
+
+// ClientInfo reports protocol §5.3's client block for a heartbeat sent
+// from outside a cycle — the supervisor's bare heartbeats while this
+// mon-client is disabled (spec §6), which carry no cycles but must still
+// say which version is running, which xray is installed and whether the
+// applied config is broken.
+//
+// It is the exported half of clientInfo: the configError comes from the
+// applier, which is the same place the cycle's own does, so a box that was
+// disabled while a revision would not apply keeps reporting that error for
+// as long as it is disabled instead of going quiet about it.
+func (l *Loop) ClientInfo() proto.ClientInfo {
+	_, _, configErr := l.d.Applier.Applied()
+	return l.clientInfo(configErr)
+}
+
+// clientInfo builds the client block over an already-known configError —
+// the cycle has one in hand and must report exactly the error that cycle
+// probed under, not whatever the applier holds a moment later.
+func (l *Loop) clientInfo(configErr error) proto.ClientInfo {
+	return proto.ClientInfo{
+		Version:     l.d.Version,
+		XrayVersion: l.xrayVersion(),
+		UptimeMs:    l.uptimeMs(),
+		ConfigError: configErrorText(configErr),
+	}
 }
 
 // uptimeMs is the process' age (protocol §5.3's client.uptimeMs), never

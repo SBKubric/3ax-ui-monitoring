@@ -40,6 +40,19 @@ const stopTimeout = 5 * time.Second
 // Run returns, before anything else happens to that identity.
 type LoopFactory func(file *state.File, client *api.Client) (loop *Loop, stop func(ctx context.Context) error, err error)
 
+// ClientInfoSource is the one thing the supervisor asks a built loop for
+// while that loop is not running: protocol §5.3's client block, so the
+// bare heartbeats of disabled mode carry the same xrayVersion and
+// configError an ordinary heartbeat would. *Loop satisfies it.
+//
+// It is an interface rather than a direct call on *Loop because it is the
+// whole of what the supervisor needs from a stopped loop, and stating that
+// keeps the disabled branch from growing a second use of a loop it has
+// deliberately taken out of service.
+type ClientInfoSource interface {
+	ClientInfo() proto.ClientInfo
+}
+
 // SupervisorDeps are everything RunSupervisor needs. Clock, Sleep and Rand
 // exist so a test can run a revocation and a five-minute disable in
 // microseconds; everything else is what registration and the loop need
@@ -185,20 +198,15 @@ func (s *supervisor) identity(ctx context.Context) (*state.File, error) {
 	switch {
 	case err == nil:
 		s.d.Log.Info(fmt.Sprintf("state loaded (mon-client %s)", f.MonClientID))
-	case errors.Is(err, state.ErrNoState):
-		s.d.Log.Info("no state, registration required")
-		f, err = s.registerAgain(ctx)
-		if err != nil {
-			return nil, err
-		}
 	default:
-		s.d.Log.Warn("state file unreadable, clearing it", "error", err)
-		if clearErr := s.d.Dir.Clear(); clearErr != nil {
-			return nil, clearErr
+		if !errors.Is(err, state.ErrNoState) {
+			s.d.Log.Warn("state file unreadable, clearing it", "error", err)
+			if clearErr := s.d.Dir.Clear(); clearErr != nil {
+				return nil, clearErr
+			}
 		}
 		s.d.Log.Info("no state, registration required")
-		f, err = s.registerAgain(ctx)
-		if err != nil {
+		if f, err = s.registerAgain(ctx); err != nil {
 			return nil, err
 		}
 	}
@@ -259,7 +267,7 @@ func (s *supervisor) serve(ctx context.Context, file *state.File, client *api.Cl
 		case errors.Is(runErr, api.ErrTokenRevoked):
 			return true, s.clearState()
 		case errors.Is(runErr, api.ErrDisabled):
-			revoked, err := s.waitEnabled(ctx, file, client)
+			revoked, err := s.waitEnabled(ctx, file, client, loop)
 			if err != nil {
 				return false, err
 			}
@@ -333,7 +341,7 @@ func (s *supervisor) stop(stop func(ctx context.Context) error) {
 // mon-server already refused to take. Those stay in cycles.json and ride
 // along with the first real heartbeat after resuming (spec §6's buffer
 // rules), which is the next loop's job.
-func (s *supervisor) waitEnabled(ctx context.Context, file *state.File, client *api.Client) (revoked bool, err error) {
+func (s *supervisor) waitEnabled(ctx context.Context, file *state.File, client *api.Client, info ClientInfoSource) (revoked bool, err error) {
 	s.d.Log.Info(fmt.Sprintf("mon-client disabled, probing stopped, heartbeat every %s", disabledHeartbeatInterval))
 	for {
 		if err := s.d.Sleep(ctx, disabledHeartbeatInterval); err != nil {
@@ -343,10 +351,7 @@ func (s *supervisor) waitEnabled(ctx context.Context, file *state.File, client *
 		hb := &proto.HeartbeatRequest{
 			MonClientID:    file.MonClientID,
 			ConfigRevision: file.AppliedRevision,
-			Client: proto.ClientInfo{
-				Version:  s.d.Version,
-				UptimeMs: s.uptimeMs(),
-			},
+			Client:         s.clientInfo(info),
 			// Non-nil so the body carries "cycles": [] rather than null
 			// (protocol §5.3).
 			Cycles: []proto.Cycle{},
@@ -376,6 +381,25 @@ func (s *supervisor) waitEnabled(ctx context.Context, file *state.File, client *
 			s.d.Log.Warn("heartbeat while disabled failed", "error", sendErr)
 		}
 	}
+}
+
+// clientInfo is the bare heartbeats' client block (protocol §5.3).
+//
+// It is the stopped loop's own block — the version of xray it started,
+// and the configError of whatever revision it last tried to apply, both of
+// which a disabled mon-client still has to report (the operator looking at
+// the admin UI is often disabling a box *because* its config is broken).
+// Only uptimeMs is the supervisor's: the loop's clock starts when the loop
+// is built, and a box that has been disabled and re-enabled a few times
+// would otherwise report an uptime much shorter than the process'.
+func (s *supervisor) clientInfo(info ClientInfoSource) proto.ClientInfo {
+	c := proto.ClientInfo{}
+	if info != nil {
+		c = info.ClientInfo()
+	}
+	c.Version = s.d.Version
+	c.UptimeMs = s.uptimeMs()
+	return c
 }
 
 // uptimeMs is the process' age for the bare heartbeats' client block
