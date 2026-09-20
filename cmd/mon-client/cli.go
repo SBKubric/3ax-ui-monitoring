@@ -6,17 +6,30 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"os"
 	"strings"
 
+	"github.com/SBKubric/3ax-ui-monitoring/internal/client/api"
+	"github.com/SBKubric/3ax-ui-monitoring/internal/client/register"
 	"github.com/SBKubric/3ax-ui-monitoring/internal/client/state"
 	"github.com/SBKubric/3ax-ui-monitoring/internal/version"
 )
+
+// httpClientForTests, when non-nil, replaces the plain *http.Client `run`
+// otherwise builds for internal/client/api.New. Production never touches
+// it; this package's own tests set it to a client trusting a
+// servertest.Stub's self-signed certificate, so `run` can be driven all
+// the way through registration against a stub without either a real
+// mon-server or any flag/CA-file plumbing of its own (issue #16's brief:
+// "keep it simple").
+var httpClientForTests *http.Client
 
 // envServerURL is spec §2's ENV alternative to --server.
 const envServerURL = "MON_SERVER_URL"
@@ -119,11 +132,13 @@ func runRun(args []string, stdout, stderr io.Writer) int {
 	}
 
 	f, err := dir.Load()
+	needsRegistration := false
 	switch {
 	case err == nil:
 		logger.Info(fmt.Sprintf("state loaded (mon-client %s)", f.MonClientID))
 	case errors.Is(err, state.ErrNoState):
 		logger.Info("no state, registration required")
+		needsRegistration = true
 	default:
 		// A corrupt state file (spec §2: "Пропал или 401 — стереть и
 		// регистрироваться заново" — the same recovery applies to a state
@@ -135,13 +150,37 @@ func runRun(args []string, stdout, stderr io.Writer) int {
 			return 1
 		}
 		logger.Info("no state, registration required")
+		needsRegistration = true
 	}
 
-	_ = serverURL // wired into internal/client/register from step 2 on
+	if needsRegistration {
+		hc := httpClientForTests
+		if hc == nil {
+			hc = &http.Client{}
+		}
+		hostname, err := os.Hostname()
+		if err != nil {
+			hostname = ""
+		}
+		f, err = register.Run(context.Background(), register.Deps{
+			API:      api.New(serverURL, hc),
+			State:    dir,
+			Log:      logger,
+			Hostname: hostname,
+			Version:  version.Version(),
+			PublicIP: register.PublicIPFromDial(serverURL),
+		})
+		if err != nil {
+			fmt.Fprintf(stderr, "mon-client: register: %v\n", err)
+			return 1
+		}
+	}
 
-	// The registration/probe/heartbeat loop arrives in step 7
-	// (internal/client/app.Loop); step 1 only proves flags, state and
-	// logging work end to end.
+	logger.Info(fmt.Sprintf("registered as %s", f.MonClientID))
+
+	// The config/probe/heartbeat loop arrives in step 7
+	// (internal/client/app.Loop); this step only carries mon-client
+	// through registration and proves it end to end against a stub.
 	return 0
 }
 
