@@ -1,0 +1,124 @@
+{{define "content"}}
+<section class="card tight hd">
+  <h3>mon-clients</h3>
+  <a-tag data-testid="clients-count">[[ clients.length ]] registered</a-tag>
+  <span class="sp"></span>
+  <span class="muted small">"⋯" → Edit · Revoke · Delete. Revoke makes the box drop its state and register again.</span>
+</section>
+
+<section class="card table-card">
+  <table class="t" data-testid="clients-table">
+    <thead>
+      <tr>
+        <th class="c">Operate</th><th class="c">Enabled</th><th>Name</th><th>State</th>
+        <th>Last heartbeat</th><th>Paths</th><th>Version</th><th>Config</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr v-for="c in clients" :key="c.id" data-testid="client-row" :data-client-id="c.id" :class="c.enabled ? '' : 'dis'">
+        <td class="c">
+          <a-dropdown trigger="click">
+            <a-button size="small" data-testid="client-actions">⋯</a-button>
+            <template #overlay>
+              <a-menu>
+                <a-menu-item @click="openEdit(c)"><span data-testid="client-edit">Edit</span></a-menu-item>
+                <a-menu-item @click="askRevoke(c)"><span data-testid="client-revoke">Revoke token</span></a-menu-item>
+                <a-menu-item danger @click="askDelete(c)"><span data-testid="client-delete">Delete</span></a-menu-item>
+              </a-menu>
+            </template>
+          </a-dropdown>
+        </td>
+        <td class="c">
+          <a-switch :checked="c.enabled" size="small" data-testid="client-enabled-switch" @change="setEnabled(c, $event)"></a-switch>
+        </td>
+        <td>
+          <b data-testid="client-name">[[ c.name ]]</b>
+          <div class="muted mono tiny">[[ c.id ]] · [[ c.region || '—' ]]</div>
+        </td>
+        <td><span class="st" :class="stateClass(c)" data-testid="client-state">[[ stateLabel(c) ]]</span></td>
+        <td data-testid="client-heartbeat">
+          <span v-if="c.lastHeartbeat">[[ ago(c.lastHeartbeat, now) ]]</span>
+          <span class="muted" v-else>approved [[ ago(c.approvedAt, now) ]]</span>
+        </td>
+        <td data-testid="client-paths"><a-tag v-for="p in c.paths" :key="p" :color="p === 'proxy' ? 'blue' : 'default'">[[ p ]]</a-tag></td>
+        <td data-testid="client-version">
+          <span v-if="c.version">v[[ c.version ]] <span class="muted">· xray [[ c.xrayVersion || '?' ]]</span></span>
+          <span class="muted" v-else>—</span>
+        </td>
+        <td data-testid="client-config">
+          <a-tag color="error" v-if="c.configError" :title="c.configError">⚠ config error · rev [[ shortRev(c.appliedRevision) ]]</a-tag>
+          <span class="mono muted" v-else-if="c.appliedRevision || c.serverRevision">[[ shortRev(c.appliedRevision || c.serverRevision) ]]</span>
+          <span class="muted" v-else>—</span>
+        </td>
+      </tr>
+      <tr v-if="!clients.length"><td colspan="8" class="muted" data-testid="clients-empty">No mon-clients yet. Approve a registration request first.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<a-modal v-model:open="edit.open" :footer="null" title="Edit mon-client" :width="600">
+  <div data-testid="edit-modal" v-if="edit.client">
+    <div class="fi">
+      <label>id (permanent)</label>
+      <div class="in ro mono" data-testid="edit-id">[[ edit.client.id ]]</div>
+    </div>
+    <div class="row2">
+      <div class="fi">
+        <label>Name</label>
+        <a-input v-model:value="edit.name" data-testid="edit-name"></a-input>
+      </div>
+      <div class="fi">
+        <label>Region</label>
+        <a-input v-model:value="edit.region" data-testid="edit-region"></a-input>
+      </div>
+    </div>
+    <div class="fi">
+      <label>Paths</label>
+      <div>
+        <a-checkbox v-model:checked="edit.proxy" data-testid="edit-path-proxy">proxy</a-checkbox>
+        <a-checkbox v-model:checked="edit.direct" data-testid="edit-path-direct">direct</a-checkbox>
+      </div>
+      <div class="muted tiny">[[ strings.pathsHint ]]</div>
+    </div>
+    <div class="fi">
+      <label>Config revisions</label>
+      <div class="mono small">
+        applied: <span data-testid="edit-applied-revision">[[ edit.client.appliedRevision || '—' ]]</span><br>
+        server: <span data-testid="edit-server-revision">[[ edit.client.serverRevision || '—' ]]</span>
+      </div>
+    </div>
+    <div class="fi" v-if="edit.client.configError">
+      <label>Config error reported by the box</label>
+      <pre class="pre" data-testid="edit-config-error">[[ edit.client.configError ]]</pre>
+    </div>
+    <div class="hd right">
+      <a-button data-testid="edit-cancel" @click="edit.open = false">Cancel</a-button>
+      <a-button type="primary" :loading="edit.busy" data-testid="edit-save" @click="save">Save</a-button>
+    </div>
+  </div>
+</a-modal>
+
+<a-modal v-model:open="revoke.open" :footer="null" title="Revoke this token?">
+  <div data-testid="revoke-modal" v-if="revoke.client">
+    <p>[[ strings.revokeWarning ]]</p>
+    <p class="mono">[[ revoke.client.id ]] · [[ revoke.client.name ]]</p>
+    <div class="hd right">
+      <a-button data-testid="revoke-cancel" @click="revoke.open = false">Cancel</a-button>
+      <a-button type="primary" danger :loading="revoke.busy" data-testid="revoke-confirm" @click="doRevoke">Revoke token</a-button>
+    </div>
+  </div>
+</a-modal>
+
+<a-modal v-model:open="remove.open" :footer="null" title="Delete this mon-client?">
+  <div data-testid="delete-modal" v-if="remove.client">
+    <p>[[ strings.deleteWarning ]]</p>
+    <p class="mono">[[ remove.client.id ]] · [[ remove.client.name ]]</p>
+    <div class="hd right">
+      <a-button data-testid="delete-cancel" @click="remove.open = false">Cancel</a-button>
+      <a-button type="primary" danger :loading="remove.busy" data-testid="delete-confirm" @click="doDelete">Delete</a-button>
+    </div>
+  </div>
+</a-modal>
+{{end}}
+
+{{define "script"}}<script src="/admin/assets/page-clients.js"></script>{{end}}

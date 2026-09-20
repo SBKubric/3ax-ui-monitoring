@@ -1,24 +1,107 @@
-# 3ax-ui-monitoring
+# mon-server
 
-Мониторинг inbound'ов панели [3AX-UI](https://github.com/SBKubric/3ax-ui-proxy): **mon-server** на отдельном сервере и коробки **mon-client** в целевых регионах, которые раз в минуту проверяют каждый inbound real server через proxy front и напрямую, а панель показывает картину и шлёт Telegram.
+Monitoring for [3AX-UI](https://github.com/SBKubric/3ax-ui-proxy) panel inbounds: **mon-server** runs on its own box and is the single source of truth for monitoring; **mon-client** boxes in each target region probe every inbound through the proxy front and directly, once a minute; the panel only displays what mon-server tells it and sends Telegram on mon-server's behalf. Terms below follow [CONTEXT.md](CONTEXT.md). See [docs/spec/mon-server.md](docs/spec/mon-server.md) for the full spec this README summarizes, [docs/spec/mon-client.md](docs/spec/mon-client.md) for the mon-client side, [mon-protocol.md](docs/spec/mon-protocol.md) for the mon-server↔mon-client wire protocol, [the panel's monitoring contract](https://github.com/SBKubric/3ax-ui-proxy/blob/main/docs/spec/monitoring-contract.md) for what mon-server calls on the panel, and [ADR 0003](https://github.com/SBKubric/3ax-ui-proxy/blob/main/docs/adr/0003-mon-server-single-source-panel-passive.md) for why the panel is a passive receiver.
 
-Статус: спека готова к реализации, кода пока нет. Решения приняты в карте [Healthcheck-мониторинг inbound'ов: mon-server, mon-clients и контракт с панелью](https://github.com/SBKubric/3ax-ui-proxy/issues/20).
+## Requirements
 
-## Документы
+- A Linux box with a **public IP** it can be reached on. mon-server terminates its own TLS and needs no reverse proxy in front of it.
+- **Port 443 open to the whole internet** — both Let's Encrypt's `tls-alpn-01` validators (default TLS mode, see below) and every mon-client need to reach it. No other inbound port is used.
+- **NTP running.** Let's Encrypt's certificate validation and mon-server's own state machine (timestamps, timeouts, the 24h/7d retention windows) all depend on the clock being correct.
+- No domain name is required: the default TLS mode gets a certificate for the box's bare IP address.
 
-| документ | что |
-|---|---|
-| [CONTEXT.md](CONTEXT.md) | глоссарий: mon-server, mon-client, target, path, probe account, tunnel probe, heartbeat, registration request, pairing code, client token, config revision, unverified cycle, admin UI |
-| [docs/spec/mon-server.md](docs/spec/mon-server.md) | mon-server: bootstrap и TLS, хранилище, цикл с панелью, реестр и регистрация, state machine, статистика, Telegram, admin UI, план реализации |
-| [docs/spec/mon-client.md](docs/spec/mon-client.md) | mon-client: регистрация, конфиг и его применение, xray и AWG-netstack, цикл проб и измерения, heartbeat и буфер, план реализации |
-| [docs/spec/mon-protocol.md](docs/spec/mon-protocol.md) | протокол mon-server ↔ mon-client v1 (wire-форма) |
-| [Контракт API панели для mon-server](https://github.com/SBKubric/3ax-ui-proxy/blob/main/docs/spec/monitoring-contract.md) | ручки панели `/mon/v1/*`, которые mon-server вызывает (репо панели) |
-| [Панельная часть мониторинга](https://github.com/SBKubric/3ax-ui-proxy/blob/main/docs/spec/monitoring-panel.md) | таблицы, probe accounts, job'ы, Telegram, UI панели (репо панели) |
-| [ADR 0003](https://github.com/SBKubric/3ax-ui-proxy/blob/main/docs/adr/0003-mon-server-single-source-panel-passive.md) | mon-server — реестр и единственный источник истины, панель — пассивный приёмник |
+Packaging (a container image or an installer) is intentionally out of scope here — that is tracked separately in [SBKubric/3ax-ui-proxy#38](https://github.com/SBKubric/3ax-ui-proxy/issues/38). What follows is how to build and run the binary by hand or under systemd.
 
-## Как это устроено в двух словах
+## Quick start
 
-1. Панель (real server) открывает mon-server bearer-защищённые ручки и по его запросу заводит **probe accounts** — по служебному клиенту в каждом inbound'е под одним subId.
-2. mon-server раз в минуту забирает у панели состояние и конфиги probe-набора, собирает каждому mon-client его **targets** (inbound × path `proxy`/`direct`) и раздаёт их по **config revision**.
-3. mon-client поднимает туннель на каждый target (xray-core, AmneziaWG in-process) и раз в минуту шлёт **tunnel probe** через туннель и **heartbeat** мимо него.
-4. mon-server считает UP/DOWN/FLAPPING/UNKNOWN/PAUSED и шлёт панели переходы и 5-минутные агрегаты; панель рисует страницу Monitoring, бейдж Health у inbound'ов и шлёт Telegram. Молчание mon-server панель показывает как STALE.
+### 1. Build
+
+```sh
+make build          # -> ./mon-server, version stamped from `git describe`
+```
+
+or build a container image with the project's `Dockerfile` if you prefer that (see that file for details — it is not covered here).
+
+### 2. Bootstrap config
+
+mon-server needs a minimal bootstrap config *before* it has a database to keep settings in — everything else (panel URL, Telegram, thresholds) is configured later, at runtime, through the admin UI (see the spec's §9.4, [docs/spec/mon-server.md](docs/spec/mon-server.md)). Write `/etc/mon-server/config.json`:
+
+```json
+{
+  "listen": ":443",
+  "publicIp": "203.0.113.10",
+  "dataDir": "/var/lib/mon-server",
+  "tls": { "mode": "acme-ip" }
+}
+```
+
+| key | ENV | default | meaning |
+|---|---|---|---|
+| `listen` | `MON_LISTEN` | `:443` | address the single HTTPS listener binds — serves `/v1/*` (mon-clients), `/admin/*` (admin UI) and `/healthz` on the same port |
+| `publicIp` | `MON_PUBLIC_IP` | — | this box's public IP; required in `acme-ip` mode (Let's Encrypt needs to know what to request a certificate for) |
+| `dataDir` | `MON_DATA_DIR` | `/var/lib/mon-server` | where the SQLite file and, in `acme-ip` mode, certmagic's certificate cache live |
+| `tls.mode` | `MON_TLS_MODE` | `acme-ip` | `acme-ip` (built-in Let's Encrypt cert for `publicIp`, no domain needed) or `files` (bring your own cert/key — a real domain, or a test environment that must not touch the ACME network) |
+| `tls.cert` | `MON_TLS_CERT` | — | certificate path, required when `tls.mode=files` |
+| `tls.key` | `MON_TLS_KEY` | — | key path, required when `tls.mode=files` |
+
+ENV always wins over the file, so a systemd unit or container can override a single field without templating the whole JSON. An unknown key in the file is a hard error (almost always a typo, or a setting that belongs in the admin UI instead).
+
+### 3. Set the admin login
+
+```sh
+mon-server admin set alice -config /etc/mon-server/config.json
+```
+
+Prompts for the password twice on a terminal (bcrypt hash only, never stored in the clear); running it again changes the login and/or password. For scripted provisioning, set `MON_ADMIN_PASSWORD` to skip the prompt.
+
+### 4. Run
+
+```sh
+mon-server run -config /etc/mon-server/config.json
+```
+
+Then open `https://<publicIp>/admin/`, log in, and fill in **Settings → Real server**: `panelUrl` (the panel's base URL) and `monToken` (from the panel's Monitoring tab). Use **Check** to verify those two values reach the panel before saving. While you're there, the **Telegram** tab (`tgToken`, `tgChatId`) lets mon-server send its own alerts (panel unreachable, config errors) — optional, but recommended.
+
+### What happens next
+
+Once the panel is reachable, mon-server polls it once a minute for inbound state and probe configs, builds each mon-client's per-target config, and starts accepting heartbeats and tunnel probes. New mon-client boxes show up under **Requests** with a pairing code to approve against the box's own boot log; approved ones then appear under **mon-clients** with their live state.
+
+### Version
+
+```sh
+mon-server version
+```
+
+Prints the build's version string (from `make build`'s `git describe`, or `dev` for an unstamped local build).
+
+## Running under systemd
+
+```ini
+[Unit]
+Description=mon-server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/mon-server run
+Restart=on-failure
+RestartSec=5
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+StateDirectory=mon-server
+User=mon-server
+
+[Install]
+WantedBy=multi-user.target
+```
+
+`AmbientCapabilities=CAP_NET_BIND_SERVICE` lets the process bind `:443` without running as root; `StateDirectory=mon-server` gives it `/var/lib/mon-server` (matching `dataDir`'s default) owned by the service user. Adjust `dataDir`/`MON_DATA_DIR` if you point `StateDirectory` elsewhere.
+
+## Development
+
+```sh
+make check     # fmt + vet + staticcheck + test, the full gate CI runs
+make test      # go test -race -count=1 ./...
+```
+
+An end-to-end harness (`make e2e`, driving a real panel stub end to end) is being added on this branch stack by another change; once it lands, see `e2e/` for how to run it.
+
+There is no `go` toolchain assumption beyond what `go.mod` names — `make build`/`make test` work with a plain local Go install.

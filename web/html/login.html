@@ -1,0 +1,59 @@
+{{define "layout"}}<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mon-server · log in</title>
+<link rel="stylesheet" href="/admin/assets/antd.min.css">
+<link rel="stylesheet" href="/admin/assets/app.css">
+</head>
+<body>
+<div id="app" v-cloak data-testid="login-page" data-page="login" data-pending="0" data-next="{{.Next}}">
+  <a-config-provider :theme="themeConfig(dark)">
+    <div class="login">
+      <div class="box">
+        <div class="hd">
+          <h2>mon-server</h2>
+          <span class="sp"></span>
+          <button class="ghost" data-testid="theme-toggle" @click="toggleTheme">[[ dark ? '☀' : '☾' ]]</button>
+        </div>
+        <div class="muted">{{.PublicIP}} · single administrator</div>
+
+        <a-form layout="vertical" @submit.prevent="submit">
+          <a-form-item label="Login">
+            <a-input v-model:value="username" data-testid="login-username" autocomplete="username" autofocus></a-input>
+          </a-form-item>
+          <a-form-item label="Password">
+            <a-input-password v-model:value="password" data-testid="login-password" autocomplete="current-password"></a-input-password>
+          </a-form-item>
+          <!-- html-type="submit" rather than @click: the form's own @submit.prevent
+               then handles both a click and Enter in either field, without the
+               two paths firing submit() twice. -->
+          <a-button type="primary" block html-type="submit" :loading="busy" data-testid="login-submit">Log in</a-button>
+        </a-form>
+
+        <a-alert v-if="error" type="error" show-icon :message="error" data-testid="login-error"></a-alert>
+
+        <div class="muted tiny">
+          [[ attemptsLine ]]<br>
+          The account is set on the box: <span class="mono">mon-server admin set &lt;user&gt;</span>
+        </div>
+      </div>
+    </div>
+  </a-config-provider>
+</div>
+
+<script src="/admin/assets/vue.global.prod.js"></script>
+<script src="/admin/assets/dayjs.min.js"></script>
+<script src="/admin/assets/dayjs-customParseFormat.min.js"></script>
+<script src="/admin/assets/dayjs-weekday.min.js"></script>
+<script src="/admin/assets/dayjs-localeData.min.js"></script>
+<script src="/admin/assets/dayjs-weekOfYear.min.js"></script>
+<script src="/admin/assets/dayjs-weekYear.min.js"></script>
+<script src="/admin/assets/dayjs-advancedFormat.min.js"></script>
+<script src="/admin/assets/dayjs-quarterOfYear.min.js"></script>
+<script src="/admin/assets/antd.min.js"></script>
+<script src="/admin/assets/app.js"></script>
+<script src="/admin/assets/page-login.js"></script>
+</body>
+</html>{{end}}

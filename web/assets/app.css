@@ -1,0 +1,143 @@
+/* mon-server admin UI — the shell Ant Design does not draw for us (spec §9:
+ * "оболочка панели 3AX-UI: тёмный сайдбар, карточки, таблицы"). Component
+ * styling comes from Ant Design Vue's own CSS-in-JS and its ConfigProvider
+ * theme (colorPrimary #008771, dark algorithm); everything here is layout
+ * and the few panel tokens the shell itself needs. */
+
+:root {
+  --pn-bg: #f0f2f5;
+  --pn-card: #ffffff;
+  --pn-card2: #fafafa;
+  --pn-text: rgba(0, 0, 0, .78);
+  --pn-muted: rgba(0, 0, 0, .45);
+  --pn-line: #f0f0f0;
+  --pn-stroke: #d9d9d9;
+  --pn-primary: #008771;
+  --pn-primary-soft: #e6f7f3;
+  --pn-menu: #151f31;
+  --pn-menu-text: rgba(255, 255, 255, .65);
+  --st-up: #008771;
+  --st-up-soft: #e6f7f3;
+  --st-down: #cf3c3c;
+  --st-down-soft: #fdecec;
+  --st-warn: #b58a00;
+  --st-warn-soft: #fff8dc;
+  --st-off: #8c8c8c;
+  --st-off-soft: #f2f2f2;
+  --code-bg: #0f1a2b;
+  --code-fg: #e9f5f1;
+}
+
+:root[data-theme="dark"] {
+  --pn-bg: #0a1222;
+  --pn-card: #151f31;
+  --pn-card2: #0a1222;
+  --pn-text: rgba(255, 255, 255, .78);
+  --pn-muted: rgba(255, 255, 255, .45);
+  --pn-line: #2c3950;
+  --pn-stroke: #2c3950;
+  --pn-primary: #3ad3ba;
+  --pn-primary-soft: #0f2a2a;
+  --st-up: #3ad3ba;
+  --st-up-soft: #10302b;
+  --st-down: #e04141;
+  --st-down-soft: #3a1717;
+  --st-warn: #e0b93a;
+  --st-warn-soft: #3a3212;
+  --st-off: #8a94a6;
+  --st-off-soft: #1b2436;
+  --code-bg: #05090f;
+  --code-fg: #cdebe3;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--pn-bg);
+  color: var(--pn-text);
+  font: 14px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+  font-variant-numeric: tabular-nums;
+}
+
+[v-cloak] { display: none; }
+
+h1, h2, h3, h4 { margin: 0; font-weight: 600; }
+
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.muted { color: var(--pn-muted); }
+.small { font-size: 12px; }
+.tiny { font-size: 11px; }
+.sp { flex: 1; }
+
+/* ---- shell ---- */
+.shell { display: grid; grid-template-columns: 220px minmax(0, 1fr); min-height: 100vh; }
+.sider { background: var(--pn-menu); color: var(--pn-menu-text); padding: 12px 0; display: grid; align-content: start; gap: 2px; }
+.sider .brand { padding: 6px 24px 14px; color: #fff; font-weight: 600; display: grid; }
+.sider .brand small { color: var(--pn-menu-text); font-weight: 400; font-size: 11px; }
+.sider .mi {
+  display: flex; align-items: center; gap: 10px; padding: 0 24px; height: 40px;
+  font-size: 14px; color: inherit; text-decoration: none; cursor: pointer;
+}
+.sider .mi.plain { background: none; border: 0; font: inherit; color: inherit; text-align: left; width: 100%; }
+.sider .mi:hover { background: rgba(255, 255, 255, .06); }
+.sider .mi .ic { width: 14px; text-align: center; opacity: .8; font-size: 13px; }
+.sider .mi.active { background: var(--pn-primary); color: #fff; }
+.sider .cnt { margin-left: auto; background: var(--st-down); color: #fff; border-radius: 10px; font-size: 11px; padding: 0 6px; line-height: 18px; }
+
+.content { padding: 20px 16px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 14px; align-content: start; min-width: 0; }
+@media (max-width: 720px) { .shell { grid-template-columns: 1fr; } }
+
+/* ---- cards, tables, bits ---- */
+.card { background: var(--pn-card); border-radius: 12px; padding: 14px 18px; border: 1px solid var(--pn-line); min-width: 0; }
+.card.tight { padding: 10px 14px; }
+.card.table-card { padding: 0 6px; overflow-x: auto; }
+.hd { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.hd.right { justify-content: flex-end; margin-top: 12px; }
+.flex { display: flex; gap: 8px; align-items: center; }
+
+.t { width: 100%; border-collapse: collapse; font-size: 13px; }
+.t th, .t td { padding: 8px 10px; border-bottom: 1px solid var(--pn-line); text-align: left; vertical-align: middle; white-space: nowrap; }
+.t th { color: var(--pn-muted); font-weight: 500; background: var(--pn-card2); }
+.t td.c, .t th.c { text-align: center; }
+.t tr.sel td { background: var(--pn-primary-soft); }
+.t tr.dis td { color: var(--pn-muted); }
+.t td.ops { display: flex; gap: 6px; flex-wrap: wrap; }
+
+.st { display: inline-flex; align-items: center; gap: 6px; border-radius: 4px; padding: 0 8px; line-height: 22px; font-size: 12px; font-weight: 600; }
+.st.ONLINE { color: var(--st-up); background: var(--st-up-soft); }
+.st.OFFLINE { color: var(--st-down); background: var(--st-down-soft); }
+.st.NEVER { color: var(--pn-muted); background: var(--st-off-soft); }
+.st.DISABLED { color: var(--st-off); background: var(--st-off-soft); }
+
+.code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .12em; font-weight: 700; font-size: 18px; }
+.code.big { font-size: 26px; letter-spacing: .18em; background: var(--code-bg); color: var(--code-fg); padding: 6px 14px; border-radius: 6px; }
+.exp { color: var(--pn-muted); font-size: 12px; }
+.hint { color: var(--st-warn); font-size: 11px; }
+.pre { background: var(--pn-card2); border: 1px solid var(--pn-line); border-radius: 6px; padding: 8px 10px; font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; margin: 0; }
+
+.alert { border-radius: 6px; padding: 4px 12px; font-size: 13px; border: 1px solid transparent; }
+.alert.ok { color: var(--st-up); background: var(--st-up-soft); border-color: var(--st-up); }
+.alert.err { color: var(--st-down); background: var(--st-down-soft); border-color: var(--st-down); }
+
+.fi { display: grid; gap: 4px; margin: 10px 0; }
+.fi label { font-size: 12px; color: var(--pn-muted); }
+.row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+@media (max-width: 520px) { .row2 { grid-template-columns: 1fr; } }
+.seg { margin: 12px 0; }
+
+.in.ro { border: 1px solid var(--pn-stroke); background: var(--pn-card2); color: var(--pn-muted); border-radius: 6px; padding: 4px 10px; overflow-wrap: anywhere; }
+
+.sli { display: grid; grid-template-columns: minmax(0, 1fr) minmax(220px, 360px); gap: 16px; align-items: center; padding: 12px 0; border-bottom: 1px solid var(--pn-line); }
+.sli:last-child { border-bottom: 0; }
+.sli .tt { font-weight: 500; }
+.sli .d { color: var(--pn-muted); font-size: 12px; }
+@media (max-width: 640px) { .sli { grid-template-columns: 1fr; } }
+.num { max-width: 110px; }
+.num.wide { max-width: 160px; }
+
+/* ---- login ---- */
+.login { min-height: 100vh; display: grid; place-items: center; padding: 24px 16px; }
+.login .box { background: var(--pn-card); border: 1px solid var(--pn-line); border-radius: 16px; padding: 26px 28px; width: min(380px, 100%); display: grid; gap: 12px; }
+.login h2 { font-size: 22px; }
+.login .ghost { background: none; border: 0; color: var(--pn-muted); font-size: 16px; cursor: pointer; }

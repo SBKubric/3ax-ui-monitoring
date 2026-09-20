@@ -1,0 +1,55 @@
+{{define "layout"}}<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mon-server · {{.Page}}</title>
+<!-- Ant Design Vue 4 is CSS-in-JS: antd.min.css is its reset.css, the only
+     stylesheet it ships. Everything else it renders styles itself at runtime. -->
+<link rel="stylesheet" href="/admin/assets/antd.min.css">
+<link rel="stylesheet" href="/admin/assets/app.css">
+</head>
+<body>
+<div id="app" v-cloak data-testid="{{.Page}}-page" data-page="{{.Page}}" data-pending="{{.Pending}}">
+  <a-config-provider :theme="themeConfig(dark)">
+    <div class="shell">
+      <aside class="sider" data-testid="sidebar">
+        <div class="brand">mon-server <small>{{.PublicIP}}{{.Listen}} · v{{.Version}}</small></div>
+        <a class="mi" data-testid="nav-requests" :class="navClass('requests')" href="/admin/requests">
+          <span class="ic">📥</span>Requests
+          <span class="cnt" data-testid="nav-pending-badge" v-if="pending > 0">[[ pending ]]</span>
+        </a>
+        <a class="mi" data-testid="nav-clients" :class="navClass('clients')" href="/admin/clients">
+          <span class="ic">🖥</span>mon-clients
+        </a>
+        <a class="mi" data-testid="nav-settings" :class="navClass('settings')" href="/admin/settings">
+          <span class="ic">⚙</span>Settings
+        </a>
+        <button class="mi plain" data-testid="theme-toggle" @click="toggleTheme">
+          <span class="ic">[[ dark ? '☀' : '☾' ]]</span>[[ dark ? 'Light theme' : 'Dark theme' ]]
+        </button>
+        <button class="mi plain" data-testid="logout-button" @click="logout">
+          <span class="ic">⏻</span>Log out
+        </button>
+      </aside>
+      <main class="content">
+        {{template "content" .}}
+      </main>
+    </div>
+  </a-config-provider>
+</div>
+
+<script src="/admin/assets/vue.global.prod.js"></script>
+<script src="/admin/assets/dayjs.min.js"></script>
+<script src="/admin/assets/dayjs-customParseFormat.min.js"></script>
+<script src="/admin/assets/dayjs-weekday.min.js"></script>
+<script src="/admin/assets/dayjs-localeData.min.js"></script>
+<script src="/admin/assets/dayjs-weekOfYear.min.js"></script>
+<script src="/admin/assets/dayjs-weekYear.min.js"></script>
+<script src="/admin/assets/dayjs-advancedFormat.min.js"></script>
+<script src="/admin/assets/dayjs-quarterOfYear.min.js"></script>
+<script src="/admin/assets/antd.min.js"></script>
+<script src="/admin/assets/app.js"></script>
+{{template "script" .}}
+</body>
+</html>{{end}}

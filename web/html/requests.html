@@ -1,0 +1,103 @@
+{{define "content"}}
+<section class="card tight hd">
+  <h3>Registration requests</h3>
+  <a-tag color="warning" data-testid="requests-pending-badge">[[ pending ]] pending</a-tag>
+  <span class="sp"></span>
+  <span class="muted small" data-testid="requests-limits">
+    rate limit: [[ limits.perIpPerMin ]]/min per IP · ≤ [[ limits.pendingPerIp ]] pending per IP · ≤ [[ limits.pendingGlobal ]] global
+  </span>
+</section>
+
+<section class="card table-card">
+  <table class="t" data-testid="requests-table">
+    <thead>
+      <tr><th>IP</th><th>Hostname</th><th>Pairing code</th><th>Expires</th><th>Operate</th></tr>
+    </thead>
+    <tbody>
+      <tr v-for="r in requests" :key="r.requestId" data-testid="request-row" :data-request-id="r.requestId" :class="rowClass(r)">
+        <td class="mono" data-testid="request-ip">[[ r.remoteIp ]]</td>
+        <td>
+          <span data-testid="request-hostname">[[ r.hostname || '—' ]]</span>
+          <div class="muted tiny">v[[ r.version || '?' ]] · attempt [[ r.attempt ]]</div>
+          <div class="hint" data-testid="request-suggest" v-if="r.suggestReplacement">
+            same [[ r.suggestReplacement.reason === 'ip' ? 'IP' : 'hostname' ]] as [[ r.suggestReplacement.monClientId ]]: replacement?
+          </div>
+        </td>
+        <td><span class="code" data-testid="request-code">[[ spaced(r.pairingCode) ]]</span></td>
+        <td class="exp" data-testid="request-expires">
+          [[ mmss(r.expiresAt - now) ]] left
+          <div class="muted tiny">received [[ ago(r.createdAt, now) ]]</div>
+        </td>
+        <td class="ops">
+          <a-button type="primary" size="small" data-testid="request-approve" @click="openApprove(r, 'new')">Approve</a-button>
+          <a-button size="small" data-testid="request-approve-replacement" @click="openApprove(r, 'replace')">Approve as replacement ▾</a-button>
+          <a-button size="small" danger data-testid="request-reject" @click="reject(r)">Reject</a-button>
+        </td>
+      </tr>
+      <tr v-if="!requests.length"><td colspan="5" class="muted" data-testid="requests-empty">No pending registration requests.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section class="card tight muted small">
+  Approved requests hand the token to the box once, then disappear here and appear in
+  <b>mon-clients</b> as <i>never seen</i> until the first heartbeat.
+</section>
+
+<a-modal v-model:open="modal.open" :footer="null" :title="strings.approveTitle" :width="600" @cancel="closeApprove">
+  <div data-testid="approve-modal" v-if="modal.request">
+    <div class="hd">
+      <span class="mono">[[ modal.request.remoteIp ]]</span> · [[ modal.request.hostname ]] · v[[ modal.request.version || '?' ]]
+      <span class="sp"></span>
+      <span class="code big" data-testid="approve-code">[[ spaced(modal.request.pairingCode) ]]</span>
+    </div>
+    <a-alert type="warning" show-icon data-testid="approve-warning"
+      :message="strings.compareCode + ' It stays valid for ' + mmss(modal.request.expiresAt - now) + '.'"></a-alert>
+
+    <div class="seg">
+      <a-radio-group v-model:value="modal.mode" button-style="solid">
+        <a-radio-button value="new" data-testid="approve-mode-new">New mon-client</a-radio-button>
+        <a-radio-button value="replace" data-testid="approve-mode-replace">Replace an existing one</a-radio-button>
+      </a-radio-group>
+    </div>
+
+    <div v-if="modal.mode === 'new'">
+      <div class="row2">
+        <div class="fi">
+          <label>Name</label>
+          <a-input v-model:value="modal.name" data-testid="approve-name" placeholder="Amsterdam #2"></a-input>
+          <div class="muted tiny">id: <span class="mono" data-testid="approve-id-hint">[[ slug(modal.name) || '—' ]]</span> (slug of the name, permanent)</div>
+        </div>
+        <div class="fi">
+          <label>Region</label>
+          <a-input v-model:value="modal.region" data-testid="approve-region" placeholder="NL"></a-input>
+        </div>
+      </div>
+      <div class="fi">
+        <label>Paths this mon-client probes</label>
+        <div>
+          <a-checkbox v-model:checked="modal.proxy" data-testid="approve-path-proxy">proxy</a-checkbox>
+          <a-checkbox v-model:checked="modal.direct" data-testid="approve-path-direct">direct</a-checkbox>
+        </div>
+        <div class="muted tiny">[[ strings.pathsHint ]]</div>
+      </div>
+    </div>
+
+    <div v-else>
+      <div class="fi">
+        <label>Existing mon-client this box replaces</label>
+        <a-select v-model:value="modal.existingId" data-testid="approve-existing" style="width:100%"
+                  :options="clientOptions" placeholder="Pick a mon-client"></a-select>
+        <div class="muted tiny">[[ strings.replaceHint ]]</div>
+      </div>
+    </div>
+
+    <div class="hd right">
+      <a-button data-testid="approve-cancel" @click="closeApprove">Cancel</a-button>
+      <a-button type="primary" :loading="modal.busy" data-testid="approve-submit" @click="approve">Approve and issue token</a-button>
+    </div>
+  </div>
+</a-modal>
+{{end}}
+
+{{define "script"}}<script src="/admin/assets/page-requests.js"></script>{{end}}
