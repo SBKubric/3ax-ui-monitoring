@@ -3,6 +3,7 @@ package tg
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestMsgConfigError checks spec §8's exact wording and the first-line/256
@@ -74,5 +75,52 @@ func TestMsgMonClientTransition(t *testing.T) {
 	want := "[via mon-server] mon-client ams-1 (NL) ONLINE → OFFLINE"
 	if got != want {
 		t.Fatalf("MsgMonClientTransition = %q, want %q", got, want)
+	}
+}
+
+// TestMsgTargetRecovered checks spec §7.2's "UP" row: the recovery message
+// carries the downtime, rounded to whole seconds, and is only ever used for
+// a transition out of DOWN — which is why the states are baked into the
+// text rather than passed in.
+func TestMsgTargetRecovered(t *testing.T) {
+	cases := []struct {
+		name     string
+		downtime time.Duration
+		want     string
+	}{
+		{
+			name:     "minutes and seconds",
+			downtime: 12*time.Minute + 30*time.Second,
+			want:     "[via mon-server] target ams-1 (NL) xray:12/proxy DOWN → UP after 12m30s",
+		},
+		{
+			name:     "rounded to whole seconds",
+			downtime: 45*time.Second + 600*time.Millisecond,
+			want:     "[via mon-server] target ams-1 (NL) xray:12/proxy DOWN → UP after 46s",
+		},
+		{
+			name:     "hours",
+			downtime: 3*time.Hour + 4*time.Minute + 5*time.Second,
+			want:     "[via mon-server] target ams-1 (NL) xray:12/proxy DOWN → UP after 3h4m5s",
+		},
+		{
+			name:     "zero",
+			downtime: 0,
+			want:     "[via mon-server] target ams-1 (NL) xray:12/proxy DOWN → UP after 0s",
+		},
+		{
+			name:     "negative is shown as zero",
+			downtime: -time.Minute,
+			want:     "[via mon-server] target ams-1 (NL) xray:12/proxy DOWN → UP after 0s",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := MsgTargetRecovered("ams-1", "NL", "xray", 12, "proxy", tc.downtime)
+			if got != tc.want {
+				t.Fatalf("MsgTargetRecovered = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }

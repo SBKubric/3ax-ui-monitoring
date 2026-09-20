@@ -1,6 +1,10 @@
 package store
 
-import "encoding/json"
+import (
+	"encoding/json"
+
+	"gorm.io/gorm"
+)
 
 // EventPayload is the contract's event body (docs/spec/mon-protocol.md and
 // the panel contract §4.6), the exact JSON EnqueueEvent stores in
@@ -36,6 +40,19 @@ type EventPayload struct {
 // transitions (spec §4.1) — there is no direct-send shortcut, so a crash
 // between "decided" and "sent" never loses an event.
 func (s *Store) EnqueueEvent(ev EventPayload) error {
+	return EnqueueEventTx(s.DB, ev)
+}
+
+// EnqueueEventTx is EnqueueEvent against a caller-supplied handle, which is
+// what lets a caller file an event in the same transaction as the row the
+// event describes. internal/state needs this: a heartbeat's whole mutation
+// — the mon-client's last_ack_seq, the target rows it moves and the events
+// those moves owe the panel — has to commit or roll back as one, or a crash
+// in the middle leaves an acknowledged cycle whose transition was never
+// recorded and can never be resent (the mon-client drops everything at or
+// below the ack). Pass a *gorm.DB from DB.Transaction; passing Store.DB
+// itself is the same as calling EnqueueEvent.
+func EnqueueEventTx(tx *gorm.DB, ev EventPayload) error {
 	payload, err := json.Marshal(ev)
 	if err != nil {
 		return err
@@ -46,5 +63,5 @@ func (s *Store) EnqueueEvent(ev EventPayload) error {
 		Payload:  string(payload),
 		Notified: ev.Notified,
 	}
-	return s.DB.Create(&row).Error
+	return tx.Create(&row).Error
 }

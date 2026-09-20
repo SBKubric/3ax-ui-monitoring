@@ -1,0 +1,902 @@
+package state
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"gorm.io/gorm"
+
+	"github.com/SBKubric/3ax-ui-monitoring/internal/clock"
+	"github.com/SBKubric/3ax-ui-monitoring/internal/panel"
+	"github.com/SBKubric/3ax-ui-monitoring/internal/registry"
+	"github.com/SBKubric/3ax-ui-monitoring/internal/store"
+	"github.com/SBKubric/3ax-ui-monitoring/internal/tg"
+)
+
+// stubConfigs answers what registry.ConfigBuilder would, from a literal.
+type stubConfigs struct {
+	keys     []registry.TargetKey
+	revision string
+}
+
+func (s *stubConfigs) TargetKeys(context.Context, string) ([]registry.TargetKey, error) {
+	return s.keys, nil
+}
+
+func (s *stubConfigs) CurrentRevision(context.Context, string) (string, error) {
+	return s.revision, nil
+}
+
+// recordingSink is step 7's StatsSink as far as step 6 can check it: it
+// keeps what it was handed so the tests can assert the filtering contract,
+// and can be told to fail so the heartbeat's transaction can be tested.
+type recordingSink struct {
+	cycles []Cycle
+	err    error
+	// tx records the handle the engine passed in, to pin the contract that
+	// the sink joins the heartbeat's transaction rather than opening its own.
+	tx *gorm.DB
+}
+
+func (r *recordingSink) Record(_ context.Context, tx *gorm.DB, _ string, cycles []Cycle) error {
+	r.tx = tx
+	if r.err != nil {
+		return r.err
+	}
+	r.cycles = append(r.cycles, cycles...)
+	return nil
+}
+
+// flakyNotifier wraps the recorder so a test can make Telegram fail without
+// touching internal/tg, which step 9 owns.
+type flakyNotifier struct {
+	rec *tg.Recorder
+	err error
+}
+
+func (n *flakyNotifier) Send(ctx context.Context, text string) error {
+	if n.err != nil {
+		return n.err
+	}
+	return n.rec.Send(ctx, text)
+}
+
+// fixture is one engine over a real temp-file store with a fake clock, the
+// combination docs/agents/testing.md asks for.
+type fixture struct {
+	t    *testing.T
+	e    *Engine
+	st   *store.Store
+	clk  *clock.Fake
+	tgr  *tg.Recorder
+	tgn  *flakyNotifier
+	cfg  *stubConfigs
+	sink *recordingSink
+	mc   *store.MonClient
+
+	panelDown bool
+}
+
+var (
+	keyProxy  = registry.TargetKey{InboundKind: store.InboundKindXray, InboundID: 12, Path: store.PathProxy}
+	keyDirect = registry.TargetKey{InboundKind: store.InboundKindXray, InboundID: 12, Path: store.PathDirect}
+)
+
+func newFixture(t *testing.T) *fixture {
+	t.Helper()
+	st, err := store.Open(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	f := &fixture{
+		t:    t,
+		st:   st,
+		clk:  clock.NewFake(baseTime),
+		tgr:  &tg.Recorder{},
+		cfg:  &stubConfigs{keys: []registry.TargetKey{keyProxy, keyDirect}, revision: "rev-current"},
+		sink: &recordingSink{},
+	}
+	f.mc = &store.MonClient{
+		Id: "ams-1", Name: "ams-1", Region: "NL", Enabled: true,
+		State: store.MonClientNever, ApprovedAt: clock.Ms(baseTime),
+	}
+	f.mc.SetPaths([]string{store.PathProxy, store.PathDirect})
+	if err := st.DB.Create(f.mc).Error; err != nil {
+		t.Fatalf("create mon-client: %v", err)
+	}
+	f.tgn = &flakyNotifier{rec: f.tgr}
+	f.e = New(Deps{
+		Store: st, Clock: f.clk, Notifier: f.tgn,
+		PanelDown: func() bool { return f.panelDown },
+		Configs:   f.cfg, Stats: f.sink,
+	})
+	return f
+}
+
+// result builds one wire result for keyProxy unless told otherwise.
+func result(key registry.TargetKey, ok bool, reason string) Result {
+	r := Result{InboundKind: key.InboundKind, InboundID: key.InboundID, Path: key.Path, Ok: ok}
+	if !ok && reason != "" {
+		r.Reason = &reason
+	}
+	return r
+}
+
+// beat sends one heartbeat with the given cycles and fails the test if the
+// engine errors.
+func (f *fixture) beat(cycles ...Cycle) *HeartbeatResponse {
+	f.t.Helper()
+	resp, err := f.e.Heartbeat(context.Background(), f.mc, &HeartbeatRequest{
+		MonClientID:    f.mc.Id,
+		ConfigRevision: "rev-applied",
+		Client:         ClientInfo{Version: "0.1.0", XrayVersion: "26.3.27"},
+		Cycles:         cycles,
+	})
+	if err != nil {
+		f.t.Fatalf("Heartbeat: %v", err)
+	}
+	return resp
+}
+
+// beatErr sends one heartbeat and hands back whatever the engine said,
+// for the tests that are about a beat failing.
+func (f *fixture) beatErr(cycles ...Cycle) error {
+	f.t.Helper()
+	_, err := f.e.Heartbeat(context.Background(), f.mc, &HeartbeatRequest{
+		MonClientID:    f.mc.Id,
+		ConfigRevision: "rev-applied",
+		Client:         ClientInfo{Version: "0.1.0", XrayVersion: "26.3.27"},
+		Cycles:         cycles,
+	})
+	return err
+}
+
+// cycle is a live cycle at the fake clock's current time.
+func (f *fixture) cycle(seq int64, results ...Result) Cycle {
+	return Cycle{Seq: seq, Ts: clock.Ms(f.clk.Now()), Results: results}
+}
+
+// targetState reads one target row back, failing if it is gone.
+func (f *fixture) targetState(key registry.TargetKey) store.Target {
+	f.t.Helper()
+	var t store.Target
+	if err := f.st.DB.First(&t, "mon_client_id = ? AND inbound_kind = ? AND inbound_id = ? AND path = ?",
+		f.mc.Id, key.InboundKind, key.InboundID, key.Path).Error; err != nil {
+		f.t.Fatalf("read target %+v: %v", key, err)
+	}
+	return t
+}
+
+// events decodes the outbox in insertion order.
+func (f *fixture) events() []store.EventPayload {
+	f.t.Helper()
+	var rows []store.EventOutbox
+	if err := f.st.DB.Order("ts, id").Find(&rows).Error; err != nil {
+		f.t.Fatalf("read outbox: %v", err)
+	}
+	out := make([]store.EventPayload, 0, len(rows))
+	for _, r := range rows {
+		var ev store.EventPayload
+		if err := json.Unmarshal([]byte(r.Payload), &ev); err != nil {
+			f.t.Fatalf("decode event: %v", err)
+		}
+		out = append(out, ev)
+	}
+	return out
+}
+
+// reload re-reads the mon-client row from the database.
+func (f *fixture) reload() store.MonClient {
+	f.t.Helper()
+	var mc store.MonClient
+	if err := f.st.DB.First(&mc, "id = ?", f.mc.Id).Error; err != nil {
+		f.t.Fatalf("reload mon-client: %v", err)
+	}
+	return mc
+}
+
+// fail3 drives the target to DOWN through three live heartbeats.
+func (f *fixture) fail3(seq int64, key registry.TargetKey, reason string) int64 {
+	f.t.Helper()
+	for i := 0; i < 3; i++ {
+		f.clk.Advance(time.Minute)
+		f.beat(f.cycle(seq, result(key, false, reason)))
+		seq++
+	}
+	return seq
+}
+
+// TestHeartbeat_FirstHeartbeatBringsTheClientOnline covers spec §7.1 step 2
+// and §7.3's ONLINE rule, including that targets stay UNKNOWN until a
+// result actually arrives.
+func TestHeartbeat_FirstHeartbeatBringsTheClientOnline(t *testing.T) {
+	f := newFixture(t)
+	f.clk.Advance(time.Minute)
+
+	resp := f.beat()
+
+	mc := f.reload()
+	if mc.State != store.MonClientOnline {
+		t.Fatalf("state = %s, want ONLINE", mc.State)
+	}
+	if mc.LastHeartbeat == nil || *mc.LastHeartbeat != clock.Ms(f.clk.Now()) {
+		t.Fatalf("last_heartbeat = %v, want mon-server's receive time", mc.LastHeartbeat)
+	}
+	if mc.Version != "0.1.0" || mc.XrayVersion != "26.3.27" || mc.AppliedRevision != "rev-applied" {
+		t.Fatalf("mon-client row = %+v, want the heartbeat's versions and applied revision", mc)
+	}
+	if resp.ConfigRevision != "rev-current" || resp.ServerTs != clock.Ms(f.clk.Now()) {
+		t.Fatalf("response = %+v, want the current revision and mon-server's time", resp)
+	}
+
+	evs := f.events()
+	if len(evs) != 1 || evs[0].Kind != eventKindMonClient || evs[0].From != store.MonClientNever || evs[0].To != store.MonClientOnline {
+		t.Fatalf("events = %+v, want one mon_client NEVER → ONLINE", evs)
+	}
+	if evs[0].Notified {
+		t.Fatalf("event notified = true, want the panel to send it (the panel is up)")
+	}
+	var targets []store.Target
+	if err := f.st.DB.Find(&targets).Error; err != nil {
+		t.Fatalf("read targets: %v", err)
+	}
+	if len(targets) != 0 {
+		t.Fatalf("targets = %+v, want none until a result arrives", targets)
+	}
+}
+
+// TestHeartbeat_NoConfigRevisionEchoesTheClients covers the "nothing built
+// yet" answer: a mon-client must not be told to converge on "".
+func TestHeartbeat_NoConfigRevisionEchoesTheClients(t *testing.T) {
+	f := newFixture(t)
+	f.cfg.revision = ""
+	if got := f.beat().ConfigRevision; got != "rev-applied" {
+		t.Fatalf("configRevision = %q, want the client's own when nothing is built", got)
+	}
+}
+
+// TestHeartbeat_LiveCycleDrivesTheMachine is the end-to-end of §7.1 step 3
+// plus §7.2: results move the target and the transition lands in the
+// outbox with mon-server's receive time.
+func TestHeartbeat_LiveCycleDrivesTheMachine(t *testing.T) {
+	f := newFixture(t)
+	f.clk.Advance(time.Minute)
+	f.beat(f.cycle(1, result(keyProxy, true, "")))
+
+	if got := f.targetState(keyProxy); got.State != store.TargetUp {
+		t.Fatalf("state = %s, want UP after the first success", got.State)
+	}
+	evs := f.events()
+	last := evs[len(evs)-1]
+	if last.Kind != eventKindTarget || last.To != store.TargetUp || last.Reason != ReasonRecovered {
+		t.Fatalf("last event = %+v, want a target UNKNOWN → UP", last)
+	}
+	if last.InboundID == nil || *last.InboundID != 12 || last.Path != store.PathProxy || last.Ts != clock.Ms(f.clk.Now()) {
+		t.Fatalf("event = %+v, want it to name the target and carry received_at", last)
+	}
+
+	seq := f.fail3(2, keyProxy, "tls_timeout")
+	if got := f.targetState(keyProxy); got.State != store.TargetDown || got.Reason != "tls_timeout" {
+		t.Fatalf("state = %s/%s, want DOWN/tls_timeout", got.State, got.Reason)
+	}
+	_ = seq
+}
+
+// TestHeartbeat_UnverifiedFailureIsNotCounted is the protocol §5.3 rule
+// the issue calls out: an unverified cycle's failures say nothing about
+// the tunnel, so they must never move the state machine — but the cycle
+// still reaches statistics.
+func TestHeartbeat_UnverifiedFailureIsNotCounted(t *testing.T) {
+	f := newFixture(t)
+	f.clk.Advance(time.Minute)
+	f.beat(f.cycle(1, result(keyProxy, true, "")))
+
+	for i := int64(0); i < 5; i++ {
+		f.clk.Advance(time.Minute)
+		c := f.cycle(2+i, result(keyProxy, false, "tcp_timeout"))
+		c.Unverified = true
+		f.beat(c)
+	}
+
+	got := f.targetState(keyProxy)
+	if got.State != store.TargetUp || got.ConsecutiveFail != 0 {
+		t.Fatalf("state = %s (fails %d), want UP untouched by unverified failures", got.State, got.ConsecutiveFail)
+	}
+	if len(f.sink.cycles) != 6 {
+		t.Fatalf("stats got %d cycles, want all six (unverified included)", len(f.sink.cycles))
+	}
+}
+
+// TestHeartbeat_ResentCycleDoesNotReplayState covers "переходы задним
+// числом не переигрываются": a resend carrying failures arrives after the
+// live cycle already said the target is up, and must not take it down.
+func TestHeartbeat_ResentCycleDoesNotReplayState(t *testing.T) {
+	f := newFixture(t)
+	f.clk.Advance(time.Minute)
+	f.beat(f.cycle(10, result(keyProxy, true, "")))
+
+	f.clk.Advance(time.Minute)
+	// seq 11 is live; 12, 13 and 14 are older-looking resends carrying
+	// failures. Only the highest non-unverified cycle counts, and one
+	// success cannot be outvoted by resent failures.
+	resend := func(seq int64) Cycle {
+		c := f.cycle(seq, result(keyProxy, false, "tcp_refused"))
+		c.Unverified = true
+		return c
+	}
+	f.beat(f.cycle(11, result(keyProxy, true, "")), resend(12), resend(13), resend(14))
+
+	if got := f.targetState(keyProxy); got.State != store.TargetUp {
+		t.Fatalf("state = %s, want UP: resent/unverified cycles must not replay state", got.State)
+	}
+}
+
+// TestHeartbeat_AckSeqAndReplay covers the ackSeq contract: the response
+// acknowledges the highest seq seen, it is persisted, and a repeat of an
+// acknowledged cycle changes nothing.
+func TestHeartbeat_AckSeqAndReplay(t *testing.T) {
+	f := newFixture(t)
+	f.clk.Advance(time.Minute)
+
+	resp := f.beat(f.cycle(7, result(keyProxy, true, "")), f.cycle(8, result(keyProxy, true, "")))
+	if resp.AckSeq != 8 {
+		t.Fatalf("ackSeq = %d, want 8 (the highest seq seen)", resp.AckSeq)
+	}
+	if got := f.reload().LastAckSeq; got != 8 {
+		t.Fatalf("last_ack_seq = %d, want it persisted as 8", got)
+	}
+	before := len(f.events())
+	sinkBefore := len(f.sink.cycles)
+
+	// The same cycles again (the mon-client never saw the answer).
+	f.clk.Advance(time.Minute)
+	resp = f.beat(f.cycle(7, result(keyProxy, false, "tcp_refused")), f.cycle(8, result(keyProxy, false, "tcp_refused")))
+	if resp.AckSeq != 8 {
+		t.Fatalf("ackSeq on a replay = %d, want 8 again", resp.AckSeq)
+	}
+	if got := f.targetState(keyProxy); got.State != store.TargetUp || got.ConsecutiveFail != 0 {
+		t.Fatalf("state = %s (fails %d), want UP: acknowledged cycles must be ignored", got.State, got.ConsecutiveFail)
+	}
+	if len(f.events()) != before {
+		t.Fatalf("replayed cycles produced %d new events, want none", len(f.events())-before)
+	}
+	if len(f.sink.cycles) != sinkBefore {
+		t.Fatalf("replayed cycles reached statistics, want them dropped")
+	}
+}
+
+// TestHeartbeat_ClampsSkewedTimestamps covers spec §7.1 step 1: a cycle
+// whose own ts is more than five minutes from mon-server's receive time is
+// filed under the receive time, and one inside the window is kept as sent.
+func TestHeartbeat_ClampsSkewedTimestamps(t *testing.T) {
+	f := newFixture(t)
+	f.clk.Advance(time.Hour)
+	nowMs := clock.Ms(f.clk.Now())
+
+	skewed := f.cycle(1, result(keyProxy, true, ""))
+	skewed.Ts = nowMs + int64(6*time.Minute/time.Millisecond)
+	behind := f.cycle(2, result(keyProxy, true, ""))
+	behind.Ts = nowMs - int64(2*time.Minute/time.Millisecond)
+	f.beat(skewed, behind)
+
+	if len(f.sink.cycles) != 2 {
+		t.Fatalf("stats got %d cycles, want 2", len(f.sink.cycles))
+	}
+	if f.sink.cycles[0].Ts != nowMs {
+		t.Fatalf("skewed ts = %d, want it clamped to %d", f.sink.cycles[0].Ts, nowMs)
+	}
+	if f.sink.cycles[1].Ts != behind.Ts {
+		t.Fatalf("in-window ts = %d, want it kept as %d", f.sink.cycles[1].Ts, behind.Ts)
+	}
+}
+
+// TestHeartbeat_DropsResultsForUnknownTargets covers §7.1 step 3's last
+// sentence: a result for a target that is not in this mon-client's config
+// creates no row, no state and no statistics.
+func TestHeartbeat_DropsResultsForUnknownTargets(t *testing.T) {
+	f := newFixture(t)
+	f.clk.Advance(time.Minute)
+	stranger := registry.TargetKey{InboundKind: store.InboundKindAwg, InboundID: 0, Path: store.PathProxy}
+
+	f.beat(f.cycle(1, result(keyProxy, true, ""), result(stranger, false, "awg_no_handshake")))
+
+	var targets []store.Target
+	if err := f.st.DB.Find(&targets).Error; err != nil {
+		t.Fatalf("read targets: %v", err)
+	}
+	if len(targets) != 1 || targets[0].Path != store.PathProxy || targets[0].InboundKind != store.InboundKindXray {
+		t.Fatalf("targets = %+v, want only the configured one", targets)
+	}
+	if got := f.sink.cycles[0].Results; len(got) != 1 {
+		t.Fatalf("stats results = %+v, want the stranger dropped before the sink", got)
+	}
+}
+
+// TestHeartbeat_ConfigErrorNotifiesAndClears covers spec §7.1 step 2 and
+// §8: a configError is one of the few things mon-server tells Telegram
+// itself, whatever the panel is doing, and clearing it leaves no trace on
+// the row.
+func TestHeartbeat_ConfigErrorNotifiesAndClears(t *testing.T) {
+	f := newFixture(t)
+	f.clk.Advance(time.Minute)
+	boom := "cannot parse link\nstack trace"
+	if _, err := f.e.Heartbeat(context.Background(), f.mc, &HeartbeatRequest{
+		MonClientID: f.mc.Id, Client: ClientInfo{ConfigError: &boom},
+	}); err != nil {
+		t.Fatalf("Heartbeat: %v", err)
+	}
+
+	mc := f.reload()
+	if mc.ConfigError != boom || mc.ConfigErrorAt == nil {
+		t.Fatalf("row = %+v, want the configError recorded", mc)
+	}
+	if len(f.tgr.Sent) != 1 || f.tgr.Sent[0] != tg.MsgConfigError("ams-1", boom) {
+		t.Fatalf("telegram = %v, want exactly the configError message", f.tgr.Sent)
+	}
+
+	// The same error again must not notify twice.
+	f.clk.Advance(time.Minute)
+	if _, err := f.e.Heartbeat(context.Background(), f.mc, &HeartbeatRequest{
+		MonClientID: f.mc.Id, Client: ClientInfo{ConfigError: &boom},
+	}); err != nil {
+		t.Fatalf("Heartbeat: %v", err)
+	}
+	if len(f.tgr.Sent) != 1 {
+		t.Fatalf("telegram = %v, want no repeat for an unchanged configError", f.tgr.Sent)
+	}
+
+	// Gone.
+	f.clk.Advance(time.Minute)
+	f.beat()
+	mc = f.reload()
+	if mc.ConfigError != "" || mc.ConfigErrorAt != nil {
+		t.Fatalf("row = %+v, want the configError cleared", mc)
+	}
+}
+
+// TestHeartbeat_PanelDownSendsTransitionsItself covers spec §4.1: while
+// the panel is unreachable mon-server sends the transition to Telegram and
+// marks the event notified so the panel does not repeat it later.
+func TestHeartbeat_PanelDownSendsTransitionsItself(t *testing.T) {
+	f := newFixture(t)
+	f.panelDown = true
+	f.clk.Advance(time.Minute)
+
+	f.beat(f.cycle(1, result(keyProxy, true, "")))
+
+	evs := f.events()
+	last := evs[len(evs)-1]
+	if !last.Notified {
+		t.Fatalf("event = %+v, want notified=true while PANEL_DOWN", last)
+	}
+	want := tg.MsgTargetTransition("ams-1", "NL", store.InboundKindXray, 12, store.PathProxy,
+		store.TargetUnknown, store.TargetUp, ReasonRecovered)
+	if len(f.tgr.Sent) != 2 || f.tgr.Sent[1] != want {
+		// [0] is the mon_client NEVER → ONLINE message.
+		t.Fatalf("telegram = %v, want the target transition as %q", f.tgr.Sent, want)
+	}
+}
+
+// TestHeartbeat_PanelDownStaysSilentForUnknownTransitions is the other
+// half of spec §7.2: UNKNOWN and PAUSED transitions never reach Telegram,
+// even from mon-server itself.
+func TestHeartbeat_PanelDownStaysSilentForUnknownTransitions(t *testing.T) {
+	f := newFixture(t)
+	f.panelDown = true
+	f.clk.Advance(time.Minute)
+	f.beat(f.cycle(1, result(keyProxy, true, "")))
+	sentBefore := len(f.tgr.Sent)
+
+	if err := f.e.MonClientDisabled(context.Background(), f.mc.Id); err != nil {
+		t.Fatalf("MonClientDisabled: %v", err)
+	}
+
+	if got := f.targetState(keyProxy); got.State != store.TargetUnknown || got.Reason != ReasonMonClientDisabled {
+		t.Fatalf("target = %s/%s, want UNKNOWN/mon_client_disabled", got.State, got.Reason)
+	}
+	if len(f.tgr.Sent) != sentBefore {
+		t.Fatalf("telegram = %v, want nothing for a transition into UNKNOWN", f.tgr.Sent[sentBefore:])
+	}
+	evs := f.events()
+	last := evs[len(evs)-1]
+	if last.To != store.TargetUnknown || last.Reason != ReasonMonClientDisabled || last.Notified {
+		t.Fatalf("event = %+v, want an un-notified UNKNOWN event", last)
+	}
+}
+
+// TestMarkOffline covers spec §7.3 end to end: silence past
+// clientOfflineAfter intervals turns the mon-client OFFLINE with reason
+// heartbeat_missed and drops its targets to UNKNOWN without alerting on
+// each one.
+func TestMarkOffline(t *testing.T) {
+	f := newFixture(t)
+	f.clk.Advance(time.Minute)
+	f.beat(f.cycle(1, result(keyProxy, true, "")))
+
+	set, err := f.st.LoadSettings()
+	if err != nil {
+		t.Fatalf("LoadSettings: %v", err)
+	}
+	silence := time.Duration(int64(set.ClientOfflineAfter)*set.IntervalMs+set.HeartbeatTimeoutMs) * time.Millisecond
+
+	// One millisecond short of the threshold: nothing happens yet.
+	f.clk.Advance(silence)
+	if err := f.e.MarkOffline(context.Background()); err != nil {
+		t.Fatalf("MarkOffline: %v", err)
+	}
+	if got := f.reload().State; got != store.MonClientOnline {
+		t.Fatalf("state = %s, want still ONLINE exactly at the threshold", got)
+	}
+
+	f.clk.Advance(time.Millisecond)
+	if err := f.e.MarkOffline(context.Background()); err != nil {
+		t.Fatalf("MarkOffline: %v", err)
+	}
+	mc := f.reload()
+	if mc.State != store.MonClientOffline {
+		t.Fatalf("state = %s, want OFFLINE", mc.State)
+	}
+	if got := f.targetState(keyProxy); got.State != store.TargetUnknown || got.Reason != ReasonMonClientOffline {
+		t.Fatalf("target = %s/%s, want UNKNOWN/mon_client_offline", got.State, got.Reason)
+	}
+
+	evs := f.events()
+	var monClientEv, targetEv *store.EventPayload
+	for i := range evs {
+		switch {
+		case evs[i].Kind == eventKindMonClient && evs[i].To == store.MonClientOffline:
+			monClientEv = &evs[i]
+		case evs[i].Kind == eventKindTarget && evs[i].Reason == ReasonMonClientOffline:
+			targetEv = &evs[i]
+		}
+	}
+	if monClientEv == nil || monClientEv.Reason != ReasonHeartbeatMissed {
+		t.Fatalf("events = %+v, want a mon_client OFFLINE with reason heartbeat_missed", evs)
+	}
+	if targetEv == nil || targetEv.From != store.TargetUp || targetEv.Notified {
+		t.Fatalf("events = %+v, want an un-notified target UP → UNKNOWN", evs)
+	}
+
+	// A second sweep must not repeat itself.
+	before := len(evs)
+	f.clk.Advance(time.Hour)
+	if err := f.e.MarkOffline(context.Background()); err != nil {
+		t.Fatalf("MarkOffline: %v", err)
+	}
+	if len(f.events()) != before {
+		t.Fatalf("a second sweep produced %d more events, want none", len(f.events())-before)
+	}
+
+	// And the next heartbeat brings it back.
+	f.clk.Advance(time.Minute)
+	f.beat()
+	if got := f.reload().State; got != store.MonClientOnline {
+		t.Fatalf("state = %s, want ONLINE again after a heartbeat", got)
+	}
+}
+
+// TestMarkOffline_NeverSeenClientIsLeftAlone pins spec §3's NEVER state: a
+// box that has not come up for the first time is not an outage.
+func TestMarkOffline_NeverSeenClientIsLeftAlone(t *testing.T) {
+	f := newFixture(t)
+	f.clk.Advance(24 * time.Hour)
+
+	if err := f.e.MarkOffline(context.Background()); err != nil {
+		t.Fatalf("MarkOffline: %v", err)
+	}
+	if got := f.reload().State; got != store.MonClientNever {
+		t.Fatalf("state = %s, want NEVER", got)
+	}
+	if evs := f.events(); len(evs) != 0 {
+		t.Fatalf("events = %+v, want none", evs)
+	}
+}
+
+// TestMarkOffline_PanelDownAnnouncesItself covers the mon_client half of
+// spec §4.1.
+func TestMarkOffline_PanelDownAnnouncesItself(t *testing.T) {
+	f := newFixture(t)
+	f.clk.Advance(time.Minute)
+	f.beat()
+	f.panelDown = true
+	f.clk.Advance(time.Hour)
+
+	if err := f.e.MarkOffline(context.Background()); err != nil {
+		t.Fatalf("MarkOffline: %v", err)
+	}
+	want := tg.MsgMonClientTransition("ams-1", "NL", store.MonClientOnline, store.MonClientOffline)
+	if len(f.tgr.Sent) != 1 || f.tgr.Sent[0] != want {
+		t.Fatalf("telegram = %v, want %q", f.tgr.Sent, want)
+	}
+	evs := f.events()
+	if !evs[len(evs)-1].Notified {
+		t.Fatalf("event = %+v, want notified=true", evs[len(evs)-1])
+	}
+}
+
+// saveInbound seeds panel_inbounds the way the poller's savePanelInbounds
+// would.
+func (f *fixture) saveInbound(kind string, id int, enable bool) {
+	f.t.Helper()
+	row := store.PanelInbound{InboundKind: kind, InboundId: id, Protocol: "vless", Enable: enable, SeenRevision: "r1"}
+	if err := f.st.DB.Create(&row).Error; err != nil {
+		f.t.Fatalf("create panel inbound: %v", err)
+	}
+}
+
+// TestSyncInbounds_DisabledPausesAndEnabledResumes covers spec §4 step 3's
+// first case: an inbound the panel disabled parks its targets in PAUSED,
+// results for them are ignored, and enabling it again releases them to
+// UNKNOWN.
+func TestSyncInbounds_DisabledPausesAndEnabledResumes(t *testing.T) {
+	f := newFixture(t)
+	f.clk.Advance(time.Minute)
+	f.beat(f.cycle(1, result(keyProxy, true, "")))
+	f.saveInbound(store.InboundKindXray, 12, true)
+
+	ctx := context.Background()
+	disabled := []panel.Inbound{{Kind: store.InboundKindXray, InboundId: 12, Enable: false}}
+	if err := f.e.SyncInbounds(ctx, disabled); err != nil {
+		t.Fatalf("SyncInbounds: %v", err)
+	}
+	got := f.targetState(keyProxy)
+	if got.State != store.TargetPaused || got.Reason != ReasonConfigDisabled {
+		t.Fatalf("target = %s/%s, want PAUSED/config_disabled", got.State, got.Reason)
+	}
+
+	// A result for a paused target must change nothing.
+	f.clk.Advance(time.Minute)
+	f.beat(f.cycle(2, result(keyProxy, false, "tcp_refused")))
+	if got := f.targetState(keyProxy); got.State != store.TargetPaused {
+		t.Fatalf("target = %s, want it still PAUSED", got.State)
+	}
+
+	// Pausing twice must not re-file the event.
+	before := len(f.events())
+	if err := f.e.SyncInbounds(ctx, disabled); err != nil {
+		t.Fatalf("SyncInbounds: %v", err)
+	}
+	if len(f.events()) != before {
+		t.Fatalf("a repeated sync produced %d more events, want none", len(f.events())-before)
+	}
+
+	if err := f.e.SyncInbounds(ctx, []panel.Inbound{{Kind: store.InboundKindXray, InboundId: 12, Enable: true}}); err != nil {
+		t.Fatalf("SyncInbounds: %v", err)
+	}
+	got = f.targetState(keyProxy)
+	if got.State != store.TargetUnknown || got.Reason != ReasonConfigEnabled {
+		t.Fatalf("target = %s/%s, want UNKNOWN/config_enabled", got.State, got.Reason)
+	}
+}
+
+// TestSyncInbounds_VanishedInboundRetiresOnTheNextHeartbeat covers the
+// other case of spec §4 step 3: an inbound that stopped being offered
+// pauses its targets and their rows are deleted once a heartbeat arrives
+// for a config that no longer names them.
+func TestSyncInbounds_VanishedInboundRetiresOnTheNextHeartbeat(t *testing.T) {
+	f := newFixture(t)
+	f.clk.Advance(time.Minute)
+	f.beat(f.cycle(1, result(keyProxy, true, ""), result(keyDirect, true, "")))
+	f.saveInbound(store.InboundKindXray, 12, true)
+	f.saveInbound(store.InboundKindAwg, 0, true)
+
+	ctx := context.Background()
+	if err := f.e.SyncInbounds(ctx, []panel.Inbound{{Kind: store.InboundKindAwg, InboundId: 0, Enable: true}}); err != nil {
+		t.Fatalf("SyncInbounds: %v", err)
+	}
+	if got := f.targetState(keyProxy); got.State != store.TargetPaused {
+		t.Fatalf("target = %s, want PAUSED after its inbound vanished", got.State)
+	}
+	var inbounds []store.PanelInbound
+	if err := f.st.DB.Find(&inbounds).Error; err != nil {
+		t.Fatalf("read panel_inbounds: %v", err)
+	}
+	if len(inbounds) != 1 || inbounds[0].InboundKind != store.InboundKindAwg {
+		t.Fatalf("panel_inbounds = %+v, want the vanished one forgotten", inbounds)
+	}
+
+	// The config no longer names those targets either; the next heartbeat
+	// confirms the retirement.
+	f.cfg.keys = nil
+	f.clk.Advance(time.Minute)
+	f.beat()
+
+	var targets []store.Target
+	if err := f.st.DB.Find(&targets).Error; err != nil {
+		t.Fatalf("read targets: %v", err)
+	}
+	if len(targets) != 0 {
+		t.Fatalf("targets = %+v, want them retired", targets)
+	}
+}
+
+// TestSyncInbounds_EmptyListIsIgnored pins the guard that keeps this in
+// step with the poller's own savePanelInbounds: a contract response with
+// no inbounds must not retire the whole install.
+func TestSyncInbounds_EmptyListIsIgnored(t *testing.T) {
+	f := newFixture(t)
+	f.clk.Advance(time.Minute)
+	f.beat(f.cycle(1, result(keyProxy, true, "")))
+	f.saveInbound(store.InboundKindXray, 12, true)
+
+	if err := f.e.SyncInbounds(context.Background(), nil); err != nil {
+		t.Fatalf("SyncInbounds: %v", err)
+	}
+	if got := f.targetState(keyProxy); got.State != store.TargetUp {
+		t.Fatalf("target = %s, want UP: an empty inbound list says nothing", got.State)
+	}
+}
+
+// TestHeartbeat_FailedWriteRollsBackTheWholeBeat is the transaction
+// guarantee: answering with ackSeq tells the mon-client it may drop those
+// cycles forever, so nothing about a heartbeat may be half-applied. The
+// stats sink is the last write in the beat; when it fails, the ack, the
+// target the live cycle moved and the events it filed must all be gone, or
+// the resend would be discarded as a duplicate and the transition lost with
+// nothing left to replay it from.
+func TestHeartbeat_FailedWriteRollsBackTheWholeBeat(t *testing.T) {
+	f := newFixture(t)
+	f.clk.Advance(time.Minute)
+	f.beat(f.cycle(1, result(keyProxy, true, "")))
+
+	ackBefore := f.reload().LastAckSeq
+	eventsBefore := len(f.events())
+	stateBefore := f.targetState(keyProxy)
+
+	f.sink.err = errors.New("disk full")
+	for i := int64(0); i < 3; i++ {
+		f.clk.Advance(time.Minute)
+		if err := f.beatErr(f.cycle(2+i, result(keyProxy, false, "tls_timeout"))); err == nil {
+			t.Fatal("Heartbeat succeeded with a failing stats sink, want the beat rolled back")
+		}
+	}
+
+	if got := f.reload().LastAckSeq; got != ackBefore {
+		t.Fatalf("last_ack_seq = %d, want it unchanged at %d: a failed beat must not acknowledge", got, ackBefore)
+	}
+	got := f.targetState(keyProxy)
+	if got.State != stateBefore.State || got.ConsecutiveFail != stateBefore.ConsecutiveFail {
+		t.Fatalf("target = %s (fails %d), want it untouched at %s (fails %d)",
+			got.State, got.ConsecutiveFail, stateBefore.State, stateBefore.ConsecutiveFail)
+	}
+	if n := len(f.events()); n != eventsBefore {
+		t.Fatalf("outbox grew by %d events, want none from a rolled-back beat", n-eventsBefore)
+	}
+
+	// And with the sink healthy again, the mon-client's resend of exactly
+	// those cycles is applied as if the failure had never happened.
+	f.sink.err = nil
+	for i := int64(0); i < 3; i++ {
+		f.clk.Advance(time.Minute)
+		f.beat(f.cycle(2+i, result(keyProxy, false, "tls_timeout")))
+	}
+	if got := f.targetState(keyProxy); got.State != store.TargetDown {
+		t.Fatalf("target = %s after the resend, want DOWN: nothing may have been lost", got.State)
+	}
+	if got := f.reload().LastAckSeq; got != 4 {
+		t.Fatalf("last_ack_seq = %d, want 4 once the resend committed", got)
+	}
+}
+
+// TestHeartbeat_StatsSinkJoinsTheTransaction pins the StatsSink seam step 7
+// implements: the sink is handed the beat's own transaction, not the
+// store's handle, so its buckets commit with the ack that lets the
+// mon-client forget the cycles they were built from.
+func TestHeartbeat_StatsSinkJoinsTheTransaction(t *testing.T) {
+	f := newFixture(t)
+	f.clk.Advance(time.Minute)
+	f.beat(f.cycle(1, result(keyProxy, true, "")))
+
+	if f.sink.tx == nil {
+		t.Fatal("stats sink got a nil handle, want the heartbeat's transaction")
+	}
+	if f.sink.tx == f.st.DB {
+		t.Fatal("stats sink got Store.DB, want the heartbeat's transaction")
+	}
+}
+
+// TestHeartbeat_PanelDownRecoveryCarriesTheDowntime covers spec §7.2's "UP"
+// row: a DOWN → UP transition announced by mon-server itself must say how
+// long the target was down, and only that transition uses the recovery
+// wording.
+func TestHeartbeat_PanelDownRecoveryCarriesTheDowntime(t *testing.T) {
+	f := newFixture(t)
+	f.panelDown = true
+	f.clk.Advance(time.Minute)
+	f.beat(f.cycle(1, result(keyProxy, true, "")))
+
+	// Three failures, one minute apart, take it DOWN at minute 4.
+	seq := f.fail3(2, keyProxy, "tls_timeout")
+	downAt := f.clk.Now()
+	if got := f.targetState(keyProxy); got.State != store.TargetDown {
+		t.Fatalf("target = %s, want DOWN", got.State)
+	}
+	wantDown := tg.MsgTargetTransition("ams-1", "NL", store.InboundKindXray, 12, store.PathProxy,
+		store.TargetUp, store.TargetDown, "tls_timeout")
+	if last := f.tgr.Sent[len(f.tgr.Sent)-1]; last != wantDown {
+		t.Fatalf("telegram = %q, want the DOWN message %q", last, wantDown)
+	}
+
+	// Two successes bring it back up; the second one is the transition.
+	for i := 0; i < 2; i++ {
+		f.clk.Advance(90 * time.Second)
+		f.beat(f.cycle(seq, result(keyProxy, true, "")))
+		seq++
+	}
+	if got := f.targetState(keyProxy); got.State != store.TargetUp {
+		t.Fatalf("target = %s, want UP again", got.State)
+	}
+
+	want := tg.MsgTargetRecovered("ams-1", "NL", store.InboundKindXray, 12, store.PathProxy,
+		f.clk.Now().Sub(downAt))
+	last := f.tgr.Sent[len(f.tgr.Sent)-1]
+	if last != want {
+		t.Fatalf("telegram = %q, want the recovery message %q", last, want)
+	}
+	if !strings.Contains(last, "DOWN → UP after 3m0s") {
+		t.Fatalf("telegram = %q, want it to carry the three-minute downtime", last)
+	}
+
+	evs := f.events()
+	up := evs[len(evs)-1]
+	if up.From != store.TargetDown || up.To != store.TargetUp || !up.Notified {
+		t.Fatalf("event = %+v, want a notified DOWN → UP", up)
+	}
+}
+
+// TestHeartbeat_TelegramIsSentOnlyAfterTheCommit pins the ordering the
+// transaction forces: a beat that rolls back must not have announced
+// anything, however far into the state machine it got.
+func TestHeartbeat_TelegramIsSentOnlyAfterTheCommit(t *testing.T) {
+	f := newFixture(t)
+	f.panelDown = true
+	f.clk.Advance(time.Minute)
+	f.beat(f.cycle(1, result(keyProxy, true, "")))
+	sentBefore := len(f.tgr.Sent)
+
+	f.sink.err = errors.New("disk full")
+	for i := int64(0); i < 3; i++ {
+		f.clk.Advance(time.Minute)
+		if err := f.beatErr(f.cycle(2+i, result(keyProxy, false, "tls_timeout"))); err == nil {
+			t.Fatal("Heartbeat succeeded with a failing stats sink, want the beat rolled back")
+		}
+	}
+
+	if len(f.tgr.Sent) != sentBefore {
+		t.Fatalf("telegram = %v, want nothing from rolled-back beats", f.tgr.Sent[sentBefore:])
+	}
+}
+
+// TestHeartbeat_FailedTelegramLeavesTheEventForThePanel covers the other
+// half of deferring the send: the outbox row is written notified=true
+// before the message is attempted, so a send that fails has to put it back
+// — otherwise the panel would stay silent about a transition nobody
+// announced (contract §4.6).
+func TestHeartbeat_FailedTelegramLeavesTheEventForThePanel(t *testing.T) {
+	f := newFixture(t)
+	f.panelDown = true
+	f.tgn.err = errors.New("bot token revoked")
+	f.clk.Advance(time.Minute)
+
+	f.beat(f.cycle(1, result(keyProxy, true, "")))
+
+	for _, ev := range f.events() {
+		if ev.Notified {
+			t.Fatalf("event = %+v, want notified=false after the send failed", ev)
+		}
+	}
+	var rows []store.EventOutbox
+	if err := f.st.DB.Find(&rows).Error; err != nil {
+		t.Fatalf("read outbox: %v", err)
+	}
+	for _, r := range rows {
+		if r.Notified {
+			t.Fatalf("outbox row %s = notified, want the column cleared too", r.Id)
+		}
+	}
+}

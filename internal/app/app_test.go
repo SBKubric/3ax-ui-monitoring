@@ -5,14 +5,18 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
-	"github.com/SBKubric/3ax-ui-monitoring/internal/panel/paneltest"
+	"encoding/json"
 	"io"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/SBKubric/3ax-ui-monitoring/internal/panel/paneltest"
+	"github.com/SBKubric/3ax-ui-monitoring/internal/state"
 
 	"github.com/gin-gonic/gin"
 
@@ -350,11 +354,12 @@ func TestApp_ReadTimeoutClosesStalledBody(t *testing.T) {
 	}
 }
 
-// TestShutdown_JoinsThePanelPoller checks that the panel poll loop (spec §4)
-// is started by Start and actually joined by Shutdown: a goroutine still
+// TestShutdown_JoinsTheBackgroundJobs checks that the panel poll loop (spec
+// §4) and the mon-client liveness sweep (spec §7.3)
+// are started by Start and actually joined by Shutdown: a goroutine still
 // running after Shutdown returned would keep writing to a database the
 // process believes it has closed, and would show up as a leak under -race.
-func TestShutdown_JoinsThePanelPoller(t *testing.T) {
+func TestShutdown_JoinsTheBackgroundJobs(t *testing.T) {
 	a, _ := newTestApp(t)
 
 	if a.Poller() == nil {
@@ -371,6 +376,11 @@ func TestShutdown_JoinsThePanelPoller(t *testing.T) {
 	}
 	if !a.pollStopped.Load() {
 		t.Fatal("Shutdown returned while the panel poll loop was still running")
+	}
+	// The 20s mon-client liveness job (spec §7.3) is joined the same way,
+	// and for the same reason: it writes to the database on every tick.
+	if !a.offlineStopped.Load() {
+		t.Fatal("Shutdown returned while the offline sweep was still running")
 	}
 	if a.Poller().PanelDown() {
 		t.Fatal("an unconfigured mon-server must not start out in PANEL_DOWN")
@@ -570,5 +580,73 @@ func TestConfigs_WiredIntoServer(t *testing.T) {
 	}
 	if !bytes.Contains(body, []byte("config_not_ready")) {
 		t.Fatalf("body = %s, want the config_not_ready error code", body)
+	}
+}
+
+// TestState_WiredIntoServer checks step 6's wiring the same way: App builds
+// the state engine, exposes it through State(), and POST /v1/heartbeat is
+// mounted behind the client-token middleware on the App's own listener. A
+// real approved token goes over the real TLS listener, and the answer is
+// the protocol §5.3 body with the cycle acknowledged — which also proves
+// the engine reached the same database the registry approved into.
+func TestState_WiredIntoServer(t *testing.T) {
+	a, clientTLS := newTestApp(t)
+	if a.State() == nil {
+		t.Fatal("State() = nil, want a constructed *state.Engine")
+	}
+
+	ctx := context.Background()
+	reg := a.Registry()
+	out, err := reg.Register(ctx, registry.RegisterInput{PairingCode: "ABCDEF", Hostname: "h", RemoteIP: "198.51.100.8"})
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if _, err := reg.Approve(ctx, out.RequestID, registry.ApproveInput{Name: "ams-1"}); err != nil {
+		t.Fatalf("Approve: %v", err)
+	}
+	poll, err := reg.Poll(ctx, out.RequestID)
+	if err != nil {
+		t.Fatalf("Poll: %v", err)
+	}
+
+	addr, err := a.Start()
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	body := `{"monClientId":"ams-1","configRevision":"","client":{"version":"0.1.0"},` +
+		`"cycles":[{"seq":42,"ts":0,"unverified":false,"results":[]}]}`
+	req, err := http.NewRequest(http.MethodPost, "https://"+addr+"/v1/heartbeat", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+poll.Token)
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Transport: &http.Transport{TLSClientConfig: clientTLS}}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("POST /v1/heartbeat: %v", err)
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", resp.StatusCode, respBody)
+	}
+
+	var got state.HeartbeatResponse
+	if err := json.Unmarshal(respBody, &got); err != nil {
+		t.Fatalf("decode body: %v (%s)", err, respBody)
+	}
+	if got.AckSeq != 42 || got.ServerTs == 0 {
+		t.Fatalf("body = %+v, want the cycle acknowledged with a server timestamp", got)
+	}
+
+	mc, err := reg.Get(ctx, "ams-1")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if mc.State != store.MonClientOnline {
+		t.Fatalf("mon-client state = %s, want ONLINE after a heartbeat over the listener", mc.State)
 	}
 }

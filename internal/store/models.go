@@ -181,6 +181,14 @@ type MonClient struct {
 	RemoteIp         string `json:"remoteIp" gorm:"column:remote_ip"`
 	ApprovedAt       int64  `json:"approvedAt" gorm:"column:approved_at"`
 	MissedHeartbeats int    `json:"missedHeartbeats" gorm:"column:missed_heartbeats;not null;default:0"`
+
+	// LastAckSeq is the highest probe-cycle seq this mon-client's
+	// heartbeats have been acknowledged for (protocol §5.3: "ackSeq
+	// подтверждает всё до него включительно"). It lives on the row rather
+	// than in memory because it is what makes a resend idempotent: after a
+	// restart, cycles the mon-client is still buffering must not be applied
+	// to the state machine a second time (spec §7.1 step 3).
+	LastAckSeq int64 `json:"lastAckSeq" gorm:"column:last_ack_seq;not null;default:0"`
 }
 
 func (MonClient) TableName() string { return "mon_clients" }

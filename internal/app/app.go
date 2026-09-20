@@ -22,6 +22,7 @@ import (
 	"github.com/SBKubric/3ax-ui-monitoring/internal/config"
 	"github.com/SBKubric/3ax-ui-monitoring/internal/panel"
 	"github.com/SBKubric/3ax-ui-monitoring/internal/registry"
+	"github.com/SBKubric/3ax-ui-monitoring/internal/state"
 	"github.com/SBKubric/3ax-ui-monitoring/internal/store"
 	"github.com/SBKubric/3ax-ui-monitoring/internal/tg"
 	"github.com/SBKubric/3ax-ui-monitoring/internal/tlsx"
@@ -48,6 +49,13 @@ const readTimeout = 30 * time.Second
 // handler's 20s probe budget (spec §5: budgetMs default 20000) plus margin,
 // so that step doesn't also need to touch this timeout.
 const writeTimeout = 60 * time.Second
+
+// offlineSweep is how often the mon-client liveness job runs (spec §7.3:
+// "проверяет job раз в 20 с"). It is deliberately much shorter than the
+// silence it detects (clientOfflineAfter x intervalMs, three minutes by
+// default): the tick only bounds how late an OFFLINE verdict is, never how
+// early.
+const offlineSweep = 20 * time.Second
 
 // defaultHTTPSPort is the port probeURL assumes when cfg.Listen names none
 // — the port an https:// URL leaves implicit.
@@ -80,6 +88,11 @@ type App struct {
 	// registry is step 4's registration desk and mon-client directory,
 	// exposed through Registry() so later steps can wire their hooks.
 	registry *registry.Registry
+
+	// engine is step 6's heartbeat + state machine, exposed through
+	// State() so step 7's buckets and step 8's probe handler can reach the
+	// same instance.
+	engine *state.Engine
 
 	// configs is step 5's per-mon-client config builder, exposed through
 	// Configs() so step 10's Settings Save can call RebuildAll when a probe
@@ -122,6 +135,13 @@ type App struct {
 	pollCancel  context.CancelFunc
 	pollWG      sync.WaitGroup
 	pollStopped atomic.Bool
+
+	// offlineCancel/offlineWG are the same pair for the 20s mon-client
+	// liveness job (spec §7.3): a job that writes to the database must be
+	// joined by Shutdown for the same reason the poll loop is.
+	offlineCancel  context.CancelFunc
+	offlineWG      sync.WaitGroup
+	offlineStopped atomic.Bool
 }
 
 // New builds an App from cfg and deps: the TLS config and (for "acme-ip") a
@@ -183,11 +203,27 @@ func newApp(d Deps, readTimeout, writeTimeout time.Duration) (*App, error) {
 	configs := registry.NewConfigBuilder(d.Store, d.Clock, poller, probeURL(d.Cfg))
 	poller.SetConfigs(configs)
 	poller.SetSnapshot(reg.SnapshotSource())
+	// Step 6's state engine: it answers heartbeats, owns the target state
+	// machine and asks the poller who should send a transition to Telegram
+	// (spec §4.1). The poller hands it the panel's inbound list so a
+	// disabled or vanished inbound pauses its targets (spec §4 step 3), and
+	// the registry tells it when an administrator disables a mon-client
+	// (spec §6). Stats stays nil until step 7 wires its buckets in.
+	engine := state.New(state.Deps{
+		Store:     d.Store,
+		Clock:     d.Clock,
+		Notifier:  d.Notifier,
+		PanelDown: poller.PanelDown,
+		Configs:   configs,
+	})
+	poller.SetInbounds(engine)
 	reg.SetHooks(registry.Hooks{
 		PathsChanged: configs.Rebuild,
 		Approved:     configs.Rebuild,
+		Disabled:     engine.MonClientDisabled,
 	})
 	api.ConfigRoutes(srv.V1, reg, configs)
+	api.HeartbeatRoutes(srv.V1, reg, engine)
 
 	httpSrv := &http.Server{
 		Handler:   srv.Engine,
@@ -217,6 +253,7 @@ func newApp(d Deps, readTimeout, writeTimeout time.Duration) (*App, error) {
 		http:       httpSrv,
 		mgr:        mgr,
 		poller:     poller,
+		engine:     engine,
 		registry:   reg,
 		configs:    configs,
 		ctx:        ctx,
@@ -267,6 +304,15 @@ func (a *App) Start() (addr string, err error) {
 		a.poller.Run(pollCtx)
 	}()
 
+	offlineCtx, offlineCancel := context.WithCancel(context.Background())
+	a.offlineCancel = offlineCancel
+	a.offlineWG.Add(1)
+	go func() {
+		defer a.offlineWG.Done()
+		defer a.offlineStopped.Store(true)
+		a.runOfflineSweep(offlineCtx)
+	}()
+
 	go func() {
 		// cert/key args are empty because TLSConfig already carries the
 		// certificate (via Certificates for "files", via GetCertificate for
@@ -280,6 +326,25 @@ func (a *App) Start() (addr string, err error) {
 	}()
 
 	return addr, nil
+}
+
+// runOfflineSweep runs the mon-client liveness job until ctx is cancelled
+// (spec §7.3). A failed sweep is logged rather than fatal: the next tick
+// re-evaluates every mon-client from the database, so a transient SQLite
+// error costs at most one tick's latency on an OFFLINE verdict.
+func (a *App) runOfflineSweep(ctx context.Context) {
+	t := time.NewTicker(offlineSweep)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if err := a.engine.MarkOffline(ctx); err != nil {
+				slog.Warn("app: marking silent mon-clients offline failed", "err", err)
+			}
+		}
+	}
 }
 
 // Shutdown stops the listener from accepting new connections, waits for
@@ -307,6 +372,9 @@ func (a *App) Shutdown(ctx context.Context) error {
 	if a.pollCancel != nil {
 		a.pollCancel()
 	}
+	if a.offlineCancel != nil {
+		a.offlineCancel()
+	}
 	err := a.http.Shutdown(ctx)
 	a.cancel()
 	a.mgr.Stop()
@@ -314,12 +382,13 @@ func (a *App) Shutdown(ctx context.Context) error {
 	joined := make(chan struct{})
 	go func() {
 		a.pollWG.Wait()
+		a.offlineWG.Wait()
 		close(joined)
 	}()
 	select {
 	case <-joined:
 	case <-ctx.Done():
-		slog.Warn("app: shutdown context expired before the panel poll loop stopped; abandoning it")
+		slog.Warn("app: shutdown context expired before the background jobs stopped; abandoning them")
 	}
 	return err
 }
@@ -417,6 +486,13 @@ func probeURL(cfg *config.Config) string {
 // would be served.
 func (a *App) Configs() *registry.ConfigBuilder {
 	return a.configs
+}
+
+// State exposes step 6's engine so step 7 can hand it the stats buckets,
+// step 8's probe handler can share it, and tests can drive a heartbeat
+// without going through the listener.
+func (a *App) State() *state.Engine {
+	return a.engine
 }
 
 // Registry exposes the registration desk / mon-client directory so later

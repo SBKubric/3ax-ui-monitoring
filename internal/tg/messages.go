@@ -3,6 +3,7 @@ package tg
 import (
 	"fmt"
 	"strings"
+	"time"
 )
 
 // configErrorMaxRunes bounds MsgConfigError's first-line excerpt (spec §8:
@@ -51,6 +52,27 @@ func firstLineTrimmed(s string) string {
 func MsgTargetTransition(monClientName, region, inboundKind string, inboundID int, path, from, to, reason string) string {
 	return fmt.Sprintf("%s target %s (%s) %s:%d/%s %s → %s (%s)",
 		viaMonServerMark, monClientName, region, inboundKind, inboundID, path, from, to, reason)
+}
+
+// MsgTargetRecovered formats the one transition spec §7.2 wants worded
+// differently: the "UP" row says the message carries the length of the
+// outage, and only when the target is coming back from DOWN («UP» с
+// длительностью простоя (только из DOWN)). An operator reading the chat
+// wants "was it five seconds or five hours" without going to the panel,
+// e.g.:
+//
+//	[via mon-server] target ams-1 (NL) xray:12/proxy DOWN → UP after 12m30s
+//
+// downtime is rounded to whole seconds — the probe interval is measured in
+// tens of seconds, so sub-second precision here would be noise — and a
+// negative value (a row whose `since` somehow sits in the future) is shown
+// as 0s rather than as a negative duration.
+func MsgTargetRecovered(monClientName, region, inboundKind string, inboundID int, path string, downtime time.Duration) string {
+	if downtime < 0 {
+		downtime = 0
+	}
+	return fmt.Sprintf("%s target %s (%s) %s:%d/%s DOWN → UP after %s",
+		viaMonServerMark, monClientName, region, inboundKind, inboundID, path, downtime.Round(time.Second))
 }
 
 // MsgMonClientTransition formats a mon-client state transition sent by
