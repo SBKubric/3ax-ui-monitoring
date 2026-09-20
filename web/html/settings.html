@@ -1,0 +1,114 @@
+{{define "content"}}
+<section class="card tight hd">
+  <a-button type="primary" :loading="busy" data-testid="settings-save" @click="save">Save</a-button>
+  <span class="sp"></span>
+  <span class="alert" :class="status.reachable ? 'ok' : 'err'" data-testid="settings-status">[[ statusLine ]]</span>
+</section>
+
+<section class="card">
+  <a-tabs v-model:active-key="tab">
+    <a-tab-pane key="real">
+      <template #tab><span data-testid="tab-real">🖥 Real server</span></template>
+
+      <div class="sli">
+        <div><div class="tt">Panel URL</div><div class="d">[[ strings.panelUrl ]]</div></div>
+        <div><a-input v-model:value="form.panelUrl" class="mono" data-testid="field-panelUrl" placeholder="https://203.0.113.10:2053/xyz/"></a-input></div>
+      </div>
+
+      <div class="sli">
+        <div><div class="tt">Monitoring token</div><div class="d">[[ strings.monToken ]]</div></div>
+        <div class="flex">
+          <a-input-password v-model:value="form.monToken" class="mono" data-testid="field-monToken"></a-input-password>
+          <a-button :loading="checking" data-testid="settings-check" @click="check">Check</a-button>
+        </div>
+      </div>
+
+      <div class="sli" v-if="checkResult">
+        <div><div class="tt">Check result</div><div class="d">Nothing was saved by this check.</div></div>
+        <div class="mono small" data-testid="settings-check-result">[[ checkResult ]]</div>
+      </div>
+
+      <div class="sli">
+        <div><div class="tt">Address for path direct</div><div class="d">[[ strings.realHost ]]</div></div>
+        <div><a-input v-model:value="form.realHost" class="mono" data-testid="field-realHost" :placeholder="panelHost"></a-input></div>
+      </div>
+
+      <div class="sli">
+        <div><div class="tt">Proxy front</div><div class="d">[[ strings.proxyFront ]]</div></div>
+        <div class="in ro mono" data-testid="proxy-front">[[ proxyFrontLine ]]</div>
+      </div>
+    </a-tab-pane>
+
+    <a-tab-pane key="telegram">
+      <template #tab><span data-testid="tab-telegram">💬 Telegram</span></template>
+      <div class="sli">
+        <div><div class="tt">Bot token</div><div class="d">[[ strings.telegram ]]</div></div>
+        <div><a-input-password v-model:value="form.tgToken" class="mono" data-testid="field-tgToken"></a-input-password></div>
+      </div>
+      <div class="sli">
+        <div><div class="tt">Chat id</div><div class="d">The chat alerts are sent to, e.g. -1001234567890.</div></div>
+        <div class="flex">
+          <a-input v-model:value="form.tgChatId" class="mono" data-testid="field-tgChatId"></a-input>
+          <a-button :loading="sending" data-testid="settings-telegram-test" @click="sendTest">Send test</a-button>
+        </div>
+      </div>
+    </a-tab-pane>
+
+    <a-tab-pane key="thresholds">
+      <template #tab><span data-testid="tab-thresholds">📏 Thresholds</span></template>
+      <div class="sli">
+        <div><div class="tt">Target DOWN after / UP after</div><div class="d">Consecutive failed probes before DOWN, consecutive successes before UP.</div></div>
+        <div class="flex">
+          <a-input v-model:value="form.downAfter" class="num" data-testid="field-downAfter"></a-input>
+          <a-input v-model:value="form.upAfter" class="num" data-testid="field-upAfter"></a-input>
+        </div>
+      </div>
+      <div class="sli">
+        <div><div class="tt">FLAPPING</div><div class="d">Transitions within the window that mark a target FLAPPING, and how long it is held there.</div></div>
+        <div class="flex">
+          <a-input v-model:value="form.flapN" class="num" data-testid="field-flapN"></a-input>
+          <span class="muted">in</span>
+          <a-input v-model:value="form.flapMin" class="num" data-testid="field-flapMin"></a-input>
+          <span class="muted">min, hold</span>
+          <a-input v-model:value="form.flapHoldMin" class="num" data-testid="field-flapHoldMin"></a-input>
+          <span class="muted">min</span>
+        </div>
+      </div>
+      <div class="sli">
+        <div><div class="tt">mon-client OFFLINE after / PANEL_DOWN after</div><div class="d">Missed heartbeats, failed panel polls.</div></div>
+        <div class="flex">
+          <a-input v-model:value="form.clientOfflineAfter" class="num" data-testid="field-clientOfflineAfter"></a-input>
+          <a-input v-model:value="form.panelDownAfter" class="num" data-testid="field-panelDownAfter"></a-input>
+        </div>
+      </div>
+    </a-tab-pane>
+
+    <a-tab-pane key="probe">
+      <template #tab><span data-testid="tab-probe">⏱ Probe</span></template>
+      <div class="sli"><div><div class="tt">Probe cycle</div><div class="d">[[ strings.probe ]]</div></div><div></div></div>
+      <div class="sli" v-for="f in probeFields" :key="f.key">
+        <div><div class="tt">[[ f.label ]]</div><div class="d">[[ f.hint ]]</div></div>
+        <div><a-input v-model:value="form[f.key]" class="num wide" :data-testid="'field-' + f.key"></a-input></div>
+      </div>
+    </a-tab-pane>
+
+    <a-tab-pane key="tls">
+      <template #tab><span data-testid="tab-tls">🔐 TLS &amp; admin</span></template>
+      <div class="sli">
+        <div><div class="tt">TLS</div><div class="d">[[ strings.tls ]]</div></div>
+        <div class="in ro mono" data-testid="tls-info">[[ tlsLine ]]</div>
+      </div>
+      <div class="sli">
+        <div><div class="tt">Data directory · listen</div><div class="d">From the bootstrap config (file or MON_* environment), read-only here.</div></div>
+        <div class="in ro mono" data-testid="bootstrap-info">[[ bootstrap.dataDir || '—' ]] · [[ bootstrap.listen || '—' ]]</div>
+      </div>
+      <div class="sli">
+        <div><div class="tt">Administrator</div><div class="d">One account, no 2FA in v1. Sessions last 24 h.</div></div>
+        <div class="in ro mono" data-testid="admin-hint">[[ bootstrap.adminCommand ]]</div>
+      </div>
+    </a-tab-pane>
+  </a-tabs>
+</section>
+{{end}}
+
+{{define "script"}}<script src="/admin/assets/page-settings.js"></script>{{end}}

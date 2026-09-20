@@ -17,6 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/SBKubric/3ax-ui-monitoring/internal/admin"
 	"github.com/SBKubric/3ax-ui-monitoring/internal/api"
 	"github.com/SBKubric/3ax-ui-monitoring/internal/clock"
 	"github.com/SBKubric/3ax-ui-monitoring/internal/config"
@@ -238,6 +239,23 @@ func newApp(d Deps, readTimeout, writeTimeout time.Duration) (*App, error) {
 	// config builder as GET /v1/config, since "is this target one I handed
 	// out" is exactly ConfigBuilder.TargetKeys.
 	api.ProbeRoutes(srv.V1, reg, configs, d.Store)
+
+	// Step 10's admin UI: the four surfaces of spec §9 plus /admin/api/*,
+	// mounted on the group api.New already made for them. It gets the same
+	// registry, config builder and poller the rest of the process uses —
+	// the UI is a client of mon-server's domain, never a second copy of it
+	// — and its own Telegram client for the Settings page's "Send test",
+	// which sends with the credentials typed into the form rather than the
+	// saved ones (spec §9.4).
+	admin.New(admin.Deps{
+		Store:    d.Store,
+		Clock:    d.Clock,
+		Registry: reg,
+		Configs:  configs,
+		Poller:   poller,
+		Cfg:      d.Cfg,
+		Telegram: tg.NewHTTP(nil, ""),
+	}).Mount(srv.Admin)
 
 	httpSrv := &http.Server{
 		Handler:   srv.Engine,
