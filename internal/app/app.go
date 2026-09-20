@@ -62,6 +62,22 @@ const offlineSweep = 20 * time.Second
 // — the port an https:// URL leaves implicit.
 const defaultHTTPSPort = "443"
 
+// retentionInterval is how often the hourly cleanup job runs (spec §3:
+// "Ретеншн (job раз в час)"; issue #13). An hour is short next to every
+// window it prunes against (24h/7d), so the job never lets a backlog grow
+// large enough for its own batching (store.retentionBatch) to matter much.
+const retentionInterval = time.Hour
+
+// retentionFirstRun is how long Start waits before the very first
+// retention pass, rather than running it immediately at boot. A fresh
+// process has nothing to clean up yet — every table it prunes only grows
+// rows over hours or days — so running immediately would only cost a few
+// idle SELECTs during the busiest moment of a cold start (TLS handshake,
+// first panel poll). Waiting a minute lets that settle first; it is not
+// spec-mandated, just a boot-time courtesy, and does not affect when the
+// job first has anything to actually delete.
+const retentionFirstRun = time.Minute
+
 // Deps are every collaborator App needs, injected rather than constructed
 // internally so tests can pass a temp-file store, a Fake clock and a
 // tg.Recorder instead of the real things (architecture brief §4: "no global
@@ -143,6 +159,14 @@ type App struct {
 	offlineCancel  context.CancelFunc
 	offlineWG      sync.WaitGroup
 	offlineStopped atomic.Bool
+
+	// retentionCancel/retentionWG are the same pair again for the hourly
+	// retention job (spec §3, issue #13): it too writes to (deletes from)
+	// the database, so Shutdown must join it before the process considers
+	// itself stopped, exactly like the poller and the offline sweep.
+	retentionCancel  context.CancelFunc
+	retentionWG      sync.WaitGroup
+	retentionStopped atomic.Bool
 }
 
 // New builds an App from cfg and deps: the TLS config and (for "acme-ip") a
@@ -345,6 +369,15 @@ func (a *App) Start() (addr string, err error) {
 		a.runOfflineSweep(offlineCtx)
 	}()
 
+	retentionCtx, retentionCancel := context.WithCancel(context.Background())
+	a.retentionCancel = retentionCancel
+	a.retentionWG.Add(1)
+	go func() {
+		defer a.retentionWG.Done()
+		defer a.retentionStopped.Store(true)
+		a.runRetention(retentionCtx)
+	}()
+
 	go func() {
 		// cert/key args are empty because TLSConfig already carries the
 		// certificate (via Certificates for "files", via GetCertificate for
@@ -379,10 +412,54 @@ func (a *App) runOfflineSweep(ctx context.Context) {
 	}
 }
 
+// runRetention runs the hourly cleanup job (spec §3, issue #13) until ctx is
+// cancelled: a short delay (retentionFirstRun) before the first pass, since
+// a fresh process has nothing yet to clean up, then store.Store.Retention
+// every retentionInterval. A failed pass is logged rather than fatal — like
+// the offline sweep, the next tick tries again from scratch, so a
+// transient SQLite error costs at most one hour's delay in reclaiming
+// space, never a stuck process.
+func (a *App) runRetention(ctx context.Context) {
+	timer := time.NewTimer(retentionFirstRun)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+			a.runRetentionOnce(ctx)
+			timer.Reset(retentionInterval)
+		}
+	}
+}
+
+// runRetentionOnce runs and logs a single retention pass. It only logs at
+// Info when the report says something was actually deleted (RetentionReport.
+// Total() > 0): an hourly "deleted nothing" line on every install, most of
+// which spend most hours with nothing to prune, would just be noise.
+func (a *App) runRetentionOnce(ctx context.Context) {
+	report, err := a.deps.Store.Retention(ctx)
+	if err != nil {
+		slog.Warn("app: retention pass failed", "err", err)
+		return
+	}
+	if report.Total() > 0 {
+		slog.Info("app: retention pass",
+			"events", report.Events,
+			"stats", report.Stats,
+			"probeSeen", report.ProbeSeen,
+			"requests", report.Requests,
+			"sessions", report.Sessions,
+			"loginAttempts", report.LoginAttempts,
+		)
+	}
+}
+
 // Shutdown stops the listener from accepting new connections, waits for
 // handlers already in flight to finish, up to ctx's deadline (spec §2:
 // "graceful shutdown: дождаться текущих обработчиков"), and joins the panel
-// poll loop. Buffers in SQLite are already durable by the time a handler
+// poll loop, the offline sweep and the hourly retention job (spec §3).
+// Buffers in SQLite are already durable by the time a handler
 // returns, so there is nothing else for shutdown to flush; the join is
 // about not leaving a goroutine writing to the database after the process
 // believes it has stopped. After the HTTP server has finished shutting
@@ -407,6 +484,9 @@ func (a *App) Shutdown(ctx context.Context) error {
 	if a.offlineCancel != nil {
 		a.offlineCancel()
 	}
+	if a.retentionCancel != nil {
+		a.retentionCancel()
+	}
 	err := a.http.Shutdown(ctx)
 	a.cancel()
 	a.mgr.Stop()
@@ -415,6 +495,7 @@ func (a *App) Shutdown(ctx context.Context) error {
 	go func() {
 		a.pollWG.Wait()
 		a.offlineWG.Wait()
+		a.retentionWG.Wait()
 		close(joined)
 	}()
 	select {

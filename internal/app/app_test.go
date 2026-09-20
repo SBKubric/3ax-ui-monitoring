@@ -357,10 +357,11 @@ func TestApp_ReadTimeoutClosesStalledBody(t *testing.T) {
 }
 
 // TestShutdown_JoinsTheBackgroundJobs checks that the panel poll loop (spec
-// §4) and the mon-client liveness sweep (spec §7.3)
-// are started by Start and actually joined by Shutdown: a goroutine still
-// running after Shutdown returned would keep writing to a database the
-// process believes it has closed, and would show up as a leak under -race.
+// §4), the mon-client liveness sweep (spec §7.3) and the hourly retention
+// job (spec §3) are started by Start and actually joined by Shutdown: a
+// goroutine still running after Shutdown returned would keep writing to
+// (or deleting from) a database the process believes it has closed, and
+// would show up as a leak under -race.
 func TestShutdown_JoinsTheBackgroundJobs(t *testing.T) {
 	a, _ := newTestApp(t)
 
@@ -383,6 +384,11 @@ func TestShutdown_JoinsTheBackgroundJobs(t *testing.T) {
 	// and for the same reason: it writes to the database on every tick.
 	if !a.offlineStopped.Load() {
 		t.Fatal("Shutdown returned while the offline sweep was still running")
+	}
+	// The hourly retention job (spec §3, issue #13) is joined the same
+	// way: Shutdown must not return while it could still be deleting rows.
+	if !a.retentionStopped.Load() {
+		t.Fatal("Shutdown returned while the retention job was still running")
 	}
 	if a.Poller().PanelDown() {
 		t.Fatal("an unconfigured mon-server must not start out in PANEL_DOWN")
