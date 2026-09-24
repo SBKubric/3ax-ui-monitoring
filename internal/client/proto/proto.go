@@ -140,11 +140,27 @@ type Cycle struct {
 // §5.3). ConfigError is a pointer because null ("my config is fine") and ""
 // are different states a mon-client may need to send, and the distinction
 // has to survive encoding.
+//
+// ConfigError is about the revision as a whole (it did not apply, or the
+// xray child is down); RejectedTargets is about single targets of a
+// revision that did apply (decision #53 п. 3). Absent or empty means every
+// target of the applied revision is being probed.
 type ClientInfo struct {
-	Version     string  `json:"version"`
-	XrayVersion string  `json:"xrayVersion"`
-	UptimeMs    int64   `json:"uptimeMs"`
-	ConfigError *string `json:"configError"`
+	Version         string           `json:"version"`
+	XrayVersion     string           `json:"xrayVersion"`
+	UptimeMs        int64            `json:"uptimeMs"`
+	ConfigError     *string          `json:"configError"`
+	RejectedTargets []RejectedTarget `json:"rejectedTargets,omitempty"`
+}
+
+// RejectedTarget is one target of the applied revision mon-client could
+// not turn into a probe (protocol §5.3 client.rejectedTargets): its link or
+// .conf did not parse, or its AWG device refused the config. Target is the
+// TargetKey in its String form ("awg:3:direct"); Error is the first line
+// of the reason, at most 256 characters.
+type RejectedTarget struct {
+	Target string `json:"target"`
+	Error  string `json:"error"`
 }
 
 // HeartbeatRequest is the POST /v1/heartbeat body (protocol §5.3).
