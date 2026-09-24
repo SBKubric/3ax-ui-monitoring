@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -1187,5 +1188,119 @@ func TestSyncInbounds_EnableDoesNotReleaseConfigPauses(t *testing.T) {
 	}
 	if got := f.targetState(keyProxy); got.State != store.TargetPaused || got.Reason != ReasonPathRemoved {
 		t.Fatalf("target = %s/%s, want still PAUSED/path_removed", got.State, got.Reason)
+	}
+}
+
+// beatRejecting sends one heartbeat whose client block reports rejected as
+// client.rejectedTargets (protocol §5.3), target → error.
+func (f *fixture) beatRejecting(rejected map[registry.TargetKey]string, cycles ...Cycle) {
+	f.t.Helper()
+	info := ClientInfo{Version: "0.1.0", XrayVersion: "26.3.27"}
+	for k, e := range rejected {
+		info.RejectedTargets = append(info.RejectedTargets, RejectedTarget{
+			Target: fmt.Sprintf("%s:%d:%s", k.InboundKind, k.InboundID, k.Path), Error: e,
+		})
+	}
+	if _, err := f.e.Heartbeat(context.Background(), f.mc, &HeartbeatRequest{
+		MonClientID:    f.mc.Id,
+		ConfigRevision: "rev-applied",
+		Client:         info,
+		Cycles:         cycles,
+	}); err != nil {
+		f.t.Fatalf("Heartbeat: %v", err)
+	}
+}
+
+// TestHeartbeat_RejectedTargetIsPausedWithConfigError is decision #53 п. 3
+// on mon-server's side: a target the mon-client reports in rejectedTargets
+// goes PAUSED with reason config_error — a panel event, never Telegram, even
+// while PANEL_DOWN — and the error is kept on the mon-client row for the
+// admin UI. Dropping out of rejectedTargets releases it to UNKNOWN
+// (config_enabled), and the next result decides.
+func TestHeartbeat_RejectedTargetIsPausedWithConfigError(t *testing.T) {
+	f := newFixture(t)
+	f.clk.Advance(time.Minute)
+	f.beat(f.cycle(1, result(keyProxy, true, ""), result(keyDirect, true, "")))
+
+	f.panelDown = true
+	sentBefore := len(f.tgr.Sent)
+	f.clk.Advance(time.Minute)
+	f.beatRejecting(map[registry.TargetKey]string{keyProxy: `unsupported transport "kcp"`},
+		f.cycle(2, result(keyDirect, true, "")))
+
+	if got := f.targetState(keyProxy); got.State != store.TargetPaused || got.Reason != ReasonConfigError {
+		t.Fatalf("target = %s/%s, want PAUSED/config_error", got.State, got.Reason)
+	}
+	evs := f.events()
+	last := evs[len(evs)-1]
+	if last.Kind != eventKindTarget || last.Path != store.PathProxy || last.From != store.TargetUp ||
+		last.To != store.TargetPaused || last.Reason != ReasonConfigError || last.Notified {
+		t.Fatalf("last event = %+v, want an un-notified UP → PAUSED config_error", last)
+	}
+	if len(f.tgr.Sent) != sentBefore {
+		t.Fatalf("Telegram got %q, want nothing for a config_error pause", f.tgr.Sent[sentBefore:])
+	}
+	if got := f.targetState(keyDirect); got.State != store.TargetUp {
+		t.Fatalf("direct target = %s, want it untouched (UP)", got.State)
+	}
+	mc := f.reload()
+	if r := mc.RejectedList(); len(r) != 1 || r[0].Target != "xray:12:proxy" || r[0].Error != `unsupported transport "kcp"` {
+		t.Fatalf("mon-client rejected targets = %+v, want the reported one", r)
+	}
+
+	// Still rejected: nothing more is filed.
+	before := len(f.events())
+	f.clk.Advance(time.Minute)
+	f.beatRejecting(map[registry.TargetKey]string{keyProxy: `unsupported transport "kcp"`}, f.cycle(3))
+	if len(f.events()) != before {
+		t.Fatalf("a second heartbeat filed %d more events, want none", len(f.events())-before)
+	}
+
+	// No longer rejected: UNKNOWN, then the first result.
+	f.clk.Advance(time.Minute)
+	f.beat(f.cycle(4))
+	if got := f.targetState(keyProxy); got.State != store.TargetUnknown || got.Reason != ReasonConfigEnabled {
+		t.Fatalf("target = %s/%s, want UNKNOWN/config_enabled once no longer rejected", got.State, got.Reason)
+	}
+	if mc := f.reload(); len(mc.RejectedList()) != 0 {
+		r := mc.RejectedList()
+		t.Fatalf("mon-client rejected targets = %+v, want them cleared", r)
+	}
+	f.clk.Advance(time.Minute)
+	f.beat(f.cycle(5, result(keyProxy, true, "")))
+	if got := f.targetState(keyProxy); got.State != store.TargetUp {
+		t.Fatalf("target = %s, want UP after the first result", got.State)
+	}
+}
+
+// TestHeartbeat_RejectedNewTargetGetsARow: a target rejected before it
+// ever produced a result has no row yet; it gets one (UNKNOWN, the usual
+// start of a new target) and goes PAUSED at once, so the panel learns about
+// it. A rejected key that is not in the mon-client's config, or one that is
+// not a target key at all, creates nothing.
+func TestHeartbeat_RejectedNewTargetGetsARow(t *testing.T) {
+	f := newFixture(t)
+	stranger := registry.TargetKey{InboundKind: store.InboundKindAwg, InboundID: 7, Path: store.PathProxy}
+	f.clk.Advance(time.Minute)
+	f.beatRejecting(map[registry.TargetKey]string{keyProxy: "bad", stranger: "bad", {InboundKind: "nonsense"}: "bad"})
+
+	if got := f.targetState(keyProxy); got.State != store.TargetPaused || got.Reason != ReasonConfigError {
+		t.Fatalf("target = %s/%s, want PAUSED/config_error", got.State, got.Reason)
+	}
+	var n int64
+	if err := f.st.DB.Model(&store.Target{}).Where("mon_client_id = ?", f.mc.Id).Count(&n).Error; err != nil {
+		t.Fatalf("count targets: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("%d target rows, want only the rejected target of the config", n)
+	}
+	var paused []store.EventPayload
+	for _, ev := range f.events() {
+		if ev.Kind == eventKindTarget {
+			paused = append(paused, ev)
+		}
+	}
+	if len(paused) != 1 || paused[0].From != store.TargetUnknown || paused[0].To != store.TargetPaused {
+		t.Fatalf("target events = %+v, want one UNKNOWN → PAUSED", paused)
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"time"
 
 	"github.com/google/uuid"
@@ -220,7 +221,8 @@ func (e *Engine) Heartbeat(ctx context.Context, mc *store.MonClient, hb *Heartbe
 		if err := e.retirePaused(tx, mc.Id, keys); err != nil {
 			return err
 		}
-		if err := e.reconcilePauses(tx, mc.Id, keys, excl, clock.Ms(now)); err != nil {
+		rejected := rejectedKeys(keys, hb.Client.RejectedTargets)
+		if err := e.reconcilePauses(tx, mc.Id, keys, rejected, excl, clock.Ms(now)); err != nil {
 			return err
 		}
 
@@ -463,6 +465,12 @@ func (e *Engine) applyClientInfo(tx *gorm.DB, notify *notices, mc *store.MonClie
 		"applied_revision":  hb.ConfigRevision,
 		"last_ack_seq":      ack,
 	}
+	// The rejections are stored as reported, whatever the config says of
+	// them: they are the box's own account of its revision, for the admin
+	// UI, like configError.
+	var reportedRejected store.MonClient
+	reportedRejected.SetRejected(rejectedList(hb.Client.RejectedTargets))
+	updates["rejected_targets"] = reportedRejected.RejectedTargets
 
 	from := mc.State
 	online := from != store.MonClientOnline
@@ -499,6 +507,7 @@ func (e *Engine) applyClientInfo(tx *gorm.DB, notify *notices, mc *store.MonClie
 	mc.XrayVersion = hb.Client.XrayVersion
 	mc.AppliedRevision = hb.ConfigRevision
 	mc.LastAckSeq = ack
+	mc.RejectedTargets = reportedRejected.RejectedTargets
 	if online {
 		mc.State = store.MonClientOnline
 	}
@@ -627,16 +636,38 @@ func (e *Engine) retirePaused(tx *gorm.DB, monClientID string, keys map[registry
 // target out of the config because its inbound is disabled or gone gets no
 // reason here; SyncInbounds pauses it (config_disabled) and releases it.
 //
+// A target in the config that the mon-client rejected (decision #53 п. 3)
+// goes PAUSED with config_error the same way, and is released the same way
+// once a heartbeat no longer lists it. A rejected target that has never
+// produced a result has no row yet; it gets one here, UNKNOWN like any new
+// target, so its pause reaches the panel as UNKNOWN → PAUSED.
+//
 // It runs in the heartbeat for the same reason retirePaused does: this is
 // where mon-server knows which config the mon-client was actually handed.
-func (e *Engine) reconcilePauses(tx *gorm.DB, monClientID string, keys map[registry.TargetKey]bool, excl registry.Exclusions, nowMs int64) error {
+func (e *Engine) reconcilePauses(tx *gorm.DB, monClientID string, keys, rejected map[registry.TargetKey]bool, excl registry.Exclusions, nowMs int64) error {
 	var rows []store.Target
 	if err := tx.Where("mon_client_id = ?", monClientID).Order("id").Find(&rows).Error; err != nil {
 		return fmt.Errorf("state: read targets of %s: %w", monClientID, err)
 	}
+	if len(rejected) > 0 {
+		have := make(map[registry.TargetKey]bool, len(rows))
+		for _, t := range rows {
+			have[registry.TargetKey{InboundKind: t.InboundKind, InboundID: t.InboundId, Path: t.Path}] = true
+		}
+		for _, key := range sortedKeys(rejected) {
+			if have[key] {
+				continue
+			}
+			t, err := e.targetRow(tx, monClientID, Result{InboundKind: key.InboundKind, InboundID: key.InboundID, Path: key.Path}, nowMs)
+			if err != nil {
+				return err
+			}
+			rows = append(rows, *t)
+		}
+	}
 	for _, t := range rows {
 		key := registry.TargetKey{InboundKind: t.InboundKind, InboundID: t.InboundId, Path: t.Path}
-		reason := configPause(key, keys, excl)
+		reason := configPause(key, keys, rejected, excl)
 		var err error
 		switch {
 		case reason != "" && t.State != store.TargetPaused:
@@ -652,14 +683,68 @@ func (e *Engine) reconcilePauses(tx *gorm.DB, monClientID string, keys map[regis
 }
 
 // configPause is why one target must be PAUSED by its mon-client's config,
-// or "" when it must not be (it is in the config, or it is out because of
-// its inbound, or nothing is known yet). Every reason it can return is in
-// configPauseReasons.
-func configPause(key registry.TargetKey, keys map[registry.TargetKey]bool, excl registry.Exclusions) string {
+// or "" when it must not be (it is in the config and was not rejected, or
+// it is out because of its inbound, or nothing is known yet). Every reason
+// it can return is in configPauseReasons.
+func configPause(key registry.TargetKey, keys, rejected map[registry.TargetKey]bool, excl registry.Exclusions) string {
+	if rejected[key] {
+		return ReasonConfigError
+	}
 	if keys[key] {
 		return ""
 	}
 	return excl.Reason(key)
+}
+
+// rejectedKeys is the part of client.rejectedTargets that names targets of
+// the mon-client's current config. The rest — a key of a revision the
+// config has since moved past, or a string that is no target key at all —
+// is dropped here like a result for an unknown target (spec §7.1 step 3):
+// it could only create state nobody asked to be probed.
+func rejectedKeys(keys map[registry.TargetKey]bool, rejected []RejectedTarget) map[registry.TargetKey]bool {
+	if len(rejected) == 0 {
+		return nil
+	}
+	named := make(map[string]bool, len(rejected))
+	for _, r := range rejected {
+		named[r.Target] = true
+	}
+	out := make(map[registry.TargetKey]bool)
+	for k := range keys {
+		if named[fmt.Sprintf("%s:%d:%s", k.InboundKind, k.InboundID, k.Path)] {
+			out[k] = true
+		}
+	}
+	return out
+}
+
+// sortedKeys orders a key set so rows created from it get ids — and their
+// events outbox positions — in a stable order.
+func sortedKeys(set map[registry.TargetKey]bool) []registry.TargetKey {
+	out := make([]registry.TargetKey, 0, len(set))
+	for k := range set {
+		out = append(out, k)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		a, b := out[i], out[j]
+		if a.InboundKind != b.InboundKind {
+			return a.InboundKind < b.InboundKind
+		}
+		if a.InboundID != b.InboundID {
+			return a.InboundID < b.InboundID
+		}
+		return a.Path < b.Path
+	})
+	return out
+}
+
+// rejectedList is the wire list in the store's shape.
+func rejectedList(in []RejectedTarget) []store.RejectedTarget {
+	out := make([]store.RejectedTarget, 0, len(in))
+	for _, r := range in {
+		out = append(out, store.RejectedTarget{Target: r.Target, Error: r.Error})
+	}
+	return out
 }
 
 // exclusions reads what the config builder knows about targets outside this

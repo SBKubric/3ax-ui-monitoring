@@ -7,6 +7,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/SBKubric/3ax-ui-monitoring/internal/clock"
+	"github.com/SBKubric/3ax-ui-monitoring/internal/store"
 )
 
 // clientView is one registry row as the mon-clients page shows it (spec
@@ -38,6 +39,12 @@ type clientView struct {
 	// текст configError" in the modal; the table shows a ⚠ tag).
 	ConfigError   string `json:"configError"`
 	ConfigErrorAt *int64 `json:"configErrorAt"`
+	// RejectedTargets are the targets the box rejected from its applied
+	// revision, each with the box's error (protocol §5.3
+	// client.rejectedTargets). This is the box's report about its config,
+	// not target state: the PAUSED config_error they cause is the panel's to
+	// show.
+	RejectedTargets []store.RejectedTarget `json:"rejectedTargets"`
 
 	RemoteIp string `json:"remoteIp"`
 	// TokenRevoked marks a row whose token was revoked and that is waiting
@@ -75,8 +82,12 @@ func (h *Handler) listClients(c *gin.Context) {
 			AppliedRevision: mc.AppliedRevision,
 			ConfigError:     mc.ConfigError,
 			ConfigErrorAt:   mc.ConfigErrorAt,
+			RejectedTargets: mc.RejectedList(),
 			RemoteIp:        mc.RemoteIp,
 			TokenRevoked:    mc.TokenHash == "",
+		}
+		if v.RejectedTargets == nil {
+			v.RejectedTargets = []store.RejectedTarget{}
 		}
 		if h.deps.Configs != nil {
 			rev, err := h.deps.Configs.CurrentRevision(ctx, mc.Id)
