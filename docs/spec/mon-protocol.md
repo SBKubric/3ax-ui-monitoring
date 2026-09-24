@@ -43,7 +43,7 @@ GET /v1/register/<requestId>
 
 ### 2.3 Отзыв
 
-**Revoke** в admin UI → client token недействителен → heartbeat получает `401 token_revoked` → mon-client останавливает пробы, стирает state-файл и подаёт новую заявку по правилам 2.1. Удалённый mon-client уходит из снимка реестра (`POST /probe/ensure` панели), панель чистит его строки `mon_targets`.
+**Revoke** в admin UI → client token недействителен (mon-server проводит это через state machine: событие `mon_client → OFFLINE` с `reason: token_revoked`, targets → `UNKNOWN`) → heartbeat получает `401 token_revoked` → mon-client останавливает пробы, стирает state-файл и подаёт новую заявку по правилам 2.1. Удалённый mon-client уходит из снимка реестра (`POST /probe/ensure` панели), панель чистит его строки `mon_targets`.
 
 ## 3. Аутентификация после регистрации
 
@@ -123,6 +123,7 @@ POST /v1/heartbeat
 - Латентность для xray — фаза TLS (`tlsMs`), `ttfbMs` — RTT, `handshakeMs` — только AWG (`last_handshake_time − t(dial)`); в 5-мин бакет панели mon-server кладёт `min/avg/max` по `tlsMs` и `handshakeMs` последнего успешного цикла бакета.
 - **Время**: mon-server ставит своё время приёма для состояния target'ов и heartbeat; `ts` цикла используется только для раскладки по 5-мин бакетам и клампится к времени приёма при расхождении > 5 мин.
 - **Буфер**: heartbeat не подтверждён (сеть, 5xx, таймаут) → цикл остаётся в буфере (≤ 60 циклов, старые вытесняются) и досылается в следующем heartbeat вместе с новыми; `ackSeq` подтверждает всё до него включительно. Досланные циклы идут **только в статистику**; состояние target'ов mon-server считает по циклам, пришедшим своим heartbeat'ом (переходы задним числом не переигрываются).
+- **Seq** (решение [#51](https://github.com/SBKubric/3ax-ui-monitoring/issues/51) п. 1) привязан к поколению client token: mon-server сбрасывает свой `last_ack_seq` в 0 при каждой выдаче токена (одобрение, одобрение как replacement), mon-client начинает с `seq=1` при каждой новой регистрации. Внутри поколения seq монотонен: mon-client хранит счётчик в `cycles.json`, а последний полученный `ackSeq` — в `state.json` (`lastAckSeq`). Потерян или повреждён `cycles.json` → следующий seq = `lastAckSeq + 1`, не 1 (перерегистрация не нужна); `ackSeq` в ответе выше собственного счётчика (потеряны оба файла) → следующий цикл идёт с `ackSeq + 1`.
 - **Unverified cycle**: цикл, за который heartbeat не был подтверждён, помечается `unverified: true`. Адресат tunnel probe — сам mon-server, поэтому его недоступность неотличима от падения туннеля: из unverified-циклов в статистику берутся только успехи, провалы считаются пропуском (`null`, не `nFail`).
 - mon-client `OFFLINE` у mon-server — 3 пропущенных heartbeat подряд (по времени приёма), `ONLINE` — первый heartbeat; правила из State machine.
 
