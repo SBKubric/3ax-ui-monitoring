@@ -21,6 +21,15 @@ make build          # -> ./mon-server, version stamped from `git describe`
 
 or build a container image with the project's `Dockerfile` if you prefer that (see that file for details — it is not covered here).
 
+Or download a release: every `v*` tag publishes `mon-server-linux-amd64.tar.gz` and `mon-client-linux-amd64.tar.gz` (each with a `.sha256`) on the [Releases](https://github.com/SBKubric/3ax-ui-monitoring/releases) page, built by `.github/workflows/release.yml`. Both binaries are static, so they run on any supported distribution (Debian 12/13, Ubuntu 22.04/24.04) regardless of its glibc. Tags with a suffix (`v0.1.0-stand.1`) are pre-releases.
+
+```sh
+TAG=v0.1.0-stand.1
+curl -LO https://github.com/SBKubric/3ax-ui-monitoring/releases/download/$TAG/mon-server-linux-amd64.tar.gz
+curl -LO https://github.com/SBKubric/3ax-ui-monitoring/releases/download/$TAG/mon-server-linux-amd64.tar.gz.sha256
+sha256sum -c mon-server-linux-amd64.tar.gz.sha256 && tar -xzf mon-server-linux-amd64.tar.gz
+```
+
 ### 2. Bootstrap config
 
 mon-server needs a minimal bootstrap config *before* it has a database to keep settings in — everything else (panel URL, Telegram, thresholds) is configured later, at runtime, through the admin UI (see the spec's §9.4, [docs/spec/mon-server.md](docs/spec/mon-server.md)). Write `/etc/mon-server/config.json`:
@@ -71,7 +80,7 @@ Once the panel is reachable, mon-server polls it once a minute for inbound state
 mon-server version
 ```
 
-Prints the build's version string (from `make build`'s `git describe`, or `dev` for an unstamped local build).
+Prints the build's version string (the release tag, `make build`'s `git describe`, or `dev` for an unstamped local build).
 
 ## Running under systemd
 

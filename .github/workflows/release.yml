@@ -1,0 +1,113 @@
+name: Release
+
+# A tag v* publishes mon-server and mon-client for linux/amd64 as a GitHub
+# Release — what the ansible roles in SBKubric/3ax-ui-orchestrator download
+# by tag. A tag with a suffix (v0.1.0-stand.1) is a pre-release.
+
+on:
+    push:
+        tags:
+            - "v*"
+
+permissions:
+    contents: read
+
+jobs:
+    test:
+        name: Unit tests
+        runs-on: ubuntu-latest
+        steps:
+            - name: Checkout repository
+              uses: actions/checkout@v6
+
+            - name: Set up Go
+              uses: actions/setup-go@v6
+              with:
+                  go-version-file: go.mod
+                  cache: true
+
+            - name: Vet
+              env:
+                  CGO_ENABLED: 1
+              run: go vet ./...
+
+            # Docker-backed tests (real xray, real AmneziaWG) skip without their
+            # images; CI on main already runs them.
+            - name: Test with the race detector
+              env:
+                  CGO_ENABLED: 1
+              run: go test -race -count=1 ./...
+
+    build:
+        name: Build linux/amd64
+        needs: test
+        runs-on: ubuntu-latest
+        container: golang:1.26-bookworm
+        steps:
+            - name: Checkout repository
+              uses: actions/checkout@v6
+
+            # mon-server is cgo (mattn/go-sqlite3) and linked statically, so one
+            # binary runs on every supported OS whatever its glibc (Debian 12/13,
+            # Ubuntu 22.04/24.04). netgo/osusergo keep glibc's NSS out of a
+            # static binary. mon-client has no cgo at all.
+            - name: Build
+              run: |
+                  git config --global --add safe.directory "$GITHUB_WORKSPACE"
+                  V="$GITHUB_REF_NAME"
+                  M=github.com/SBKubric/3ax-ui-monitoring
+                  X="-X $M/internal/config.version=$V -X $M/internal/version.version=$V"
+                  mkdir -p dist
+                  CGO_ENABLED=1 go build -trimpath \
+                      -tags 'netgo osusergo sqlite_omit_load_extension' \
+                      -ldflags "-s -w -linkmode external -extldflags -static $X" \
+                      -o dist/mon-server ./cmd/mon-server
+                  CGO_ENABLED=0 go build -trimpath -ldflags "-s -w $X" \
+                      -o dist/mon-client ./cmd/mon-client
+
+            - name: Check the binaries
+              run: |
+                  for b in mon-server mon-client; do
+                      if ldd "dist/$b" >/dev/null 2>&1; then
+                          echo "dist/$b is dynamically linked"; exit 1
+                      fi
+                      test "$(dist/$b version)" = "$b $GITHUB_REF_NAME"
+                  done
+
+            - name: Package
+              run: |
+                  cd dist
+                  for b in mon-server mon-client; do
+                      tar -czf "$b-linux-amd64.tar.gz" "$b"
+                      sha256sum "$b-linux-amd64.tar.gz" > "$b-linux-amd64.tar.gz.sha256"
+                  done
+
+            - name: Upload
+              uses: actions/upload-artifact@v4
+              with:
+                  name: release
+                  path: |
+                      dist/*.tar.gz
+                      dist/*.sha256
+
+    release:
+        name: Publish the release
+        needs: build
+        runs-on: ubuntu-latest
+        permissions:
+            contents: write
+        steps:
+            - name: Download
+              uses: actions/download-artifact@v4
+              with:
+                  name: release
+                  path: dist
+
+            - name: Create the release
+              env:
+                  GH_TOKEN: ${{ github.token }}
+                  TAG: ${{ github.ref_name }}
+              run: |
+                  flags=(--repo "$GITHUB_REPOSITORY" --title "$TAG" --generate-notes --verify-tag)
+                  case "$TAG" in *-*) flags+=(--prerelease) ;; esac
+                  gh release create "$TAG" "${flags[@]}" dist/*
