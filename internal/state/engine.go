@@ -640,7 +640,11 @@ func (e *Engine) retirePaused(tx *gorm.DB, monClientID string, keys map[registry
 // goes PAUSED with config_error the same way, and is released the same way
 // once a heartbeat no longer lists it. A rejected target that has never
 // produced a result has no row yet; it gets one here, UNKNOWN like any new
-// target, so its pause reaches the panel as UNKNOWN → PAUSED.
+// target, so its pause reaches the panel as UNKNOWN → PAUSED. So does an
+// AWG target of an enabled AWG server the panel gave this mon-client no
+// probe peer for (decision #80 п. 10): it is PAUSED no_probe_link from the
+// first heartbeat, and released like any no_probe_link once its item
+// appears.
 //
 // It runs in the heartbeat for the same reason retirePaused does: this is
 // where mon-server knows which config the mon-client was actually handed.
@@ -649,21 +653,30 @@ func (e *Engine) reconcilePauses(tx *gorm.DB, monClientID string, keys, rejected
 	if err := tx.Where("mon_client_id = ?", monClientID).Order("id").Find(&rows).Error; err != nil {
 		return fmt.Errorf("state: read targets of %s: %w", monClientID, err)
 	}
-	if len(rejected) > 0 {
-		have := make(map[registry.TargetKey]bool, len(rows))
-		for _, t := range rows {
-			have[registry.TargetKey{InboundKind: t.InboundKind, InboundID: t.InboundId, Path: t.Path}] = true
+	have := make(map[registry.TargetKey]bool, len(rows))
+	for _, t := range rows {
+		have[registry.TargetKey{InboundKind: t.InboundKind, InboundID: t.InboundId, Path: t.Path}] = true
+	}
+	// Targets that must be PAUSED but have never produced a result have no
+	// row to pause yet: a rejected one (decision #53 п. 3), and an AWG
+	// target the panel gave this mon-client no probe peer for (decision #80
+	// п. 10). Each gets an UNKNOWN row here, which the loop below pauses.
+	missing := sortedKeys(rejected)
+	for _, key := range excl.Expected(store.InboundKindAwg) {
+		if !keys[key] && !rejected[key] && excl.Reason(key) == ReasonNoProbeLink {
+			missing = append(missing, key)
 		}
-		for _, key := range sortedKeys(rejected) {
-			if have[key] {
-				continue
-			}
-			t, err := e.targetRow(tx, monClientID, Result{InboundKind: key.InboundKind, InboundID: key.InboundID, Path: key.Path}, nowMs)
-			if err != nil {
-				return err
-			}
-			rows = append(rows, *t)
+	}
+	for _, key := range missing {
+		if have[key] {
+			continue
 		}
+		t, err := e.targetRow(tx, monClientID, Result{InboundKind: key.InboundKind, InboundID: key.InboundID, Path: key.Path}, nowMs)
+		if err != nil {
+			return err
+		}
+		have[key] = true
+		rows = append(rows, *t)
 	}
 	for _, t := range rows {
 		key := registry.TargetKey{InboundKind: t.InboundKind, InboundID: t.InboundId, Path: t.Path}

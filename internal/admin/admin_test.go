@@ -37,6 +37,7 @@ type fakeMaterial struct {
 	have      bool
 	down      bool
 	untrusted bool
+	contract  string
 
 	// refreshes counts RefreshMaterial calls; refreshErr is what they
 	// answer.
@@ -52,6 +53,7 @@ func (f *fakeMaterial) RefreshMaterial(context.Context) error {
 func (f *fakeMaterial) Material() (panel.Material, bool) { return f.mat, f.have }
 func (f *fakeMaterial) PanelDown() bool                  { return f.down }
 func (f *fakeMaterial) UnknownAuthority() bool           { return f.untrusted }
+func (f *fakeMaterial) ContractError() string            { return f.contract }
 
 // fakeTelegram records what "Send test" sent, standing in for tg.HTTP where a
 // test does not need a real Bot API round trip.

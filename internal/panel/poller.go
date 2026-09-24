@@ -246,6 +246,12 @@ type Poller struct {
 
 	unconfiguredLogged bool
 
+	// contractErr is the refusal of the last GET /state that answered with
+	// a contract older than RequiredContract (decision #80 п. 9), nil once
+	// a new enough panel answers. It is what the Settings status line
+	// shows, and it latches the WARN log to once per spell.
+	contractErr error
+
 	// running guards Run against being started twice: a second concurrent
 	// (or accidental sequential) call would otherwise drive two overlapping
 	// poll loops against the same store and client state.
@@ -315,6 +321,19 @@ func (p *Poller) UnknownAuthority() bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.unknownAuthority
+}
+
+// ContractError is the refusal message while the panel speaks a contract
+// older than RequiredContract (decision #80 п. 9), "" otherwise. The admin
+// UI's status line shows it: the poll cycle keeps running but builds no
+// targets, and nothing else on the page would explain why.
+func (p *Poller) ContractError() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.contractErr == nil {
+		return ""
+	}
+	return p.contractErr.Error()
 }
 
 // Material returns the last probe material accepted from the panel and
@@ -423,6 +442,17 @@ func (p *Poller) Poll(ctx context.Context) error {
 		}
 	}
 
+	// Decision #80 п. 9: a panel older than contract 2 hands out one shared
+	// AWG probe peer, which the paths and mon-clients steal from each
+	// other. Nothing is ensured, synced or read from it, so no target is
+	// built; the outbox is still drained, since events and stats have not
+	// changed shape.
+	if err := p.noteContract(st); err != nil {
+		fail(err)
+		fail(p.flush(ctx, set, cl))
+		return firstErr
+	}
+
 	// Step 2: POST /probe/ensure with the full registry snapshot.
 	subID := ""
 	if st.Probe.SubId != nil {
@@ -449,6 +479,13 @@ func (p *Poller) Poll(ctx context.Context) error {
 		}
 		if res.Revision != "" {
 			revision = res.Revision
+		}
+		if len(res.Unallocated) > 0 {
+			// Decision #80 п. 10: the panel's AWG address pool is full. Those
+			// mon-clients get no AWG item, and their AWG targets go PAUSED
+			// no_probe_link through the config builder.
+			slog.Warn("panel: no AWG probe peer for some mon-clients, the panel's address pool is exhausted",
+				"monClients", res.Unallocated)
 		}
 	}
 
@@ -618,6 +655,36 @@ func (p *Poller) readMaterial(ctx context.Context, set *store.Settings, cl Clien
 	return true, nil
 }
 
+// ErrContractTooOld marks CheckContract's refusal, for a caller that needs
+// to tell it apart from a panel that could not be reached.
+var ErrContractTooOld = errors.New("panel: monitoring contract too old")
+
+// contractError is CheckContract's refusal. Its text is what the logs, the
+// poll cycle's error and the admin UI all show, so it names both versions
+// and the cure.
+type contractError struct{ got int }
+
+func (e contractError) Error() string {
+	return fmt.Sprintf("panel speaks monitoring contract %d, mon-server needs %d — update the panel", e.got, RequiredContract)
+}
+
+func (e contractError) Is(target error) bool { return target == ErrContractTooOld }
+
+// CheckContract refuses a GET /state from a panel older than
+// RequiredContract (decision #80 п. 9). A missing field is contract 1: the
+// field has been there since the first contract, so its absence cannot mean
+// anything newer.
+func CheckContract(st *State) error {
+	if st.Contract >= RequiredContract {
+		return nil
+	}
+	got := st.Contract
+	if got < 1 {
+		got = 1
+	}
+	return contractError{got: got}
+}
+
 // ErrMaterialNotRefreshed is RefreshMaterial's answer when the panel
 // answered but no new material could be accepted (its configs came back
 // stamped with another revision, or there is no host to ask for): the
@@ -657,6 +724,9 @@ func (p *Poller) RefreshMaterial(ctx context.Context) error {
 	}
 	st, err := cl.State(ctx)
 	if err := p.observe(ctx, set, err); err != nil {
+		return err
+	}
+	if err := p.noteContract(st); err != nil {
 		return err
 	}
 	subID := ""
@@ -1079,6 +1149,25 @@ func (p *Poller) clientFor(set *store.Settings) (Client, error) {
 		slog.Info("panel: client built", "url", set.PanelURL, "panelCa", roots != nil)
 	}
 	return p.client, nil
+}
+
+// noteContract records whether st comes from a panel speaking a new enough
+// contract, logging a refusal once per spell (the poll cycle's own error
+// repeats it every minute) and the recovery once.
+func (p *Poller) noteContract(st *State) error {
+	err := CheckContract(st)
+	p.mu.Lock()
+	was := p.contractErr
+	p.contractErr = err
+	p.mu.Unlock()
+	switch {
+	case err != nil && was == nil:
+		slog.Warn("panel: refusing the panel's monitoring contract, no targets are built", "err", err,
+			"contract", st.Contract, "panelVersion", st.PanelVersion)
+	case err == nil && was != nil:
+		slog.Info("panel: the panel speaks a supported monitoring contract again", "contract", st.Contract)
+	}
+	return err
 }
 
 // logUnconfigured says once, not every minute, that there is no panel to

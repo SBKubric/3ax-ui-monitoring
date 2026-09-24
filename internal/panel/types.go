@@ -15,6 +15,15 @@
 // is ignored, never rejected.
 package panel
 
+// RequiredContract is the lowest monitoring contract version mon-server can
+// work with (decision #80 п. 9). Contract 2 is the per-peer probe set: an
+// AWG probe peer per mon-client × path, handed out by GET /probe/configs as
+// one item per mon-client carrying its monClientId. A contract-1 panel
+// hands out one shared AWG peer that the paths and mon-clients steal from
+// each other, so mon-server refuses to build targets from it rather than
+// monitor with a probe that is guaranteed to fail on one side.
+const RequiredContract = 2
+
 // Inbound is one sanitised inbound from GET /state (contract §4.1): the
 // panel never sends settings, stream settings or keys here, only what
 // mon-server needs to name a target and show it to an operator. An AWG
@@ -89,12 +98,19 @@ type MonClientSnapshot struct {
 // normally empty — ensure is idempotent and only does work the first time
 // an inbound appears — and Present is the size of the probe set afterwards,
 // which an operator can compare against the inbound count.
+//
+// Unallocated (contract 2, decision #80 п. 10) lists the mon-clients the
+// panel could not give an AWG probe peer because its address pool is
+// exhausted. The ensure still succeeds; those mon-clients simply get no AWG
+// item from GET /probe/configs, and their AWG targets go PAUSED
+// no_probe_link. The field may be absent, which means none.
 type EnsureResult struct {
 	SubId       string       `json:"subId"`
 	Revision    string       `json:"revision"`
 	LastEnsured int64        `json:"lastEnsured"`
 	Created     []InboundRef `json:"created"`
 	Present     int          `json:"present"`
+	Unallocated []string     `json:"unallocated,omitempty"`
 }
 
 // ProbeItem is the material for one inbound on one path (contract §4.4):
@@ -102,12 +118,19 @@ type EnsureResult struct {
 // passes whichever it got through to the mon-client verbatim (spec §5) —
 // the panel has already applied the host override or the direct host, so
 // rewriting anything here would only introduce a way to get it wrong.
+//
+// MonClientId is set on AWG items only (contract 2, decision #80 п. 7): the
+// panel keeps one AWG probe peer per mon-client × path, so one path's
+// answer carries one AWG item per mon-client, and each one belongs to the
+// mon-client it names. xray items leave it empty: an xray probe account is
+// shared by every mon-client.
 type ProbeItem struct {
-	Kind      string `json:"kind"`
-	InboundId int    `json:"inboundId"`
-	Link      string `json:"link,omitempty"`
-	Filename  string `json:"filename,omitempty"`
-	Conf      string `json:"conf,omitempty"`
+	Kind        string `json:"kind"`
+	InboundId   int    `json:"inboundId"`
+	MonClientId string `json:"monClientId,omitempty"`
+	Link        string `json:"link,omitempty"`
+	Filename    string `json:"filename,omitempty"`
+	Conf        string `json:"conf,omitempty"`
 }
 
 // ProbeConfigs is the GET /probe/configs body (contract §4.4). Revision is

@@ -71,7 +71,7 @@ GET /v1/register/<requestId>
 }
 ```
 
-- mon-server собирает `targets` как `items` из `GET /probe/configs` (path `proxy`, только при `override.enabled`) и `GET /probe/configs?host=<real>` (path `direct`) панели × `paths` этого mon-client (default `[proxy, direct]`; для коробок во враждебных регионах владелец оставляет только `proxy`, чтобы не светить настоящий адрес real server как Reality-endpoint). Все inbound'ы — всем mon-clients; фильтра по inbound'ам в v1 нет.
+- mon-server собирает `targets` как `items` из `GET /probe/configs` (path `proxy`, только при `override.enabled`) и `GET /probe/configs?host=<real>` (path `direct`) панели × `paths` этого mon-client (default `[proxy, direct]`; для коробок во враждебных регионах владелец оставляет только `proxy`, чтобы не светить настоящий адрес real server как Reality-endpoint). Все inbound'ы — всем mon-clients; фильтра по inbound'ам в v1 нет. xray-ссылки общие, а AWG `.conf` у каждого mon-client свой (решение [#80](https://github.com/SBKubric/3ax-ui-monitoring/issues/80)): панель держит AWG probe-пир на mon-client × path, и mon-client получает только свой; wire-форма target'а от этого не меняется. Нет своего пира — нет AWG-target'а в конфиге (у mon-server он `PAUSED no_probe_link`).
 - `link`/`conf` отдаются **как есть**: mon-server прозрачен, знание протоколов (ссылка → xray-outbound, .conf → netstack-устройство) живёт только в mon-client. Выключенных inbound'ов в `targets` нет — mon-server сам держит их как `PAUSED`.
 - `probe`-параметры — из research: цикл 60 с, бюджет пробы 20 с, connect 5 с, TLS 10 с, заголовки 10 с, джиттер старта 0–5 с, heartbeat 10 с. Настраиваются в admin UI глобально; пороги state machine (3/2/4-за-30/15) mon-client не нужны и в конфиг не входят.
 

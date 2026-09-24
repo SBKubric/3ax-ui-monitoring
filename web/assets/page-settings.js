@@ -41,7 +41,7 @@
         probeFields: probeFields,
         tab: 'real',
         form: {},
-        status: { configured: false, reachable: false, unknownAuthority: false, polled: false, revision: '', inbounds: 0, override: { enabled: false, host: '' } },
+        status: { configured: false, reachable: false, unknownAuthority: false, contractError: '', polled: false, revision: '', inbounds: 0, override: { enabled: false, host: '' } },
         bootstrap: { listen: '', publicIp: '', dataDir: '', tlsMode: '', acmeCa: '', acmeDirectory: '', adminCommand: '', cert: null },
         busy: false,
         checking: false,
@@ -53,6 +53,7 @@
       statusLine: function () {
         if (!this.status.configured) { return 'Panel not configured yet — fill in the panel URL and the monitoring token, then Check.'; }
         if (this.status.unknownAuthority) { return '✗ Panel certificate not trusted (x509: unknown authority) — paste the panel\'s certificate into Panel CA.'; }
+        if (this.status.contractError) { return '✗ ' + this.status.contractError; }
         if (!this.status.polled) { return 'Panel not polled yet.'; }
         var line = (this.status.reachable ? '✓ Panel reachable' : '✗ Panel unreachable (PANEL_DOWN)');
         line += ' · revision ' + (this.status.revision || '—');
