@@ -180,6 +180,7 @@ func (h *Handler) panelStatus(c *gin.Context, set *store.Settings) gin.H {
 		"configured":       set.PanelURL != "" && set.MonToken != "",
 		"reachable":        false,
 		"unknownAuthority": false,
+		"contractError":    "",
 		"polled":           false,
 		"revision":         "",
 		"inbounds":         0,
@@ -194,6 +195,9 @@ func (h *Handler) panelStatus(c *gin.Context, set *store.Settings) gin.H {
 	// "unreachable" (or "not polled yet", which is all a panel that has
 	// never passed the handshake would otherwise show).
 	status["unknownAuthority"] = h.deps.Poller.UnknownAuthority()
+	// Decision #80 п. 9: a panel on an older contract is reachable and
+	// answering, yet nothing gets built from it; the line names the cure.
+	status["contractError"] = h.deps.Poller.ContractError()
 
 	material, have := h.deps.Poller.Material()
 	if !have {
@@ -389,6 +393,14 @@ func (h *Handler) checkPanel(c *gin.Context) {
 			return
 		}
 		fail(c, http.StatusBadGateway, "The panel did not answer: "+err.Error())
+		return
+	}
+
+	// Decision #80 п. 9: a panel on an older contract answers, but the
+	// poller would build no targets from it — which is the answer Check
+	// owes, before any probe config is read.
+	if err := panel.CheckContract(st); err != nil {
+		fail(c, http.StatusBadGateway, err.Error())
 		return
 	}
 

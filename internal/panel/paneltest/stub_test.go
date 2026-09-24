@@ -61,7 +61,8 @@ func do(t *testing.T, s *paneltest.Stub, method, route, token string, body any) 
 // contract §4.2's formula, computed here independently: the first 16 hex of
 // the SHA-256 of the canonical JSON with sorted keys, no whitespace,
 // inbounds sorted by (kind, inboundId) and reduced to the fields that affect
-// targets. Every other test that asserts "the revision changed" is only
+// targets, plus the probe material (contract 2: no items programmed here, so
+// an empty object). Every other test that asserts "the revision changed" is only
 // meaningful because this one holds.
 func TestStub_RevisionMatchesContractFormula(t *testing.T) {
 	s := paneltest.NewStub(t)
@@ -73,6 +74,7 @@ func TestStub_RevisionMatchesContractFormula(t *testing.T) {
 	canonical := `{"inbounds":[` +
 		`{"enable":true,"inboundId":0,"kind":"awg","port":51820,"protocol":"awg"},` +
 		`{"enable":true,"inboundId":12,"kind":"xray","port":443,"protocol":"vless"}],` +
+		`"items":{},` +
 		`"override":{"enabled":true,"host":"front.example.net"},` +
 		`"probeSubId":"k3j9d8s7f6g5h4j3"}`
 	sum := sha256.Sum256([]byte(canonical))
@@ -83,6 +85,22 @@ func TestStub_RevisionMatchesContractFormula(t *testing.T) {
 	}
 	if len(want) != 16 {
 		t.Fatalf("revision length = %d, want 16 (contract §4.2)", len(want))
+	}
+}
+
+// TestStub_RevisionCoversProbePeers checks contract 2's revision rule
+// (decision #80 п. 8): the probe material is part of the revision, so a new
+// AWG probe peer — another mon-client's item on a path — moves it, and
+// mon-server re-reads the configs.
+func TestStub_RevisionCoversProbePeers(t *testing.T) {
+	s := paneltest.NewStub(t)
+	s.SetInbounds(contractInbounds())
+	s.SetItems("direct", []panel.ProbeItem{paneltest.AwgItem("ams-1", "conf-a")})
+	before := s.Revision()
+
+	s.SetItems("direct", []panel.ProbeItem{paneltest.AwgItem("ams-1", "conf-a"), paneltest.AwgItem("fra-1", "conf-b")})
+	if after := s.Revision(); after == before {
+		t.Fatal("revision did not change when a probe peer was added")
 	}
 }
 
@@ -144,7 +162,8 @@ func TestStub_BareNotFoundWithoutToken(t *testing.T) {
 }
 
 // TestStub_StateCarriesContractHeader checks contract §1: every successful
-// answer announces X-Mon-Contract: 1, and GET /state repeats it in the body.
+// answer announces X-Mon-Contract, 2 by default (decision #80 п. 9), and
+// GET /state repeats it in the body.
 func TestStub_StateCarriesContractHeader(t *testing.T) {
 	s := paneltest.NewStub(t)
 	s.SetInbounds(contractInbounds())
@@ -153,16 +172,16 @@ func TestStub_StateCarriesContractHeader(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
-	if got := resp.Header.Get("X-Mon-Contract"); got != "1" {
-		t.Fatalf("X-Mon-Contract = %q, want \"1\"", got)
+	if got := resp.Header.Get("X-Mon-Contract"); got != "2" {
+		t.Fatalf("X-Mon-Contract = %q, want \"2\"", got)
 	}
 
 	var st panel.State
 	if err := json.Unmarshal(body, &st); err != nil {
 		t.Fatalf("decode state: %v", err)
 	}
-	if st.Contract != 1 {
-		t.Fatalf("state.contract = %d, want 1", st.Contract)
+	if st.Contract != 2 {
+		t.Fatalf("state.contract = %d, want 2", st.Contract)
 	}
 	if st.Revision != s.Revision() {
 		t.Fatalf("state.revision = %q, want %q", st.Revision, s.Revision())
@@ -226,6 +245,59 @@ func TestStub_EnsureAllocatesSubIDAndRecordsSnapshot(t *testing.T) {
 	ensured := s.Ensured()
 	if len(ensured) != 1 || len(ensured[0]) != 1 || ensured[0][0].Id != "ams-1" {
 		t.Fatalf("Ensured() = %+v, want the one snapshot that was sent", ensured)
+	}
+}
+
+// TestStub_ContractTwoShapes checks the wire shapes of contract 2 (decision
+// #80 п. 7, 9, 10): AWG items carry their mon-client's id and xray items do
+// not, ensure names the mon-clients left without a peer, and SetContract
+// turns the stub into an older panel on both the header and /state.
+func TestStub_ContractTwoShapes(t *testing.T) {
+	s := paneltest.NewStub(t)
+	s.SetInbounds(contractInbounds())
+	s.SetItems("direct", []panel.ProbeItem{
+		{Kind: "xray", InboundId: 12, Link: "vless://x@real:443"},
+		paneltest.AwgItem("ams-1", "[Interface]\n"),
+	})
+	s.SetUnallocated([]string{"fra-1"})
+
+	resp, body := do(t, s, http.MethodPost, "/probe/ensure", s.Token(),
+		map[string]any{"monClients": []panel.MonClientSnapshot{{Id: "ams-1"}, {Id: "fra-1"}}})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("ensure status = %d, want 200", resp.StatusCode)
+	}
+	if !strings.Contains(string(body), `"unallocated":["fra-1"]`) {
+		t.Fatalf("ensure body = %s, want unallocated [fra-1]", body)
+	}
+
+	_, body = do(t, s, http.MethodGet, "/probe/configs?host=real", s.Token(), nil)
+	var raw struct {
+		Items []map[string]any `json:"items"`
+	}
+	if err := json.Unmarshal(body, &raw); err != nil {
+		t.Fatalf("decode configs: %v", err)
+	}
+	if len(raw.Items) != 2 {
+		t.Fatalf("items = %s, want 2", body)
+	}
+	if _, has := raw.Items[0]["monClientId"]; has {
+		t.Fatalf("xray item carries monClientId: %v", raw.Items[0])
+	}
+	if raw.Items[1]["monClientId"] != "ams-1" {
+		t.Fatalf("awg item monClientId = %v, want ams-1", raw.Items[1]["monClientId"])
+	}
+
+	s.SetContract(1)
+	resp, body = do(t, s, http.MethodGet, "/state", s.Token(), nil)
+	if got := resp.Header.Get("X-Mon-Contract"); got != "1" {
+		t.Fatalf("X-Mon-Contract = %q, want \"1\"", got)
+	}
+	var st panel.State
+	if err := json.Unmarshal(body, &st); err != nil {
+		t.Fatalf("decode state: %v", err)
+	}
+	if st.Contract != 1 {
+		t.Fatalf("state.contract = %d, want 1", st.Contract)
 	}
 }
 

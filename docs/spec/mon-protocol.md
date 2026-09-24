@@ -37,7 +37,7 @@ GET /v1/register/<requestId>
 → 410 request_expired
 ```
 
-- В admin UI администратор видит IP, hostname, версию и pairing code, сверяет код с логом коробки, вводит `name` и `region`, выбирает paths и жмёт **Approve** — либо **Approve as replacement** для существующего mon-client (id, история, paths сохраняются, старый client token отзывается). `monClientId` — slug из `name` (`ams-1`), уникален, ≤ 64 символов `[A-Za-z0-9_.-]` (форма контракта панели).
+- В admin UI администратор видит IP, hostname, версию и pairing code, сверяет код с логом коробки, вводит `name` и `region`, выбирает paths и жмёт **Approve** — либо **Approve as replacement** для существующего mon-client (id, история, paths сохраняются, старый client token отзывается). `monClientId` — slug из `name` (`ams-1`), уникален, ≤ 32 символов `[A-Za-z0-9_-]` (из него панель называет AWG probe-пиры, решение [#80](https://github.com/SBKubric/3ax-ui-monitoring/issues/80)).
 - Одобренная заявка отдаёт `token` один раз; mon-client сохраняет `monClientId` + `token` в state-файл (`/var/lib/mon-client/state.json`, 0600) и больше `/register` не зовёт.
 - Запись реестра появляется при одобрении в состоянии `ONLINE`/`OFFLINE` по первому heartbeat (до него — `never seen`).
 
@@ -71,7 +71,7 @@ GET /v1/register/<requestId>
 }
 ```
 
-- mon-server собирает `targets` как `items` из `GET /probe/configs` (path `proxy`, только при `override.enabled`) и `GET /probe/configs?host=<real>` (path `direct`) панели × `paths` этого mon-client (default `[proxy, direct]`; для коробок во враждебных регионах владелец оставляет только `proxy`, чтобы не светить настоящий адрес real server как Reality-endpoint). Все inbound'ы — всем mon-clients; фильтра по inbound'ам в v1 нет.
+- mon-server собирает `targets` как `items` из `GET /probe/configs` (path `proxy`, только при `override.enabled`) и `GET /probe/configs?host=<real>` (path `direct`) панели × `paths` этого mon-client (default `[proxy, direct]`; для коробок во враждебных регионах владелец оставляет только `proxy`, чтобы не светить настоящий адрес real server как Reality-endpoint). Все inbound'ы — всем mon-clients; фильтра по inbound'ам в v1 нет. xray-ссылки общие, а AWG `.conf` у каждого mon-client свой (решение [#80](https://github.com/SBKubric/3ax-ui-monitoring/issues/80)): панель держит AWG probe-пир на mon-client × path, и mon-client получает только свой; wire-форма target'а от этого не меняется. Нет своего пира — нет AWG-target'а в конфиге (у mon-server он `PAUSED no_probe_link`).
 - `link`/`conf` отдаются **как есть**: mon-server прозрачен, знание протоколов (ссылка → xray-outbound, .conf → netstack-устройство) живёт только в mon-client. Выключенных inbound'ов в `targets` нет — mon-server сам держит их как `PAUSED`.
 - `probe`-параметры — из research: цикл 60 с, бюджет пробы 20 с, connect 5 с, TLS 10 с, заголовки 10 с, джиттер старта 0–5 с, heartbeat 10 с. Настраиваются в admin UI глобально; пороги state machine (3/2/4-за-30/15) mon-client не нужны и в конфиг не входят.
 

@@ -30,9 +30,11 @@ const (
 	// on every successful answer (contract §1). A different value means the
 	// panel is speaking a version this client was not written against;
 	// compatible changes never bump it, so mismatch is a warning, not a
-	// refusal.
+	// refusal. The refusal lives on GET /state's contract field instead
+	// (CheckContract, decision #80 п. 9), which is where the poller looks
+	// before building anything.
 	contractHeader  = "X-Mon-Contract"
-	contractVersion = "1"
+	contractVersion = "2"
 
 	// requestTimeout bounds one attempt end to end (spec §4: "таймаут 10
 	// с"). It bounds a single HTTP round trip, nothing more: a poll cycle

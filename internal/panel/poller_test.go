@@ -1395,3 +1395,109 @@ func TestRefreshMaterial_UnconfiguredPanelSaysSo(t *testing.T) {
 		t.Fatalf("RebuildAll called %d times, want 0", h.configs.calls())
 	}
 }
+
+// TestPoll_ContractOneIsRefused is decision #80 п. 9: a panel on contract 1
+// (or one whose /state has no contract at all) hands out one shared AWG
+// probe peer, so mon-server builds nothing from it — no ensure, no inbound
+// sync, no probe configs, no rebuild — and says why, in the cycle's error
+// and in ContractError for the Settings page. The outbox is still drained,
+// the panel is not declared down, and a panel that is updated is picked up
+// on the next cycle.
+func TestPoll_ContractOneIsRefused(t *testing.T) {
+	const want = "panel speaks monitoring contract 1, mon-server needs 2 — update the panel"
+	for _, contract := range []int{1, 0} {
+		t.Run(fmt.Sprintf("contract %d", contract), func(t *testing.T) {
+			h := newHarness(t)
+			h.stub.SetContract(contract)
+			ids := h.seedEvents(t, 2, clock.Ms(testTime))
+			ctx := context.Background()
+
+			err := h.poller.Poll(ctx)
+			if !errors.Is(err, panel.ErrContractTooOld) || err.Error() != want {
+				t.Fatalf("Poll = %v, want ErrContractTooOld %q", err, want)
+			}
+			if got := h.poller.ContractError(); got != want {
+				t.Fatalf("ContractError() = %q, want %q", got, want)
+			}
+			for _, r := range h.stub.Requests() {
+				if strings.HasSuffix(r.Path, "/probe/ensure") || strings.HasSuffix(r.Path, "/probe/configs") {
+					t.Fatalf("refused panel was asked %s %s", r.Method, r.Path)
+				}
+			}
+			if _, ok := h.poller.Material(); ok {
+				t.Fatal("material accepted from a contract-1 panel")
+			}
+			if h.configs.calls() != 0 || len(h.inbounds.calls()) != 0 {
+				t.Fatalf("rebuilds=%d inbound syncs=%d, want none", h.configs.calls(), len(h.inbounds.calls()))
+			}
+			if h.poller.PanelDown() {
+				t.Fatal("a refused contract declared PANEL_DOWN; the panel answered")
+			}
+			if got := len(h.stub.Events()); got != len(ids) {
+				t.Fatalf("panel received %d events, want the outbox drained (%d)", got, len(ids))
+			}
+
+			// RefreshMaterial (Settings Save) refuses the same way.
+			if err := h.poller.RefreshMaterial(ctx); !errors.Is(err, panel.ErrContractTooOld) {
+				t.Fatalf("RefreshMaterial = %v, want ErrContractTooOld", err)
+			}
+
+			// The panel is updated: the next cycle builds as usual.
+			h.stub.SetContract(panel.RequiredContract)
+			if err := h.poller.Poll(ctx); err != nil {
+				t.Fatalf("Poll after the update: %v", err)
+			}
+			if got := h.poller.ContractError(); got != "" {
+				t.Fatalf("ContractError() = %q after the update, want empty", got)
+			}
+			if _, ok := h.poller.Material(); !ok || h.configs.calls() != 1 {
+				t.Fatalf("material/rebuilds after the update = %v/%d, want accepted and one rebuild", ok, h.configs.calls())
+			}
+		})
+	}
+}
+
+// TestPoll_ContractTwoPerClientAwgItems runs a contract-2 panel through the
+// cycle: the AWG items of several mon-clients come back each with its
+// monClientId, a peer set change moves the revision and is re-read, and an
+// ensure that lists unallocated mon-clients is an ordinary success.
+func TestPoll_ContractTwoPerClientAwgItems(t *testing.T) {
+	h := newHarness(t)
+	h.stub.SetInbounds([]panel.Inbound{
+		{Kind: "xray", InboundId: 12, Protocol: "vless", Port: 443, Enable: true},
+		{Kind: "awg", InboundId: 0, Protocol: "awg", Port: 51820, Enable: true},
+	})
+	h.stub.SetItems("direct", []panel.ProbeItem{
+		{Kind: "xray", InboundId: 12, Link: "vless://direct"},
+		paneltest.AwgItem("ams-1", "conf ams-1"),
+	})
+	h.stub.SetUnallocated([]string{"fra-1"})
+	ctx := context.Background()
+
+	if err := h.poller.Poll(ctx); err != nil {
+		t.Fatalf("Poll: %v", err)
+	}
+	mat, _ := h.poller.Material()
+	if len(mat.Direct) != 2 || mat.Direct[1].MonClientId != "ams-1" || mat.Direct[1].Conf != "conf ams-1" || mat.Direct[0].MonClientId != "" {
+		t.Fatalf("direct items = %+v, want the shared xray item and ams-1's AWG item", mat.Direct)
+	}
+
+	// The panel allocates fra-1 a peer: the peer set is part of the
+	// revision, so the configs are re-read and rebuilt.
+	h.stub.SetUnallocated(nil)
+	h.stub.SetItems("direct", []panel.ProbeItem{
+		{Kind: "xray", InboundId: 12, Link: "vless://direct"},
+		paneltest.AwgItem("ams-1", "conf ams-1"),
+		paneltest.AwgItem("fra-1", "conf fra-1"),
+	})
+	if err := h.poller.Poll(ctx); err != nil {
+		t.Fatalf("Poll: %v", err)
+	}
+	mat, _ = h.poller.Material()
+	if len(mat.Direct) != 3 || mat.Direct[2].MonClientId != "fra-1" {
+		t.Fatalf("direct items = %+v, want fra-1's AWG item too", mat.Direct)
+	}
+	if h.configs.calls() != 2 {
+		t.Fatalf("RebuildAll called %d times, want 2", h.configs.calls())
+	}
+}

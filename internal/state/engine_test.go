@@ -1304,3 +1304,108 @@ func TestHeartbeat_RejectedNewTargetGetsARow(t *testing.T) {
 		t.Fatalf("target events = %+v, want one UNKNOWN → PAUSED", paused)
 	}
 }
+
+// awgExclusions is excluding with the AWG server (awg:0) enabled as well.
+func awgExclusions(override bool, paths ...string) registry.Exclusions {
+	x := excluding(override, paths...)
+	x.Inbounds[registry.TargetKey{InboundKind: store.InboundKindAwg, InboundID: 0}] = true
+	return x
+}
+
+// TestHeartbeat_MissingAwgProbePeerIsPausedNoProbeLink is decision #80
+// п. 10: the panel gave this mon-client no AWG probe peer on a path (its
+// address pool is exhausted, or ensure has not reached it yet), so the AWG
+// target is missing from the config and has never produced a result. It
+// still gets a row, PAUSED no_probe_link, so the operator sees it; once the
+// item appears the target is released like any config pause.
+func TestHeartbeat_MissingAwgProbePeerIsPausedNoProbeLink(t *testing.T) {
+	awgProxy := registry.TargetKey{InboundKind: store.InboundKindAwg, InboundID: 0, Path: store.PathProxy}
+	awgDirect := registry.TargetKey{InboundKind: store.InboundKindAwg, InboundID: 0, Path: store.PathDirect}
+
+	f := newFixture(t)
+	// panel_inbounds is where the real builder's Exclusions come from, and
+	// what keeps a PAUSED row from being retired as "inbound gone".
+	f.saveInbound(store.InboundKindXray, 12, true)
+	f.saveInbound(store.InboundKindAwg, 0, true)
+	f.cfg.keys = []registry.TargetKey{keyProxy, keyDirect, awgDirect}
+	f.cfg.excl = awgExclusions(true, store.PathProxy, store.PathDirect)
+	f.clk.Advance(time.Minute)
+	f.beat(f.cycle(1, result(keyProxy, true, ""), result(keyDirect, true, ""), result(awgDirect, true, "")))
+
+	if got := f.targetState(awgProxy); got.State != store.TargetPaused || got.Reason != ReasonNoProbeLink {
+		t.Fatalf("awg proxy target = %s/%s, want PAUSED/no_probe_link", got.State, got.Reason)
+	}
+	if got := f.targetState(awgDirect); got.State != store.TargetUp {
+		t.Fatalf("awg direct target = %s, want UP: it has its own item", got.State)
+	}
+	var paused []store.EventPayload
+	for _, ev := range f.events() {
+		if ev.Kind == eventKindTarget && ev.To == store.TargetPaused {
+			paused = append(paused, ev)
+		}
+	}
+	if len(paused) != 1 || paused[0].InboundKind != store.InboundKindAwg || paused[0].Path != store.PathProxy ||
+		paused[0].From != store.TargetUnknown || paused[0].Reason != ReasonNoProbeLink || paused[0].Notified {
+		t.Fatalf("pause events = %+v, want one un-notified UNKNOWN → PAUSED no_probe_link for awg:0 proxy", paused)
+	}
+
+	// Still missing: nothing more is filed.
+	before := len(f.events())
+	f.clk.Advance(time.Minute)
+	f.beat(f.cycle(2))
+	if evs := f.events(); len(evs) != before {
+		t.Fatalf("a second heartbeat filed %d more events, want none: %+v", len(evs)-before, evs[before:])
+	}
+
+	// The panel allocates the peer: the item appears, the target is
+	// released, and its first result decides.
+	f.cfg.keys = []registry.TargetKey{keyProxy, keyDirect, awgProxy, awgDirect}
+	f.clk.Advance(time.Minute)
+	f.beat(f.cycle(3))
+	if got := f.targetState(awgProxy); got.State != store.TargetUnknown || got.Reason != ReasonConfigEnabled {
+		t.Fatalf("awg proxy target = %s/%s, want UNKNOWN/config_enabled once its item appears", got.State, got.Reason)
+	}
+	f.clk.Advance(time.Minute)
+	f.beat(f.cycle(4, result(awgProxy, true, "")))
+	if got := f.targetState(awgProxy); got.State != store.TargetUp {
+		t.Fatalf("awg proxy target = %s, want UP after the first result", got.State)
+	}
+}
+
+// TestHeartbeat_MissingAwgRowOnlyWhereAPeerIsOwed: no row is invented for
+// an AWG target the mon-client is not owed — the AWG server disabled (that
+// is SyncInbounds' config_disabled), the proxy path while the override is
+// off, a path the mon-client does not probe — nor before anything is known
+// about the panel.
+func TestHeartbeat_MissingAwgRowOnlyWhereAPeerIsOwed(t *testing.T) {
+	disabled := awgExclusions(true, store.PathProxy, store.PathDirect)
+	disabled.Inbounds[registry.TargetKey{InboundKind: store.InboundKindAwg, InboundID: 0}] = false
+
+	cases := []struct {
+		name string
+		excl registry.Exclusions
+	}{
+		{"awg server disabled", disabled},
+		{"override off, proxy only", awgExclusions(false, store.PathProxy)},
+		{"nothing known yet", registry.Exclusions{}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			f.cfg.keys = []registry.TargetKey{keyProxy, keyDirect}
+			f.cfg.excl = tc.excl
+			f.clk.Advance(time.Minute)
+			f.beat(f.cycle(1))
+
+			var n int64
+			if err := f.st.DB.Model(&store.Target{}).
+				Where("mon_client_id = ? AND inbound_kind = ?", f.mc.Id, store.InboundKindAwg).
+				Count(&n).Error; err != nil {
+				t.Fatalf("count targets: %v", err)
+			}
+			if n != 0 {
+				t.Fatalf("%d awg target rows, want none", n)
+			}
+		})
+	}
+}

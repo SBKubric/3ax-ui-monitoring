@@ -33,7 +33,9 @@ func (f *fakeMaterial) Material() (panel.Material, bool) { return f.m, f.ok }
 
 // sampleMaterial is one panel revision with one xray inbound and one AWG
 // one on both paths, the smallest material that exercises every rule in
-// spec §5 (two kinds, two paths, an override).
+// spec §5 (two kinds, two paths, an override). The AWG server has a probe
+// peer per mon-client × path (contract 2, decision #80): ams-1 and fra-1
+// each have their own item, with a conf that names its owner.
 func sampleMaterial() panel.Material {
 	return panel.Material{
 		Revision:   "rev-1",
@@ -41,11 +43,13 @@ func sampleMaterial() panel.Material {
 		ProbeSubID: "sub-1",
 		Proxy: []panel.ProbeItem{
 			{Kind: store.InboundKindXray, InboundId: 12, Link: "vless://probe@front.example.net:443#probe-12"},
-			{Kind: store.InboundKindAwg, InboundId: 0, Filename: "probe.conf", Conf: "[Peer]\nEndpoint = front.example.net:51820\n"},
+			{Kind: store.InboundKindAwg, InboundId: 0, MonClientId: "ams-1", Filename: "probe.conf", Conf: "[Peer]\nEndpoint = front.example.net:51820\n"},
+			{Kind: store.InboundKindAwg, InboundId: 0, MonClientId: "fra-1", Filename: "probe.conf", Conf: "# fra-1 proxy\n[Peer]\nEndpoint = front.example.net:51820\n"},
 		},
 		Direct: []panel.ProbeItem{
 			{Kind: store.InboundKindXray, InboundId: 12, Link: "vless://probe@real.example.net:443#probe-12"},
-			{Kind: store.InboundKindAwg, InboundId: 0, Filename: "probe.conf", Conf: "[Peer]\nEndpoint = real.example.net:51820\n"},
+			{Kind: store.InboundKindAwg, InboundId: 0, MonClientId: "ams-1", Filename: "probe.conf", Conf: "[Peer]\nEndpoint = real.example.net:51820\n"},
+			{Kind: store.InboundKindAwg, InboundId: 0, MonClientId: "fra-1", Filename: "probe.conf", Conf: "# fra-1 direct\n[Peer]\nEndpoint = real.example.net:51820\n"},
 		},
 	}
 }
@@ -335,7 +339,7 @@ func TestRevision_ChangesWith(t *testing.T) {
 				m.Revision = "rev-2"
 				m.Direct = []panel.ProbeItem{
 					{Kind: store.InboundKindXray, InboundId: 12, Link: "vless://probe@other.example.net:443#probe-12"},
-					{Kind: store.InboundKindAwg, InboundId: 0, Conf: "[Peer]\nEndpoint = other.example.net:51820\n"},
+					{Kind: store.InboundKindAwg, InboundId: 0, MonClientId: "ams-1", Conf: "[Peer]\nEndpoint = other.example.net:51820\n"},
 				}
 				mat.m = m
 			},
@@ -643,4 +647,122 @@ func TestExclusions_Reason(t *testing.T) {
 			t.Fatalf("Reason without material = %q, want empty", got)
 		}
 	})
+}
+
+// TestRebuild_AwgItemsArePerMonClient is decision #80 п. 1, 7: xray items
+// are shared by every mon-client, but an AWG item is one mon-client's probe
+// peer on that path, so each document carries only its own mon-client's
+// AWG conf. A mon-client with no item (the panel's pool is exhausted) gets
+// no AWG target at all, and an AWG item naming nobody — the shared peer of
+// a contract-1 panel — goes to nobody.
+func TestRebuild_AwgItemsArePerMonClient(t *testing.T) {
+	b, r, _, clk, mat := newTestBuilder(t)
+	m := mat.m
+	m.Direct = append(append([]panel.ProbeItem(nil), m.Direct...),
+		panel.ProbeItem{Kind: store.InboundKindAwg, InboundId: 0, Conf: "shared peer of an old panel"})
+	mat.m = m
+
+	ams := approve(t, r, clk, "ams-1", nil)
+	fra := approve(t, r, clk, "fra-1", nil)
+	waw := approve(t, r, clk, "waw-1", nil)
+	if err := b.RebuildAll(context.Background()); err != nil {
+		t.Fatalf("RebuildAll: %v", err)
+	}
+
+	confs := func(doc *ConfigDoc) map[string]string {
+		out := map[string]string{}
+		for _, tgt := range doc.Targets {
+			if tgt.InboundKind == store.InboundKindAwg {
+				out[tgt.Path] = tgt.Conf
+			}
+		}
+		return out
+	}
+	links := func(doc *ConfigDoc) map[string]string {
+		out := map[string]string{}
+		for _, tgt := range doc.Targets {
+			if tgt.InboundKind == store.InboundKindXray {
+				out[tgt.Path] = tgt.Link
+			}
+		}
+		return out
+	}
+
+	amsDoc, fraDoc, wawDoc := mustCurrent(t, b, ams.Id), mustCurrent(t, b, fra.Id), mustCurrent(t, b, waw.Id)
+
+	if got := confs(amsDoc); got[store.PathProxy] != "[Peer]\nEndpoint = front.example.net:51820\n" ||
+		got[store.PathDirect] != "[Peer]\nEndpoint = real.example.net:51820\n" || len(got) != 2 {
+		t.Errorf("ams-1 awg confs = %q, want its own proxy and direct confs only", got)
+	}
+	if got := confs(fraDoc); got[store.PathProxy] != "# fra-1 proxy\n[Peer]\nEndpoint = front.example.net:51820\n" ||
+		got[store.PathDirect] != "# fra-1 direct\n[Peer]\nEndpoint = real.example.net:51820\n" || len(got) != 2 {
+		t.Errorf("fra-1 awg confs = %q, want its own proxy and direct confs only", got)
+	}
+	if got := confs(wawDoc); len(got) != 0 {
+		t.Errorf("waw-1 awg confs = %q, want none: the panel gave it no peer", got)
+	}
+	if got := keysOf(wawDoc); strings.Join(got, ",") != "xray:12/direct,xray:12/proxy" {
+		t.Errorf("waw-1 targets = %v, want the shared xray targets only", got)
+	}
+
+	for _, doc := range []*ConfigDoc{fraDoc, wawDoc} {
+		if got, want := links(doc), links(amsDoc); len(got) != 2 || got[store.PathProxy] != want[store.PathProxy] || got[store.PathDirect] != want[store.PathDirect] {
+			t.Errorf("%s xray links = %q, want the shared %q", doc.MonClientID, got, want)
+		}
+	}
+	if amsDoc.ConfigRevision == fraDoc.ConfigRevision {
+		t.Error("ams-1 and fra-1 share a config revision, want different documents")
+	}
+}
+
+// TestExclusions_ExpectedAwgTargets checks what the state engine asks of
+// the builder for decision #80 п. 10: the AWG targets a mon-client is owed
+// by the panel's state — enabled AWG servers × its paths, proxy only with
+// the override on — whether or not its document has them.
+func TestExclusions_ExpectedAwgTargets(t *testing.T) {
+	b, r, st, clk, mat := newTestBuilder(t)
+	waw := approve(t, r, clk, "waw-1", nil)
+	hostile := approve(t, r, clk, "hostile-1", []string{store.PathProxy})
+
+	render := func(keys []TargetKey) string {
+		out := make([]string, 0, len(keys))
+		for _, k := range keys {
+			out = append(out, k.InboundKind+":"+strconv.Itoa(k.InboundID)+"/"+k.Path)
+		}
+		return strings.Join(out, ",")
+	}
+	expected := func(id string) string {
+		t.Helper()
+		x, err := b.Exclusions(context.Background(), id)
+		if err != nil {
+			t.Fatalf("Exclusions(%s): %v", id, err)
+		}
+		return render(x.Expected(store.InboundKindAwg))
+	}
+
+	if got := expected(waw.Id); got != "awg:0/direct,awg:0/proxy" {
+		t.Errorf("waw-1 expects %q, want both paths", got)
+	}
+	if got := expected(hostile.Id); got != "awg:0/proxy" {
+		t.Errorf("hostile-1 expects %q, want its one path", got)
+	}
+
+	m := mat.m
+	m.Override = panel.Override{}
+	mat.m = m
+	if got := expected(waw.Id); got != "awg:0/direct" {
+		t.Errorf("override off: waw-1 expects %q, want direct only", got)
+	}
+
+	savePanelInbound(t, st, store.PanelInbound{
+		InboundKind: store.InboundKindAwg, InboundId: 0, Protocol: "awg", Port: 51820, Remark: "AWG", Enable: false,
+	})
+	if got := expected(waw.Id); got != "" {
+		t.Errorf("awg server disabled: waw-1 expects %q, want nothing", got)
+	}
+
+	mat.ok = false
+	if got := expected(waw.Id); got != "" {
+		t.Errorf("no material: waw-1 expects %q, want nothing", got)
+	}
 }

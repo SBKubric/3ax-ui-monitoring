@@ -2,7 +2,7 @@
 <section class="card tight hd">
   <a-button type="primary" :loading="busy" data-testid="settings-save" @click="save">Save</a-button>
   <span class="sp"></span>
-  <span class="alert" :class="status.reachable ? 'ok' : 'err'" data-testid="settings-status">[[ statusLine ]]</span>
+  <span class="alert" :class="status.reachable && !status.contractError ? 'ok' : 'err'" data-testid="settings-status">[[ statusLine ]]</span>
 </section>
 
 <section class="card">

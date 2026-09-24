@@ -13,7 +13,14 @@
 // checked against the contract's dictionary — from/to per kind, the path
 // grammar — and answered element by element (decision #50), so a value
 // mon-server must never send (a mon_client transition from NEVER) fails a
-// test instead of a production panel. It is deliberately lax about
+// test instead of a production panel.
+//
+// It speaks contract 2 by default (decision #80): AWG items carry the
+// monClientId of the mon-client whose probe peer they are, xray items do
+// not, the revision covers the probe material as well as the state, and
+// ensure may name the mon-clients left without a peer (unallocated).
+// SetContract(1) turns it into an older panel for the refusal tests. It is
+// deliberately lax about
 // everything else — it does not create probe accounts, it does not check
 // reasons, ids or timestamps — because those are the panel's job, not what
 // mon-server's tests need to pin.
@@ -63,6 +70,10 @@ const (
 	maxEvents     = 1000
 	maxStats      = 2000
 	maxMonClients = 200
+
+	// contract is the monitoring contract the stub speaks unless a test
+	// says otherwise (SetContract).
+	contract = panel.RequiredContract
 
 	// staleThresholdMinutes is what the stub reports in /state's stale
 	// block (contract §5: monStaleMinutes defaults to 15). mon-server does
@@ -123,12 +134,14 @@ type Stub struct {
 	mu sync.Mutex
 
 	monEnabled bool
+	contract   int
 	inbounds   []panel.Inbound
 	override   panel.Override
 	probeSubID *string
 
 	lastEnsured int64
 	items       map[string][]panel.ProbeItem
+	unallocated []string
 	configsRev  string // forced revision for /probe/configs; "" = the real one
 
 	requests   []RecordedRequest
@@ -188,6 +201,7 @@ func (s *Stub) CertPEM() string {
 func newStub() *Stub {
 	return &Stub{
 		monEnabled: true,
+		contract:   contract,
 		items:      map[string][]panel.ProbeItem{},
 		failRoutes: map[string]routeFailure{},
 		eventIDs:   map[string]struct{}{},
@@ -244,6 +258,38 @@ func (s *Stub) SetItems(path string, items []panel.ProbeItem) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.items[path] = append([]panel.ProbeItem(nil), items...)
+}
+
+// SetContract sets the contract version the stub announces, in the
+// X-Mon-Contract header and in GET /state's contract field. 0 stands in
+// for a /state without the field: mon-server decodes both the same way.
+func (s *Stub) SetContract(v int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.contract = v
+}
+
+// SetUnallocated programs the mon-clients POST /probe/ensure reports as
+// left without an AWG probe peer (decision #80 п. 10: the panel's address
+// pool is exhausted). The stub does not drop their items itself: a test
+// programs the items it wants with SetItems, as for every other answer.
+func (s *Stub) SetUnallocated(ids []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.unallocated = append([]string(nil), ids...)
+}
+
+// AwgItem is one path's AWG item for one mon-client, the contract-2 shape
+// (decision #80 п. 7): kind awg, inbound 0, and the monClientId whose peer
+// it is.
+func AwgItem(monClientID, conf string) panel.ProbeItem {
+	return panel.ProbeItem{
+		Kind:        store.InboundKindAwg,
+		InboundId:   0,
+		MonClientId: monClientID,
+		Filename:    "probe-awg-" + monClientID + ".conf",
+		Conf:        conf,
+	}
 }
 
 // SetConfigsRevision forces GET /probe/configs to answer with a revision
@@ -412,10 +458,14 @@ func (s *Stub) Ensured() [][]panel.MonClientSnapshot {
 // revisionLocked implements contract §4.2: the first 16 hex characters of
 // the SHA-256 of the canonical JSON (keys sorted, no whitespace) of the
 // override, the inbounds sorted by (kind, inboundId) with only the fields
-// that affect targets, and the probe subId. Marshalling maps rather than
-// structs is what makes it canonical — encoding/json sorts map keys and
-// emits no spaces — and remark/tag are left out so that renaming an inbound
-// does not rebuild every mon-client's config.
+// that affect targets, the probe subId and — contract 2 (decision #80
+// п. 8, SBKubric/3ax-ui-proxy#117) — the probe material itself, the
+// programmed items of every path, which is where the set of AWG probe
+// peers shows. Marshalling maps rather than structs is what makes it
+// canonical — encoding/json sorts map keys and emits no spaces — and
+// remark/tag are left out so that renaming an inbound does not rebuild
+// every mon-client's config. mon-server treats the revision as opaque, so
+// the stub only has to move it exactly when something it serves moves.
 func (s *Stub) revisionLocked() string {
 	sorted := append([]panel.Inbound(nil), s.inbounds...)
 	sort.Slice(sorted, func(i, j int) bool {
@@ -445,6 +495,7 @@ func (s *Stub) revisionLocked() string {
 		"override":   map[string]any{"enabled": s.override.Enabled, "host": s.override.Host},
 		"inbounds":   ins,
 		"probeSubId": subID,
+		"items":      s.items,
 	})
 	if err != nil {
 		panic("paneltest: canonical revision document is not marshallable: " + err.Error())
@@ -550,7 +601,7 @@ func (s *Stub) serve(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
-	w.Header().Set("X-Mon-Contract", "1")
+	w.Header().Set("X-Mon-Contract", fmt.Sprint(s.contractNow()))
 
 	route, ok := strings.CutPrefix(r.URL.Path, basePath+"mon/v1")
 	if !ok {
@@ -576,10 +627,17 @@ func (s *Stub) serve(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// contractNow reads the programmed contract version.
+func (s *Stub) contractNow() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.contract
+}
+
 func (s *Stub) handleState(w http.ResponseWriter) {
 	s.mu.Lock()
 	st := panel.State{
-		Contract:     1,
+		Contract:     s.contract,
 		PanelVersion: "0.0.0-paneltest",
 		ServerTime:   nowMs(),
 		Revision:     s.revisionLocked(),
@@ -621,6 +679,7 @@ func (s *Stub) handleEnsure(w http.ResponseWriter, body []byte) {
 		LastEnsured: s.lastEnsured,
 		Created:     []panel.InboundRef{},
 		Present:     len(s.inbounds),
+		Unallocated: append([]string(nil), s.unallocated...),
 	}
 	s.mu.Unlock()
 

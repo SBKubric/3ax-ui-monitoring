@@ -46,8 +46,10 @@ const (
 	// tokenBytes is the entropy of a client token before base64url
 	// encoding (spec §6: "32 случайных байта").
 	tokenBytes = 32
-	// slugMaxLen bounds a mon-client id (spec §6: "≤ 64").
-	slugMaxLen = 64
+	// slugMaxLen bounds a mon-client id (spec §6: "≤ 32"): the panel names
+	// the mon-client's AWG probe peers after it and refuses a longer id in
+	// POST /probe/ensure (decision #80).
+	slugMaxLen = 32
 
 	// rateLimitWindow is the per-IP registration throttle (spec §6: "1
 	// заявка/мин на IP").
@@ -81,10 +83,11 @@ const (
 var pairingCodeRe = regexp.MustCompile(`^[A-Z2-9]{6}$`)
 
 // slugInvalidRun matches any run of characters that isn't part of a
-// mon-client id's allowed alphabet (spec §6: "[A-Za-z0-9_.-]"), so slugify
+// mon-client id's allowed alphabet (spec §6: "[A-Za-z0-9_-]", the panel's
+// probe-peer name alphabet, decision #80), so slugify
 // can collapse a whole run of spaces/punctuation into a single "-" instead
 // of leaving "amsterdam---1".
-var slugInvalidRun = regexp.MustCompile(`[^A-Za-z0-9_.-]+`)
+var slugInvalidRun = regexp.MustCompile(`[^A-Za-z0-9_-]+`)
 
 // Sentinel errors Poll, Approve, ApproveAsReplacement and Reject return so
 // internal/api's handlers can map them to the right HTTP status without
@@ -1050,9 +1053,9 @@ func newToken() (token, tokenHash string, err error) {
 func slugify(name string) string {
 	s := strings.ToLower(name)
 	s = slugInvalidRun.ReplaceAllString(s, "-")
-	s = strings.Trim(s, "-.")
+	s = strings.Trim(s, "-")
 	if len(s) > slugMaxLen {
-		s = strings.Trim(s[:slugMaxLen], "-.")
+		s = strings.Trim(s[:slugMaxLen], "-")
 	}
 	if s == "" {
 		s = "mon-client"
@@ -1063,7 +1066,7 @@ func slugify(name string) string {
 // uniqueSlug finds a mon-client id that doesn't collide with an existing
 // row: slugify(name), then "-2", "-3", ... appended (spec §6) — re-trimming
 // and re-capping at slugMaxLen each time, since appending a suffix to an
-// already-64-char base would otherwise overflow the column's own limit. It
+// already-32-char base would otherwise overflow the column's own limit. It
 // fetches every id that could possibly collide — the base itself, or the
 // base plus any "-N" suffix — with one query, then picks the first free
 // candidate in memory, so approving many mon-clients that all slugify to
@@ -1097,7 +1100,7 @@ func uniqueSlug(tx *gorm.DB, name string) (string, error) {
 		suffix := fmt.Sprintf("-%d", i)
 		candidate := base
 		if len(candidate)+len(suffix) > slugMaxLen {
-			candidate = strings.TrimRight(candidate[:slugMaxLen-len(suffix)], "-.")
+			candidate = strings.TrimRight(candidate[:slugMaxLen-len(suffix)], "-")
 		}
 		candidate += suffix
 		if !used[candidate] {

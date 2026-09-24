@@ -47,6 +47,11 @@ type PanelStatus interface {
 	// on an untrusted certificate, which the status line names together
 	// with the panelCa setting that fixes it (decision #52 §1).
 	UnknownAuthority() bool
+	// ContractError is the refusal while the panel speaks a monitoring
+	// contract older than mon-server needs (decision #80 п. 9), "" when it
+	// does not. The poll cycle then builds no targets, and the status line
+	// says why.
+	ContractError() string
 	// RefreshMaterial drops the cached probe material, re-reads it from the
 	// panel with the saved settings and rebuilds every config — what Save
 	// does after realHost or panelUrl changed (decision #51 §4).

@@ -298,6 +298,39 @@ func (x Exclusions) Reason(key TargetKey) string {
 	}
 }
 
+// Expected lists the targets of one inbound kind this mon-client should be
+// probing by the panel's own state, with or without an item in its
+// document: every enabled inbound of that kind crossed with the mon-client's
+// paths, proxy only while the override is on. The state engine asks it for
+// AWG (decision #80 п. 10): a mon-client the panel gave no AWG probe peer
+// (pool exhausted, or not ensured yet) never probes that target and so
+// never creates its row, and without a row there is no PAUSED no_probe_link
+// for the operator to see. Nothing is expected while nothing is known.
+func (x Exclusions) Expected(kind string) []TargetKey {
+	if !x.Known {
+		return nil
+	}
+	var out []TargetKey
+	for in, enabled := range x.Inbounds {
+		if !enabled || in.InboundKind != kind {
+			continue
+		}
+		for path := range x.Paths {
+			if path == store.PathProxy && !x.Override {
+				continue
+			}
+			out = append(out, TargetKey{InboundKind: in.InboundKind, InboundID: in.InboundID, Path: path})
+		}
+	}
+	slices.SortFunc(out, func(a, b TargetKey) int {
+		if a.InboundID != b.InboundID {
+			return a.InboundID - b.InboundID
+		}
+		return strings.Compare(a.Path, b.Path)
+	})
+	return out
+}
+
 // Exclusions returns the facts Exclusions.Reason decides by, for one
 // mon-client, from the same inputs a rebuild uses: the current material's
 // override, the mon-client's paths (with spec §5's default) and the
@@ -363,8 +396,9 @@ func (b *ConfigBuilder) buildAndStore(ctx context.Context, mc *store.MonClient, 
 
 // build assembles the document itself: spec §5's targets rule (every path
 // of this mon-client crossed with that path's items, proxy only while the
-// panel's override is on), the global probe parameters, the probe URL, and
-// finally the revision over everything above.
+// panel's override is on, AWG items only the mon-client's own), the global
+// probe parameters, the probe URL, and finally the revision over everything
+// above.
 func (b *ConfigBuilder) build(mc *store.MonClient, mat panel.Material, set *store.Settings, protocols map[TargetKey]string) (*ConfigDoc, error) {
 	doc := &ConfigDoc{
 		MonClientID: mc.Id,
@@ -383,6 +417,9 @@ func (b *ConfigBuilder) build(mc *store.MonClient, mat panel.Material, set *stor
 
 	for _, path := range pathsOf(mc) {
 		for _, item := range itemsFor(mat, path) {
+			if !itemFor(item, mc.Id) {
+				continue
+			}
 			key := TargetKey{InboundKind: item.Kind, InboundID: item.InboundId, Path: path}
 			doc.Targets = append(doc.Targets, ConfigTarget{
 				InboundKind: item.Kind,
@@ -446,6 +483,20 @@ func itemsFor(mat panel.Material, path string) []panel.ProbeItem {
 		// this is the belt to that braces.
 		return nil
 	}
+}
+
+// itemFor reports whether item belongs in monClientID's document (decision
+// #80 п. 1, 7). An xray item is everybody's: its probe account is shared.
+// An AWG item is a probe peer of one mon-client on this path, and only that
+// mon-client may use it — two boxes on one WireGuard peer steal its
+// endpoint and session from each other. An AWG item naming nobody is the
+// shared peer of a contract-1 panel, which the poller never accepts
+// material from; it is dropped here too rather than handed to everyone.
+func itemFor(item panel.ProbeItem, monClientID string) bool {
+	if item.Kind != store.InboundKindAwg {
+		return true
+	}
+	return item.MonClientId == monClientID
 }
 
 // protocolOf answers the document's `protocol` field (protocol §4.2). AWG
