@@ -79,7 +79,8 @@ GET /v1/register/<requestId>
 
 - Ответ heartbeat несёт `configRevision`; отличается от применённой → mon-client делает `GET /v1/config` (тот же путь, что при старте и после потери state).
 - Применение — **между циклами**: пробы в полёте дожидаются, генерируется новый xray-конфиг (все xray-targets в одном процессе: socks-inbound на target + outbound + правило routing), `xray -test`, рестарт дочернего xray; netstack-устройства AWG и так пересоздаются на пробу. Первый цикл после применения — обычный, грейса нет: результаты по удалённым targets отбрасываются, новые targets стартуют у mon-server с `UNKNOWN`.
-- Конфиг не применился (`xray -test` упал, ссылка не разобралась) → mon-client остаётся на старой ревизии, шлёт `configError` в heartbeat; mon-server пишет ошибку в реестр (видна в admin UI) и шлёт Telegram сам. Контракт панели не расширяется.
+- Применение **поцелевое** (решение [#53](https://github.com/SBKubric/3ax-ui-monitoring/issues/53) п. 3): target, чья ссылка или `.conf` не разбирается либо чей AWG-конфиг не принимает пробный `IpcSet`, отвергается, остальные применяются, ревизия считается применённой (даже если отвергнуты все). Отвергнутые идут в heartbeat как `client.rejectedTargets` (§5.3); mon-server переводит их в `PAUSED` с `reason: config_error` (событие панели, Telegram нет), а target, пропавший из `rejectedTargets`, — в `UNKNOWN`.
+- Ревизия не применилась целиком (`xray -test` упал, xray не перезапустился) → mon-client остаётся на старой ревизии, шлёт `configError` в heartbeat; mon-server пишет ошибку в реестр (видна в admin UI) и шлёт Telegram сам. Контракт панели не расширяется.
 
 ## 5. Цикл проб и heartbeat
 
@@ -119,6 +120,7 @@ POST /v1/heartbeat
 → 200 {"configRevision": "3a91c0de77b1f2e4", "serverTs": 1757721620000, "ackSeq": 1441}
 ```
 
+- `client.rejectedTargets` — `[{"target": "<kind>:<inboundId>:<path>", "error": "<первая строка, ≤ 256>"}]`: targets применённой ревизии, которые mon-client отверг при применении (§4.3) и не пробует. Поле отсутствует или пусто — применено всё. `configError` остаётся для ошибок ревизии целиком и упавшего xray. Пример: `"rejectedTargets": [{"target": "awg:3:direct", "error": "[Interface] has an unknown key \"Foo\""}]`.
 - `reason` — словарь диагностики контракта панели §4.6 (`tcp_refused` `tcp_timeout` `tls_timeout` `reality_real_cert` `awg_no_handshake` `http_error` …); `detail` — ≤ 256 символов, последняя строка xray-лога с тем же session-id или текст ошибки; в панель `detail` не уходит.
 - Латентность для xray — фаза TLS (`tlsMs`), `ttfbMs` — RTT, `handshakeMs` — только AWG (`last_handshake_time − t(dial)`); в 5-мин бакет панели mon-server кладёт `min/avg/max` по `tlsMs` и `handshakeMs` последнего успешного цикла бакета.
 - **Время**: mon-server ставит своё время приёма для состояния target'ов и heartbeat; `ts` цикла используется только для раскладки по 5-мин бакетам и клампится к времени приёма при расхождении > 5 мин.
@@ -135,7 +137,7 @@ POST /v1/heartbeat
 
 ## 7. mon-server: хранилище, admin UI, bootstrap
 
-- **Хранилище** — SQLite одним файлом в `dataDir` (GORM, как у панели): настройки, реестр mon-clients (id, name, region, paths, token-hash, enabled, lastHeartbeat, configError), pending registration requests, состояние targets, буфер событий при `PANEL_DOWN`, бакеты до отправки.
+- **Хранилище** — SQLite одним файлом в `dataDir` (GORM, как у панели): настройки, реестр mon-clients (id, name, region, paths, token-hash, enabled, lastHeartbeat, configError, rejectedTargets), pending registration requests, состояние targets, буфер событий при `PANEL_DOWN`, бакеты до отправки.
 - **Bootstrap-конфиг** (файл/ENV) минимален: `listen` (`:443`), `publicIp` (для ACME), `dataDir`, `tls.mode`. Всё остальное — в admin UI: адрес панели и `monToken`, настоящий адрес real server (`host` для path `direct`), Telegram-бот и chat id, пороги state machine, `probe`-параметры, paths и enable per-mon-client.
 - **Admin UI**: один администратор, логин и пароль (bcrypt) задаются `mon-server admin set <user>`; cookie-сессия 24 ч; 5 неудачных логинов → 15 мин блокировки по IP; без 2FA в v1. Страницы: логин, pending-заявки (Approve / Approve as replacement / Reject), реестр mon-clients (state, last heartbeat, paths, configError; Revoke, Disable), настройки. Состояние targets admin UI **не показывает** — единственная картина мониторинга остаётся страницей Monitoring панели. Страницы и поля — [mon-server.md](mon-server.md) §9 (решено в тикете [Admin UI mon-server](https://github.com/SBKubric/3ax-ui-proxy/issues/37)).
 - Регистрация и tunnel probe — свои токены (§2, §3); всё остальное в UI — за сессией.
