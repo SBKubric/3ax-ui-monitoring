@@ -161,6 +161,24 @@ func TestProcessTest(t *testing.T) {
 	}
 }
 
+// TestProcessTestNeedsAJSONExtension pins the behaviour that broke every
+// apply on the stand: xray picks the config format from the file extension,
+// so a candidate named like "xray.json.tmp-123" fails `-test` before it is
+// read, with the real xray's wording (ghcr.io/xtls/xray-core:26.3.27).
+func TestProcessTestNeedsAJSONExtension(t *testing.T) {
+	p := newTestProcess(t)
+
+	cfg := writeCfg(t, "xray.json.tmp-123", []int{freePort(t)}, fakeCfg{})
+	err := p.Test(ctxT(t, 10*time.Second), cfg)
+	if err == nil {
+		t.Fatalf("Test(%s) = nil, want the format error", filepath.Base(cfg))
+	}
+	want := "Failed to start: main: failed to load config files: [" + cfg + "] > core: Failed to get format of " + cfg
+	if err.Error() != want {
+		t.Errorf("Test = %q, want %q", err.Error(), want)
+	}
+}
+
 // TestProcessTestDoesNotKillRunningChild is the invariant of spec §4 step 3:
 // a config that fails validation leaves mon-client probing on the previous
 // revision, so the running child must survive a failed Test untouched.
