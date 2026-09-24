@@ -29,7 +29,8 @@ type AWGConfig struct {
 	// leading), then each peer's public_key, preshared_key, endpoint and
 	// allowed_ip lines. Every line is lowercase and every key is hex.
 	UAPI string
-	// Endpoint is the first peer's endpoint (`host:port`).
+	// Endpoint is the first peer's endpoint (`host:port`) as the `.conf`
+	// wrote it — possibly a host name, which the probe resolves.
 	Endpoint string
 }
 
@@ -304,7 +305,10 @@ func parseAddresses(value string) ([]netip.Addr, error) {
 }
 
 // validateEndpoint checks `host:port` (a bracketed IPv6 host included) without
-// resolving anything: the device does the resolving when it dials.
+// resolving anything. The device never resolves either — amneziawg-go takes
+// only `endpoint=<ip>:<port>` over UAPI (research #60) — so a host name is
+// resolved by the AWG probe right before every IpcSet (internal/client/awg,
+// decision #53 п. 1); parsing only has to make sure there is a port.
 func validateEndpoint(value string) error {
 	i := strings.LastIndex(value, ":")
 	if i <= 0 {

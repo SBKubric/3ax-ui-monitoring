@@ -14,6 +14,7 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"net/netip"
 	"strconv"
 	"strings"
 	"testing"
@@ -37,73 +38,21 @@ const serverPort = 8443
 // that is the tunnel address the packets really came from, and all four
 // timings measured (spec §5, protocol §5.3).
 func TestProbeThroughTunnel(t *testing.T) {
-	// Not parallel, and neither is its sibling below: each test holds two
+	// Not parallel, and neither are its siblings below: each test holds two
 	// netstack devices talking over loopback UDP, and running them side by
 	// side only adds scheduling noise to measurements the test then
 	// asserts on.
-
-	serverPrivB64, serverPubB64, _ := keypair(t)
-	clientPrivB64, clientPubB64, _ := keypair(t)
-
-	// The far end: a device listening on loopback UDP that knows our
-	// public key, with an HTTPS echo of GET /v1/probe behind it. It binds
-	// ListenPort 0 and is asked afterwards which port it actually got —
-	// picking a "free" port by opening and closing a socket first would be
-	// a race every other test on the machine can win.
-	serverCfg := parseConf(t, fmt.Sprintf(`[Interface]
-Address = %s/32
-PrivateKey = %s
-ListenPort = 0
-%s
-
-[Peer]
-PublicKey = %s
-AllowedIPs = %s/32
-`, serverTunnelIP, serverPrivB64, awgObfuscation, clientPubB64, clientTunnelIP))
-	server, err := Open(serverCfg)
-	if err != nil {
-		t.Fatalf("open server device: %v", err)
-	}
-	defer server.Close()
-	port := listenPort(t, server)
-
-	cert, pool := selfSigned(t, serverTunnelIP)
-	ln, err := server.tnet.ListenTCP(&net.TCPAddr{IP: net.ParseIP(serverTunnelIP), Port: serverPort})
-	if err != nil {
-		t.Fatalf("listen inside the tunnel: %v", err)
-	}
-	httpSrv := &http.Server{Handler: http.HandlerFunc(probeEcho)}
-	serving := make(chan struct{})
-	go func() {
-		close(serving)
-		_ = httpSrv.Serve(tls.NewListener(ln, &tls.Config{Certificates: []tls.Certificate{cert}}))
-	}()
-	t.Cleanup(func() { _ = httpSrv.Close() })
-	<-serving
+	far := startFarEnd(t, http.HandlerFunc(probeEcho))
 
 	// The near end: exactly the config mon-client would get from
 	// mon-server, pointing at the far end's loopback endpoint.
-	clientCfg := parseConf(t, fmt.Sprintf(`[Interface]
-Address = %s/32
-PrivateKey = %s
-MTU = 1420
-%s
+	clientCfg := far.clientConf(t, fmt.Sprintf("127.0.0.1:%d", far.port))
 
-[Peer]
-PublicKey = %s
-AllowedIPs = 0.0.0.0/0
-Endpoint = 127.0.0.1:%d
-`, clientTunnelIP, clientPrivB64, awgObfuscation, serverPubB64, port))
-
-	p := Prober{Log: silent(), tlsConfig: &tls.Config{RootCAs: pool}}
+	p := Prober{Log: silent(), tlsConfig: &tls.Config{RootCAs: far.pool}}
 	key := proto.TargetKey{InboundKind: "awg", InboundID: 7, Path: "direct"}
-	// Generous budgets: this is not a latency test, and a loaded CI box
-	// can take seconds to get two netstacks and an AWG handshake going —
-	// a probe that ran out of connect budget would be reported as a tunnel
-	// failure rather than a slow machine.
-	b := probe.Budgets{Budget: 60 * time.Second, Connect: 20 * time.Second, TLS: 20 * time.Second, Headers: 20 * time.Second}
+	b := tunnelBudgets()
 
-	res := p.Probe(context.Background(), fmt.Sprintf("https://%s:%d/v1/probe", serverTunnelIP, serverPort), "tok", key, clientCfg, b)
+	res := p.Probe(context.Background(), far.probeURL(), "tok", key, clientCfg, b)
 	if !res.Ok {
 		t.Fatalf("probe failed: reason=%q detail=%q", deref(res.Reason), deref(res.Detail))
 	}
@@ -132,10 +81,75 @@ Endpoint = 127.0.0.1:%d
 	}
 }
 
+// TestProbeThroughTunnelEndpointHostname is decision #53 п. 1: a `.conf`
+// whose Endpoint is a host name, not an IP. amneziawg-go only takes
+// `endpoint=<ip>:<port>` over UAPI and never resolves (research #60), so
+// before the fix every such probe failed in IpcSet with "unable to parse
+// IP" and was reported as a false awg_no_handshake. The probe now resolves
+// the name itself, right before building the device, and the tunnel comes
+// up exactly as it does for an IP.
+func TestProbeThroughTunnelEndpointHostname(t *testing.T) {
+	far := startFarEnd(t, http.HandlerFunc(probeEcho))
+	clientCfg := far.clientConf(t, fmt.Sprintf("awg-server.test:%d", far.port))
+
+	res := &fakeResolver{addrs: map[string][]netip.Addr{
+		"awg-server.test": {netip.MustParseAddr("127.0.0.1")},
+	}}
+	p := Prober{Log: silent(), Resolver: res, tlsConfig: &tls.Config{RootCAs: far.pool}}
+	got := p.Probe(context.Background(), far.probeURL(), "tok",
+		proto.TargetKey{InboundKind: "awg", InboundID: 7, Path: "direct"}, clientCfg, tunnelBudgets())
+
+	if !got.Ok {
+		t.Fatalf("probe through a hostname endpoint failed: reason=%q detail=%q", deref(got.Reason), deref(got.Detail))
+	}
+	if got.HandshakeMs == nil {
+		t.Error("handshakeMs is null: the device never handshook with the resolved endpoint")
+	}
+	if calls := res.calls(); len(calls) != 1 || calls[0] != "awg-server.test" {
+		t.Errorf("resolver calls = %v, want one lookup of awg-server.test", calls)
+	}
+}
+
 // TestProbeThroughTunnelWrongNonce is spec §5's http_error: mon-server
 // answered, but with someone else's nonce, so the response cannot be
 // attributed to this probe.
 func TestProbeThroughTunnelWrongNonce(t *testing.T) {
+	far := startFarEnd(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeEcho(w, r, "someone-elses-nonce")
+	}))
+	clientCfg := far.clientConf(t, fmt.Sprintf("127.0.0.1:%d", far.port))
+
+	p := Prober{Log: silent(), tlsConfig: &tls.Config{RootCAs: far.pool}}
+	res := p.Probe(context.Background(), far.probeURL(), "tok",
+		proto.TargetKey{InboundKind: "awg", InboundID: 7, Path: "direct"}, clientCfg, tunnelBudgets())
+
+	if res.Ok {
+		t.Fatal("a probe whose nonce was not echoed back counted as a success")
+	}
+	if got := deref(res.Reason); got != proto.ReasonHTTPError {
+		t.Errorf("reason = %q, want %q", got, proto.ReasonHTTPError)
+	}
+	if res.HandshakeMs == nil || res.TlsMs == nil {
+		t.Error("a failure after TLS must still carry the phases it did measure")
+	}
+}
+
+// farEnd is the stand-in AWG server of the tunnel tests: a netstack device
+// on loopback UDP that knows the client's public key, with an HTTPS
+// handler for GET /v1/probe listening inside the tunnel.
+type farEnd struct {
+	port          int // the far end's UDP port on 127.0.0.1
+	pool          *x509.CertPool
+	serverPubB64  string
+	clientPrivB64 string
+}
+
+// startFarEnd brings the far end up for the length of the test. It binds
+// ListenPort 0 and asks afterwards which port it actually got — picking a
+// "free" port by opening and closing a socket first would be a race every
+// other test on the machine can win.
+func startFarEnd(t *testing.T, handler http.Handler) *farEnd {
+	t.Helper()
 	serverPrivB64, serverPubB64, _ := keypair(t)
 	clientPrivB64, clientPubB64, _ := keypair(t)
 
@@ -153,7 +167,7 @@ AllowedIPs = %s/32
 	if err != nil {
 		t.Fatalf("open server device: %v", err)
 	}
-	defer server.Close()
+	t.Cleanup(server.Close)
 	port := listenPort(t, server)
 
 	cert, pool := selfSigned(t, serverTunnelIP)
@@ -161,9 +175,7 @@ AllowedIPs = %s/32
 	if err != nil {
 		t.Fatalf("listen inside the tunnel: %v", err)
 	}
-	httpSrv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		writeEcho(w, r, "someone-elses-nonce")
-	})}
+	httpSrv := &http.Server{Handler: handler}
 	serving := make(chan struct{})
 	go func() {
 		close(serving)
@@ -172,31 +184,36 @@ AllowedIPs = %s/32
 	t.Cleanup(func() { _ = httpSrv.Close() })
 	<-serving
 
-	clientCfg := parseConf(t, fmt.Sprintf(`[Interface]
+	return &farEnd{port: port, pool: pool, serverPubB64: serverPubB64, clientPrivB64: clientPrivB64}
+}
+
+// clientConf is the near end's `.conf` with the far end as its peer at
+// endpoint, exactly the shape mon-client gets from mon-server.
+func (f *farEnd) clientConf(t *testing.T, endpoint string) *config.AWGConfig {
+	t.Helper()
+	return parseConf(t, fmt.Sprintf(`[Interface]
 Address = %s/32
 PrivateKey = %s
+MTU = 1420
 %s
 
 [Peer]
 PublicKey = %s
 AllowedIPs = 0.0.0.0/0
-Endpoint = 127.0.0.1:%d
-`, clientTunnelIP, clientPrivB64, awgObfuscation, serverPubB64, port))
+Endpoint = %s
+`, clientTunnelIP, f.clientPrivB64, awgObfuscation, f.serverPubB64, endpoint))
+}
 
-	p := Prober{Log: silent(), tlsConfig: &tls.Config{RootCAs: pool}}
-	res := p.Probe(context.Background(), fmt.Sprintf("https://%s:%d/v1/probe", serverTunnelIP, serverPort), "tok",
-		proto.TargetKey{InboundKind: "awg", InboundID: 7, Path: "direct"}, clientCfg,
-		probe.Budgets{Budget: 60 * time.Second, Connect: 20 * time.Second, TLS: 20 * time.Second, Headers: 20 * time.Second})
+func (f *farEnd) probeURL() string {
+	return fmt.Sprintf("https://%s:%d/v1/probe", serverTunnelIP, serverPort)
+}
 
-	if res.Ok {
-		t.Fatal("a probe whose nonce was not echoed back counted as a success")
-	}
-	if got := deref(res.Reason); got != proto.ReasonHTTPError {
-		t.Errorf("reason = %q, want %q", got, proto.ReasonHTTPError)
-	}
-	if res.HandshakeMs == nil || res.TlsMs == nil {
-		t.Error("a failure after TLS must still carry the phases it did measure")
-	}
+// tunnelBudgets are generous on purpose: these are not latency tests, and
+// a loaded CI box can take seconds to get two netstacks and an AWG
+// handshake going — a probe that ran out of connect budget would be
+// reported as a tunnel failure rather than a slow machine.
+func tunnelBudgets() probe.Budgets {
+	return probe.Budgets{Budget: 60 * time.Second, Connect: 20 * time.Second, TLS: 20 * time.Second, Headers: 20 * time.Second}
 }
 
 // probeEcho is GET /v1/probe as mon-server implements it (protocol §5.2).
