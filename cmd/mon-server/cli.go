@@ -79,7 +79,7 @@ func runCtx(ctx context.Context, args []string, stdin io.Reader, stdout, stderr 
 func usage() string {
 	return `Usage:
   mon-server run [-config path]           start the service
-  mon-server admin set <user> [-config path]
+  mon-server admin set [-config path] <user>
                                            set the admin login and password
                                            (prompts twice on a terminal; or
                                            set ` + envAdminPassword + ` to run
@@ -213,7 +213,7 @@ func runRun(ctx context.Context, args []string, stderr io.Writer, onListen func(
 // adminPassword) so a bad config or an unopenable store fails before the
 // operator has typed a password at all.
 func runAdmin(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
-	const usage = "Usage: mon-server admin set <user> [-config path]"
+	const usage = "Usage: mon-server admin set [-config path] <user>"
 
 	if len(args) < 1 || args[0] != "set" {
 		fmt.Fprintln(stderr, usage)

@@ -29,6 +29,7 @@ func TestSettings_RoundTrip(t *testing.T) {
 		PanelURL: "https://panel.example:2053/base/",
 		MonToken: "secret-token",
 		RealHost: "real.example.com",
+		PanelCA:  "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n",
 		TgToken:  "bot:token",
 		TgChatID: "-100123456",
 

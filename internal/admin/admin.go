@@ -15,6 +15,7 @@ package admin
 
 import (
 	"context"
+	"crypto/x509"
 	"html/template"
 	"net/http"
 
@@ -42,6 +43,10 @@ type PanelStatus interface {
 	// PanelDown reports whether mon-server currently considers the panel
 	// unreachable (spec §4.1).
 	PanelDown() bool
+	// UnknownAuthority reports whether the last failed panel request failed
+	// on an untrusted certificate, which the status line names together
+	// with the panelCa setting that fixes it (decision #52 §1).
+	UnknownAuthority() bool
 }
 
 // TelegramSender is the Telegram Bot API call behind the Settings page's
@@ -73,9 +78,10 @@ type Deps struct {
 	Cfg *config.Config
 
 	// NewPanelClient builds the client the Settings page's "Check" button
-	// uses against the *submitted* panel URL and token, without saving them
-	// (spec §9.4). Defaults to panel.NewHTTPClient.
-	NewPanelClient func(baseURL, token string) panel.Client
+	// uses against the *submitted* panel URL, token and panelCa (rootCAs,
+	// nil for the system pool), without saving them (spec §9.4). Defaults
+	// to panel.NewHTTPClient with panel.WithRootCAs.
+	NewPanelClient func(baseURL, token string, rootCAs *x509.CertPool) panel.Client
 	// Telegram is the "Send test" button's sender. May be nil, in which
 	// case the button reports that Telegram is not wired.
 	Telegram TelegramSender
@@ -98,8 +104,8 @@ type Handler struct {
 // operator could fix at runtime.
 func New(d Deps) *Handler {
 	if d.NewPanelClient == nil {
-		d.NewPanelClient = func(baseURL, token string) panel.Client {
-			return panel.NewHTTPClient(baseURL, token, d.Clock)
+		d.NewPanelClient = func(baseURL, token string, rootCAs *x509.CertPool) panel.Client {
+			return panel.NewHTTPClient(baseURL, token, d.Clock, panel.WithRootCAs(rootCAs))
 		}
 	}
 	return &Handler{deps: d, pages: web.MustParsePages()}

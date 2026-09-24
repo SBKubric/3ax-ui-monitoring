@@ -45,9 +45,10 @@ func newTestApp(t *testing.T) (*App, *tls.Config) {
 	}
 
 	cfg := &config.Config{
-		Listen:  "127.0.0.1:0",
-		DataDir: dir,
-		TLS:     config.TLSConfig{Mode: config.TLSModeFiles, Cert: certPath, Key: keyPath},
+		Listen:   "127.0.0.1:0",
+		PublicIP: "127.0.0.1",
+		DataDir:  dir,
+		TLS:      config.TLSConfig{Mode: config.TLSModeFiles, Cert: certPath, Key: keyPath},
 	}
 
 	a, err := New(Deps{Cfg: cfg, Store: st, Clock: clock.Real{}, Notifier: tg.Nop{}})
@@ -281,9 +282,10 @@ func TestApp_ReadTimeoutClosesStalledBody(t *testing.T) {
 	}
 
 	cfg := &config.Config{
-		Listen:  "127.0.0.1:0",
-		DataDir: dir,
-		TLS:     config.TLSConfig{Mode: config.TLSModeFiles, Cert: certPath, Key: keyPath},
+		Listen:   "127.0.0.1:0",
+		PublicIP: "127.0.0.1",
+		DataDir:  dir,
+		TLS:      config.TLSConfig{Mode: config.TLSModeFiles, Cert: certPath, Key: keyPath},
 	}
 
 	const shortReadTimeout = 300 * time.Millisecond
@@ -429,9 +431,10 @@ func TestShutdown_AbandonsAHungPollerWhenItsCtxExpires(t *testing.T) {
 	notifier := &hangingNotifier{release: make(chan struct{})}
 
 	cfg := &config.Config{
-		Listen:  "127.0.0.1:0",
-		DataDir: dir,
-		TLS:     config.TLSConfig{Mode: config.TLSModeFiles, Cert: certPath, Key: keyPath},
+		Listen:   "127.0.0.1:0",
+		PublicIP: "127.0.0.1",
+		DataDir:  dir,
+		TLS:      config.TLSConfig{Mode: config.TLSModeFiles, Cert: certPath, Key: keyPath},
 	}
 	a, err := New(Deps{Cfg: cfg, Store: st, Clock: clock.Real{}, Notifier: notifier})
 	if err != nil {
@@ -745,9 +748,10 @@ func TestStats_WiredIntoServer(t *testing.T) {
 	}
 	clk := clock.NewFake(time.Date(2025, 9, 12, 10, 0, 0, 0, time.UTC))
 	cfg := &config.Config{
-		Listen:  "127.0.0.1:0",
-		DataDir: dir,
-		TLS:     config.TLSConfig{Mode: config.TLSModeFiles, Cert: certPath, Key: keyPath},
+		Listen:   "127.0.0.1:0",
+		PublicIP: "127.0.0.1",
+		DataDir:  dir,
+		TLS:      config.TLSConfig{Mode: config.TLSModeFiles, Cert: certPath, Key: keyPath},
 	}
 	a, err := New(Deps{Cfg: cfg, Store: st, Clock: clk, Notifier: tg.Nop{}})
 	if err != nil {

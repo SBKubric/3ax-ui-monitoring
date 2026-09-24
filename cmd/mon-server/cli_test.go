@@ -256,9 +256,10 @@ func TestRunCtx_RunServesAndShutsDownWhenCtxCancelled(t *testing.T) {
 	dir := t.TempDir()
 	certPath, keyPath := tlsxtest.WriteSelfSigned(t, dir)
 	cfg := map[string]any{
-		"listen":  "127.0.0.1:0",
-		"dataDir": dir,
-		"tls":     map[string]any{"mode": "files", "cert": certPath, "key": keyPath},
+		"listen":   "127.0.0.1:0",
+		"publicIp": "127.0.0.1",
+		"dataDir":  dir,
+		"tls":      map[string]any{"mode": "files", "cert": certPath, "key": keyPath},
 	}
 	data, err := json.Marshal(cfg)
 	if err != nil {

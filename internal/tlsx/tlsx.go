@@ -9,8 +9,10 @@ package tlsx
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
+	"net"
 	"path/filepath"
 
 	"github.com/caddyserver/certmagic"
@@ -49,10 +51,10 @@ const certsSubdir = "certs"
 func Build(cfg config.TLSConfig, dataDir, publicIP string) (*tls.Config, *Manager, error) {
 	switch cfg.Mode {
 	case config.TLSModeFiles:
-		tlsCfg, err := buildFiles(cfg)
+		tlsCfg, err := buildFiles(cfg, publicIP)
 		return tlsCfg, nil, err
 	case config.TLSModeACMEIP:
-		return buildACMEIP(dataDir, publicIP)
+		return buildACMEIP(dataDir, publicIP, ACMEDirectory(cfg.ACMECA))
 	default:
 		return nil, nil, fmt.Errorf("tlsx: unknown tls.mode %q (want %q or %q)", cfg.Mode, config.TLSModeACMEIP, config.TLSModeFiles)
 	}
@@ -62,10 +64,19 @@ func Build(cfg config.TLSConfig, dataDir, publicIP string) (*tls.Config, *Manage
 // (домен или тесты), без ACME"). This is what every test in this repo that
 // needs a real TLS listener uses (see tlsxtest.WriteSelfSigned) precisely
 // because it never touches the network.
-func buildFiles(cfg config.TLSConfig) (*tls.Config, error) {
+//
+// The leaf must carry publicIP as an IP SAN (decision #52 §4): every
+// mon-client reaches this listener at probeUrl, https://<publicIp>:<port>,
+// so a certificate for a domain only would fail every tunnel probe's TLS
+// verification. That is refused here, at start-up, rather than discovered
+// as every target going DOWN.
+func buildFiles(cfg config.TLSConfig, publicIP string) (*tls.Config, error) {
 	cert, err := tls.LoadX509KeyPair(cfg.Cert, cfg.Key)
 	if err != nil {
 		return nil, fmt.Errorf("tlsx: load keypair (cert=%s, key=%s): %w", cfg.Cert, cfg.Key, err)
+	}
+	if err := requireIPSAN(cert, publicIP); err != nil {
+		return nil, fmt.Errorf("tlsx: %s: %w", cfg.Cert, err)
 	}
 	return &tls.Config{
 		Certificates: []tls.Certificate{cert},
@@ -74,15 +85,54 @@ func buildFiles(cfg config.TLSConfig) (*tls.Config, error) {
 	}, nil
 }
 
+// requireIPSAN checks that the leaf of cert lists publicIP among its IP
+// SANs, comparing parsed addresses so "2001:db8::1" matches however the
+// certificate happened to encode it.
+func requireIPSAN(cert tls.Certificate, publicIP string) error {
+	ip := net.ParseIP(publicIP)
+	if ip == nil {
+		return fmt.Errorf("files mode requires publicIp as an IP address, got %q", publicIP)
+	}
+	leaf := cert.Leaf
+	if leaf == nil {
+		var err error
+		if leaf, err = x509.ParseCertificate(cert.Certificate[0]); err != nil {
+			return fmt.Errorf("parse leaf certificate: %w", err)
+		}
+	}
+	for _, san := range leaf.IPAddresses {
+		if san.Equal(ip) {
+			return nil
+		}
+	}
+	return fmt.Errorf("cert has no IP SAN for publicIp %s", publicIP)
+}
+
+// ACMEDirectory resolves tls.acmeCa (decision #52 §2) to the ACME directory
+// URL certmagic needs: "production" or unset is Let's Encrypt production,
+// "staging" is Let's Encrypt staging, and anything else is already a
+// directory URL (config.Validate has checked its shape). The admin UI shows
+// the result on the "TLS & admin" tab.
+func ACMEDirectory(ca string) string {
+	switch ca {
+	case "", config.ACMECAProduction:
+		return certmagic.LetsEncryptProductionCA
+	case config.ACMECAStaging:
+		return certmagic.LetsEncryptStagingCA
+	default:
+		return ca
+	}
+}
+
 // buildACMEIP wires up certmagic for the default mode (spec §2.1) and
 // returns a Manager the caller must Manage(ctx) once it is safe to do so
 // (after the listener is bound). It never calls out to the network itself.
-func buildACMEIP(dataDir, publicIP string) (*tls.Config, *Manager, error) {
+func buildACMEIP(dataDir, publicIP, caDir string) (*tls.Config, *Manager, error) {
 	if publicIP == "" {
 		return nil, nil, errors.New("tlsx: acme-ip mode requires a public IP")
 	}
 
-	magic, cache, _ := acmeSetup(dataDir, publicIP)
+	magic, cache, _ := acmeSetup(dataDir, publicIP, caDir)
 
 	// magic.TLSConfig() pre-populates NextProtos with certmagic's own
 	// acme-tls/1 value (required for tls-alpn-01 to keep working on renewal,
@@ -114,7 +164,14 @@ func buildACMEIP(dataDir, publicIP string) (*tls.Config, *Manager, error) {
 // default/fallback name, certmagic has nothing to match the empty or
 // mismatched ServerName against and the handshake fails even though the
 // right certificate is sitting in the cache.
-func acmeSetup(dataDir, publicIP string) (*certmagic.Config, *certmagic.Cache, *certmagic.ACMEIssuer) {
+//
+// caDir is the ACME directory (ACMEDirectory of tls.acmeCa). With Let's
+// Encrypt production certmagic also retries failed issuances against
+// staging first (its implicit TestCA), so retry logs mention the staging
+// host even on a production install; staging and custom directories have
+// no such second CA. FileStorage keys everything by the CA's host, so
+// switching acmeCa never mixes certificates or accounts of different CAs.
+func acmeSetup(dataDir, publicIP, caDir string) (*certmagic.Config, *certmagic.Cache, *certmagic.ACMEIssuer) {
 	var magic *certmagic.Config
 	cache := certmagic.NewCache(certmagic.CacheOptions{
 		GetConfigForCert: func(certmagic.Certificate) (*certmagic.Config, error) {
@@ -138,7 +195,9 @@ func acmeSetup(dataDir, publicIP string) (*certmagic.Config, *certmagic.Cache, *
 	})
 
 	issuer := certmagic.NewACMEIssuer(magic, certmagic.ACMEIssuer{
-		CA: certmagic.LetsEncryptProductionCA,
+		// tls.acmeCa (decision #52 §2): production by default, staging or
+		// a custom directory for stands and e2e.
+		CA: caDir,
 		// mon-server is a single unattended service with no operator to
 		// click "I agree" during a first boot; running it at all implies
 		// accepting Let's Encrypt's subscriber agreement.

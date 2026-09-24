@@ -23,6 +23,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -156,16 +157,42 @@ type Stub struct {
 // monitoring on for.
 func NewStub(t testing.TB) *Stub {
 	t.Helper()
-	s := &Stub{
+	s := newStub()
+	s.srv = httptest.NewServer(http.HandlerFunc(s.serve))
+	t.Cleanup(s.srv.Close)
+	return s
+}
+
+// NewTLSStub is NewStub served over HTTPS with httptest's self-signed
+// certificate (IP SAN 127.0.0.1) — the shape of a stand panel on a
+// certificate no system CA knows, which is what the panelCa setting is for
+// (decision #52 §1). CertPEM hands that certificate to a test as the PEM an
+// operator would paste.
+func NewTLSStub(t testing.TB) *Stub {
+	t.Helper()
+	s := newStub()
+	s.srv = httptest.NewTLSServer(http.HandlerFunc(s.serve))
+	t.Cleanup(s.srv.Close)
+	return s
+}
+
+// CertPEM is the stub's own TLS certificate in PEM, or "" for a plain-HTTP
+// stub from NewStub.
+func (s *Stub) CertPEM() string {
+	if s.srv.Certificate() == nil {
+		return ""
+	}
+	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: s.srv.Certificate().Raw}))
+}
+
+func newStub() *Stub {
+	return &Stub{
 		monEnabled: true,
 		items:      map[string][]panel.ProbeItem{},
 		failRoutes: map[string]routeFailure{},
 		eventIDs:   map[string]struct{}{},
 		stats:      map[string]panel.StatPayload{},
 	}
-	s.srv = httptest.NewServer(http.HandlerFunc(s.serve))
-	t.Cleanup(s.srv.Close)
-	return s
 }
 
 // URL is the base URL to hand to panel.NewHTTPClient: the stub's origin plus

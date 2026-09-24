@@ -190,7 +190,8 @@ func WithTimeout(d time.Duration) Option {
 }
 
 // WithHTTPClient replaces the whole http.Client, for a caller that needs its
-// own transport (a custom TLS root for a panel with a private certificate).
+// own transport. (A custom TLS root for a panel with a private certificate
+// is WithRootCAs.)
 // The timeout is applied to the client that is passed in, so a caller does
 // not have to remember spec §4's 10 s itself.
 func WithHTTPClient(hc *http.Client) Option {
@@ -354,7 +355,11 @@ func (c *HTTPClient) do(ctx context.Context, method, path string, query url.Valu
 		if err == nil {
 			return nil
 		}
-		if !IsRetryable(err) || attempt >= maxRetries {
+		// An untrusted certificate stays untrusted however often it is
+		// asked: return at once (the Check button would otherwise sit
+		// through the whole backoff), but as the retryable netError it is,
+		// so a batch caller keeps its rows for when panelCa is fixed.
+		if !IsRetryable(err) || IsUnknownAuthority(err) || attempt >= maxRetries {
 			return err
 		}
 		delay := retryDelays[attempt]

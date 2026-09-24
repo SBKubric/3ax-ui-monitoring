@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"net"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/caddyserver/certmagic"
@@ -26,7 +28,7 @@ func TestBuild_Files_LoadsKeypair(t *testing.T) {
 	dir := t.TempDir()
 	certPath, keyPath := tlsxtest.WriteSelfSigned(t, dir)
 
-	tlsCfg, mgr, err := Build(config.TLSConfig{Mode: config.TLSModeFiles, Cert: certPath, Key: keyPath}, dir, "")
+	tlsCfg, mgr, err := Build(config.TLSConfig{Mode: config.TLSModeFiles, Cert: certPath, Key: keyPath}, dir, "127.0.0.1")
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
@@ -56,9 +58,83 @@ func TestBuild_Files_LoadsKeypair(t *testing.T) {
 // certificate and fails on the first handshake instead.
 func TestBuild_Files_MissingKeypairFails(t *testing.T) {
 	dir := t.TempDir()
-	_, _, err := Build(config.TLSConfig{Mode: config.TLSModeFiles, Cert: filepath.Join(dir, "missing.pem"), Key: filepath.Join(dir, "missing-key.pem")}, dir, "")
+	_, _, err := Build(config.TLSConfig{Mode: config.TLSModeFiles, Cert: filepath.Join(dir, "missing.pem"), Key: filepath.Join(dir, "missing-key.pem")}, dir, "127.0.0.1")
 	if err == nil {
 		t.Fatal("Build with a missing keypair: want error, got nil")
+	}
+}
+
+// TestBuild_Files_RequiresIPSANForPublicIP checks decision #52 §4: probeUrl
+// is always https://<publicIp>:<port>/v1/probe, so a "files" certificate that
+// does not carry publicIp as an IP SAN would fail every mon-client's TLS
+// verification. Build refuses to start with one instead — both for a
+// domain-only certificate and for one issued for some other IP.
+func TestBuild_Files_RequiresIPSANForPublicIP(t *testing.T) {
+	cases := []struct {
+		name     string
+		dns      []string
+		ips      []net.IP
+		publicIP string
+		wantErr  bool
+	}{
+		{"matching IPv4 SAN", nil, []net.IP{net.ParseIP("203.0.113.10")}, "203.0.113.10", false},
+		{"matching IPv6 SAN", nil, []net.IP{net.ParseIP("2001:db8::1")}, "2001:db8::1", false},
+		{"domain only", []string{"mon.example.com"}, nil, "203.0.113.10", true},
+		{"other IP", []string{"mon.example.com"}, []net.IP{net.ParseIP("203.0.113.11")}, "203.0.113.10", true},
+		{"empty publicIp", nil, []net.IP{net.ParseIP("203.0.113.10")}, "", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			certPath, keyPath := tlsxtest.WriteCert(t, dir, tc.dns, tc.ips)
+			_, _, err := Build(config.TLSConfig{Mode: config.TLSModeFiles, Cert: certPath, Key: keyPath}, dir, tc.publicIP)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("Build() error = %v, wantErr %v", err, tc.wantErr)
+			}
+			if err != nil && tc.publicIP != "" && !strings.Contains(err.Error(), "cert has no IP SAN for publicIp") {
+				t.Fatalf("Build() error = %q, want it to say %q", err, "cert has no IP SAN for publicIp")
+			}
+		})
+	}
+}
+
+// TestACMEDirectory checks the tls.acmeCa names (decision #52 §2):
+// production (and an unset value) is Let's Encrypt's production directory,
+// staging its staging directory, and anything else is taken as a directory
+// URL verbatim — Pebble in e2e/CI.
+func TestACMEDirectory(t *testing.T) {
+	cases := map[string]string{
+		"":                         certmagic.LetsEncryptProductionCA,
+		config.ACMECAProduction:    certmagic.LetsEncryptProductionCA,
+		config.ACMECAStaging:       certmagic.LetsEncryptStagingCA,
+		"https://pebble:14000/dir": "https://pebble:14000/dir",
+	}
+	for in, want := range cases {
+		if got := ACMEDirectory(in); got != want {
+			t.Errorf("ACMEDirectory(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// TestBuild_ACMEIP_UsesConfiguredCA checks that tls.acmeCa reaches the
+// certmagic issuer: an ansible stand run with acmeCa=staging must never
+// spend a production issuance.
+func TestBuild_ACMEIP_UsesConfiguredCA(t *testing.T) {
+	_, mgr, err := Build(config.TLSConfig{Mode: config.TLSModeACMEIP, ACMECA: config.ACMECAStaging}, t.TempDir(), "203.0.113.10")
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	t.Cleanup(mgr.Stop)
+
+	if len(mgr.magic.Issuers) != 1 {
+		t.Fatalf("Issuers = %v, want exactly one", mgr.magic.Issuers)
+	}
+	issuer, ok := mgr.magic.Issuers[0].(*certmagic.ACMEIssuer)
+	if !ok {
+		t.Fatalf("Issuers[0] = %T, want *certmagic.ACMEIssuer", mgr.magic.Issuers[0])
+	}
+	if issuer.CA != certmagic.LetsEncryptStagingCA {
+		t.Fatalf("CA = %q, want the Let's Encrypt staging directory", issuer.CA)
 	}
 }
 
@@ -80,7 +156,7 @@ func TestBuild_UnknownMode(t *testing.T) {
 // never touches the network.
 func TestAcmeSetup_ConfiguresExpectedFields(t *testing.T) {
 	dataDir := t.TempDir()
-	magic, cache, issuer := acmeSetup(dataDir, "203.0.113.10")
+	magic, cache, issuer := acmeSetup(dataDir, "203.0.113.10", ACMEDirectory(""))
 	t.Cleanup(cache.Stop)
 
 	if magic.RenewalWindowRatio != acmeRenewalWindowRatio {

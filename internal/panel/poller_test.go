@@ -2,6 +2,7 @@ package panel_test
 
 import (
 	"context"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -111,9 +112,16 @@ type harness struct {
 // poller builds from settings.
 func newHarness(t *testing.T, opts ...panel.Option) *harness {
 	t.Helper()
+	return newHarnessOn(t, paneltest.NewStub(t), opts...)
+}
+
+// newHarnessOn is newHarness against a stub the caller built — a TLS one,
+// for the panelCa tests.
+func newHarnessOn(t *testing.T, stub *paneltest.Stub, opts ...panel.Option) *harness {
+	t.Helper()
 
 	h := &harness{
-		stub:     paneltest.NewStub(t),
+		stub:     stub,
 		clk:      clock.NewFake(testTime),
 		tg:       &tg.Recorder{},
 		configs:  &fakeConfigs{},
@@ -150,8 +158,8 @@ func newHarness(t *testing.T, opts ...panel.Option) *harness {
 		Configs:  h.configs,
 		Inbounds: h.inbounds,
 		Stats:    h.stats,
-		NewClient: func(baseURL, token string) panel.Client {
-			all := append([]panel.Option{panel.WithSleeper(func(context.Context, time.Duration) error { return nil })}, opts...)
+		NewClient: func(baseURL, token string, rootCAs *x509.CertPool) panel.Client {
+			all := append([]panel.Option{panel.WithSleeper(func(context.Context, time.Duration) error { return nil }), panel.WithRootCAs(rootCAs)}, opts...)
 			return panel.NewHTTPClient(baseURL, token, h.clk, all...)
 		},
 	})
@@ -501,7 +509,7 @@ func TestPoll_TelegramSendFailureDoesNotBreakCycle(t *testing.T) {
 		Configs:  h.configs,
 		Inbounds: h.inbounds,
 		Stats:    h.stats,
-		NewClient: func(baseURL, token string) panel.Client {
+		NewClient: func(baseURL, token string, _ *x509.CertPool) panel.Client {
 			return panel.NewHTTPClient(baseURL, token, h.clk, panel.WithSleeper(func(context.Context, time.Duration) error { return nil }))
 		},
 	})
@@ -1201,5 +1209,62 @@ func TestPoll_EmptyEventsAnswerMarksTheBatchSent(t *testing.T) {
 	}
 	if n := len(h.stub.Events()); n != 3 {
 		t.Fatalf("panel holds %d events, want 3", n)
+	}
+}
+
+// TestPoll_PanelCA checks decision #52 §1 end to end through the poll loop:
+// a panel on a self-signed certificate fails with an unknown-authority
+// error the status line can name (UnknownAuthority), and once an operator
+// saves the panel's certificate as panelCa the poller rebuilds its client
+// with that pool — no restart — and the next cycle reaches the panel.
+func TestPoll_PanelCA(t *testing.T) {
+	h := newHarnessOn(t, paneltest.NewTLSStub(t))
+	ctx := context.Background()
+
+	if err := h.poller.Poll(ctx); !panel.IsUnknownAuthority(err) {
+		t.Fatalf("Poll without panelCa: err = %v, want an unknown-authority error", err)
+	}
+	if !h.poller.UnknownAuthority() {
+		t.Fatal("UnknownAuthority() = false after an unknown-authority failure")
+	}
+
+	set, err := h.store.LoadSettings()
+	if err != nil {
+		t.Fatalf("LoadSettings: %v", err)
+	}
+	set.PanelCA = h.stub.CertPEM()
+	if err := h.store.SaveSettings(set); err != nil {
+		t.Fatalf("SaveSettings: %v", err)
+	}
+
+	if err := h.poller.Poll(ctx); err != nil {
+		t.Fatalf("Poll with panelCa: %v", err)
+	}
+	if h.poller.UnknownAuthority() {
+		t.Fatal("UnknownAuthority() = true after a successful cycle")
+	}
+}
+
+// TestPoll_BrokenPanelCAFailsCycle checks that a panelCa row that does not
+// parse (Save refuses one, so only a hand-edited database has it) fails the
+// cycle with an error naming the setting instead of silently falling back
+// to the system pool.
+func TestPoll_BrokenPanelCAFailsCycle(t *testing.T) {
+	h := newHarness(t)
+	set, err := h.store.LoadSettings()
+	if err != nil {
+		t.Fatalf("LoadSettings: %v", err)
+	}
+	set.PanelCA = "not a certificate"
+	if err := h.store.SaveSettings(set); err != nil {
+		t.Fatalf("SaveSettings: %v", err)
+	}
+
+	err = h.poller.Poll(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "panelCa") {
+		t.Fatalf("Poll with a broken panelCa: err = %v, want one naming panelCa", err)
+	}
+	if n := len(h.stub.Requests()); n != 0 {
+		t.Fatalf("stub saw %d requests, want none with a broken panelCa", n)
 	}
 }

@@ -31,6 +31,7 @@ type settingsPayload struct {
 	PanelUrl string `json:"panelUrl"`
 	MonToken string `json:"monToken"`
 	RealHost string `json:"realHost"`
+	PanelCa  string `json:"panelCa"`
 
 	TgToken  string `json:"tgToken"`
 	TgChatId string `json:"tgChatId"`
@@ -58,7 +59,7 @@ type settingsPayload struct {
 // not edit, and an explicit list makes that omission visible in review.
 func toPayload(s *store.Settings) settingsPayload {
 	return settingsPayload{
-		PanelUrl: s.PanelURL, MonToken: s.MonToken, RealHost: s.RealHost,
+		PanelUrl: s.PanelURL, MonToken: s.MonToken, RealHost: s.RealHost, PanelCa: s.PanelCA,
 		TgToken: s.TgToken, TgChatId: s.TgChatID,
 		DownAfter: s.DownAfter, UpAfter: s.UpAfter, FlapN: s.FlapN, FlapMin: s.FlapMin,
 		FlapHoldMin: s.FlapHoldMin, ClientOfflineAfter: s.ClientOfflineAfter, PanelDownAfter: s.PanelDownAfter,
@@ -70,6 +71,7 @@ func toPayload(s *store.Settings) settingsPayload {
 func (p settingsPayload) toSettings() *store.Settings {
 	return &store.Settings{
 		PanelURL: strings.TrimSpace(p.PanelUrl), MonToken: strings.TrimSpace(p.MonToken), RealHost: strings.TrimSpace(p.RealHost),
+		PanelCA: strings.TrimSpace(p.PanelCa),
 		TgToken: strings.TrimSpace(p.TgToken), TgChatID: strings.TrimSpace(p.TgChatId),
 		DownAfter: p.DownAfter, UpAfter: p.UpAfter, FlapN: p.FlapN, FlapMin: p.FlapMin,
 		FlapHoldMin: p.FlapHoldMin, ClientOfflineAfter: p.ClientOfflineAfter, PanelDownAfter: p.PanelDownAfter,
@@ -81,9 +83,13 @@ func (p settingsPayload) toSettings() *store.Settings {
 // validate rejects a negative number in any field (spec §9.4's thresholds
 // and probe parameters are all counts or milliseconds; none of them has a
 // meaning below zero, and a negative probe timeout would be handed to every
-// mon-client in its config). The message names the field so the page can
+// mon-client in its config) and a panelCa that is not a PEM certificate
+// chain (decision #52 §1). The message names the field so the page can
 // point at it.
 func (p settingsPayload) validate() error {
+	if _, err := panel.ParseCA(p.PanelCa); err != nil {
+		return err
+	}
 	ints := []struct {
 		name string
 		v    int
@@ -153,17 +159,23 @@ func (h *Handler) getSettings(c *gin.Context) {
 // panel itself just to draw this line.
 func (h *Handler) panelStatus(c *gin.Context, set *store.Settings) gin.H {
 	status := gin.H{
-		"configured": set.PanelURL != "" && set.MonToken != "",
-		"reachable":  false,
-		"polled":     false,
-		"revision":   "",
-		"inbounds":   0,
-		"override":   gin.H{"enabled": false, "host": ""},
+		"configured":       set.PanelURL != "" && set.MonToken != "",
+		"reachable":        false,
+		"unknownAuthority": false,
+		"polled":           false,
+		"revision":         "",
+		"inbounds":         0,
+		"override":         gin.H{"enabled": false, "host": ""},
 	}
 	if h.deps.Poller == nil {
 		return status
 	}
 	status["reachable"] = !h.deps.Poller.PanelDown()
+	// Decision #52 §1: an untrusted panel certificate gets its own text on
+	// the status line, pointing at panelCa, rather than a bare
+	// "unreachable" (or "not polled yet", which is all a panel that has
+	// never passed the handshake would otherwise show).
+	status["unknownAuthority"] = h.deps.Poller.UnknownAuthority()
 
 	material, have := h.deps.Poller.Material()
 	if !have {
@@ -187,18 +199,24 @@ func (h *Handler) panelStatus(c *gin.Context, set *store.Settings) gin.H {
 // reminder that the password is changed on the box.
 func (h *Handler) bootstrapBlock() gin.H {
 	out := gin.H{
-		"listen":       h.listen(),
-		"publicIp":     h.publicIP(),
-		"dataDir":      "",
-		"tlsMode":      "",
-		"adminCommand": adminCommandHint,
-		"cert":         nil,
+		"listen":        h.listen(),
+		"publicIp":      h.publicIP(),
+		"dataDir":       "",
+		"tlsMode":       "",
+		"acmeCa":        "",
+		"acmeDirectory": "",
+		"adminCommand":  adminCommandHint,
+		"cert":          nil,
 	}
 	if h.deps.Cfg == nil {
 		return out
 	}
 	out["dataDir"] = h.deps.Cfg.DataDir
 	out["tlsMode"] = h.deps.Cfg.TLS.Mode
+	// tls.acmeCa (decision #52 §2): the name as configured and the ACME
+	// directory it resolves to, so a stand on staging is visibly so.
+	out["acmeCa"] = h.deps.Cfg.TLS.ACMECA
+	out["acmeDirectory"] = tlsx.ACMEDirectory(h.deps.Cfg.TLS.ACMECA)
 
 	info, err := tlsx.InspectCert(h.deps.Cfg.TLS, h.deps.Cfg.DataDir)
 	if err != nil {
@@ -277,10 +295,18 @@ func (h *Handler) saveSettings(c *gin.Context) {
 type checkBody struct {
 	PanelUrl string `json:"panelUrl"`
 	MonToken string `json:"monToken"`
+	PanelCa  string `json:"panelCa"`
 }
 
-// checkPanel calls GET /state with the submitted credentials and reports
-// what came back. It saves nothing, touches no settings row, and never
+// msgUnknownAuthority is Check's text for a panel certificate that the
+// current trust does not cover (decision #52 §1): the cure is specific, so
+// the message names it instead of lumping it in with "did not answer".
+const msgUnknownAuthority = "The panel's TLS certificate is not trusted (x509: certificate signed by unknown authority). " +
+	"If the panel uses a self-signed or private certificate, paste it (PEM) into Panel CA — " +
+	"mon-server then trusts exactly that chain for the panel instead of the system CAs."
+
+// checkPanel calls GET /state with the submitted credentials — panelCa
+// included — and reports what came back. It saves nothing, touches no settings row, and never
 // disturbs the poll loop's own client.
 func (h *Handler) checkPanel(c *gin.Context) {
 	var body checkBody
@@ -294,9 +320,18 @@ func (h *Handler) checkPanel(c *gin.Context) {
 		fail(c, http.StatusBadRequest, "Panel URL and monitoring token are both required.")
 		return
 	}
-
-	st, err := h.deps.NewPanelClient(url, token).State(c.Request.Context())
+	roots, err := panel.ParseCA(body.PanelCa)
 	if err != nil {
+		fail(c, http.StatusBadRequest, err.Error()+".")
+		return
+	}
+
+	st, err := h.deps.NewPanelClient(url, token, roots).State(c.Request.Context())
+	if err != nil {
+		if panel.IsUnknownAuthority(err) {
+			fail(c, http.StatusBadGateway, msgUnknownAuthority)
+			return
+		}
 		// A bare 404 is the panel's deliberate answer to anyone without a
 		// valid monToken, and to everyone when monitoring is switched off
 		// (contract §2) — it is never "no such route", so the message has

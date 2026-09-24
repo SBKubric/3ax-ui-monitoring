@@ -22,11 +22,22 @@ import (
 )
 
 // WriteSelfSigned generates a fresh ECDSA P-256 key and a self-signed
-// certificate valid for "localhost" and 127.0.0.1/::1, writes them as
-// cert.pem and key.pem under dir, and returns their paths. It is deliberately
-// not a fixture checked into the repo: a certificate generated fresh per test
-// run can never go stale or leak a key anyone might mistake for real.
+// certificate valid for "localhost" and the IP SANs 127.0.0.1/::1, writes
+// them as cert.pem and key.pem under dir, and returns their paths. The IP
+// SANs matter: tls.mode=files requires one equal to publicIp (decision #52
+// §4), so a test running mon-server on loopback sets publicIp 127.0.0.1. It
+// is deliberately not a fixture checked into the repo: a certificate
+// generated fresh per test run can never go stale or leak a key anyone might
+// mistake for real.
 func WriteSelfSigned(t testing.TB, dir string) (cert, key string) {
+	t.Helper()
+	return WriteCert(t, dir, []string{"localhost"}, []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")})
+}
+
+// WriteCert is WriteSelfSigned with the SANs chosen by the caller — for a
+// test that needs a certificate for some other IP, or one with no IP SAN at
+// all (a domain-only certificate, which "files" mode must refuse).
+func WriteCert(t testing.TB, dir string, dnsNames []string, ips []net.IP) (cert, key string) {
 	t.Helper()
 
 	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -47,8 +58,8 @@ func WriteSelfSigned(t testing.TB, dir string) (cert, key string) {
 		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		IsCA:         true,
-		DNSNames:     []string{"localhost"},
-		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")},
+		DNSNames:     dnsNames,
+		IPAddresses:  ips,
 	}
 
 	der, err := x509.CreateCertificate(rand.Reader, template, template, &priv.PublicKey, priv)

@@ -321,3 +321,55 @@ func TestOpen_CreatesMissingDataDir(t *testing.T) {
 	}
 	_ = s
 }
+
+// TestOpen_TightensPermissions checks decision #52 §5: the database holds
+// monToken and tgToken, so Open leaves dataDir at 0700 and mon-server.db at
+// 0600 on every start — on a fresh install, and on an existing one whose
+// directory and file were created looser (the live stand had 0755/0644),
+// which Open repairs rather than only getting new installs right.
+func TestOpen_TightensPermissions(t *testing.T) {
+	cases := []struct {
+		name  string
+		setup func(t *testing.T, dir, db string)
+	}{
+		{"fresh install", func(*testing.T, string, string) {}},
+		{"loose existing install", func(t *testing.T, dir, db string) {
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(dir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(db, nil, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(db, 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "mon-server")
+			db := filepath.Join(dir, "mon-server.db")
+			tc.setup(t, dir, db)
+
+			if _, err := Open(db); err != nil {
+				t.Fatalf("Open: %v", err)
+			}
+			assertMode(t, dir, 0o700)
+			assertMode(t, db, 0o600)
+		})
+	}
+}
+
+func assertMode(t *testing.T, path string, want os.FileMode) {
+	t.Helper()
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat %s: %v", path, err)
+	}
+	if got := fi.Mode().Perm(); got != want {
+		t.Fatalf("%s mode = %o, want %o", path, got, want)
+	}
+}

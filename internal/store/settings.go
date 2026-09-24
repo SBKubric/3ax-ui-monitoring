@@ -14,6 +14,7 @@ const (
 	settingPanelURL = "panelUrl"
 	settingMonToken = "monToken"
 	settingRealHost = "realHost"
+	settingPanelCA  = "panelCa"
 
 	settingTgToken  = "tgToken"
 	settingTgChatID = "tgChatId"
@@ -42,7 +43,12 @@ const (
 // threshold or the panel URL never requires a restart.
 type Settings struct {
 	PanelURL, MonToken, RealHost string
-	TgToken, TgChatID            string
+	// PanelCA is a PEM chain (decision #52 §1): when set, requests to the
+	// panel trust exactly these certificates instead of the system pool —
+	// a stand panel on a self-signed certificate is trusted by pasting that
+	// certificate here. Empty means the system pool.
+	PanelCA           string
+	TgToken, TgChatID string
 
 	DownAfter, UpAfter, FlapN, FlapMin, FlapHoldMin, ClientOfflineAfter, PanelDownAfter int
 
@@ -50,7 +56,7 @@ type Settings struct {
 }
 
 // DefaultSettings returns the spec's defaults (§9.4) for every threshold and
-// probe parameter. PanelURL, MonToken, RealHost, TgToken and TgChatID have no
+// probe parameter. PanelURL, MonToken, RealHost, PanelCA, TgToken and TgChatID have no
 // sane default — an empty string there means "not configured yet", which the
 // admin UI and the panel poll loop (step 3) both treat as "nothing to do".
 func DefaultSettings() *Settings {
@@ -92,6 +98,7 @@ func (s *Store) LoadSettings() (*Settings, error) {
 	out.PanelURL = strOr(kv, settingPanelURL, out.PanelURL)
 	out.MonToken = strOr(kv, settingMonToken, out.MonToken)
 	out.RealHost = strOr(kv, settingRealHost, out.RealHost)
+	out.PanelCA = strOr(kv, settingPanelCA, out.PanelCA)
 	out.TgToken = strOr(kv, settingTgToken, out.TgToken)
 	out.TgChatID = strOr(kv, settingTgChatID, out.TgChatID)
 
@@ -123,6 +130,7 @@ func (s *Store) SaveSettings(set *Settings) error {
 		{Key: settingPanelURL, Value: set.PanelURL},
 		{Key: settingMonToken, Value: set.MonToken},
 		{Key: settingRealHost, Value: set.RealHost},
+		{Key: settingPanelCA, Value: set.PanelCA},
 		{Key: settingTgToken, Value: set.TgToken},
 		{Key: settingTgChatID, Value: set.TgChatID},
 

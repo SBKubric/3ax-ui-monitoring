@@ -3,6 +3,7 @@ package admin
 import (
 	"bytes"
 	"context"
+	"crypto/x509"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -32,13 +33,15 @@ const (
 // admin.PanelStatus (so the Settings page has a status line), without a poll
 // cycle or a network.
 type fakeMaterial struct {
-	mat  panel.Material
-	have bool
-	down bool
+	mat       panel.Material
+	have      bool
+	down      bool
+	untrusted bool
 }
 
 func (f *fakeMaterial) Material() (panel.Material, bool) { return f.mat, f.have }
 func (f *fakeMaterial) PanelDown() bool                  { return f.down }
+func (f *fakeMaterial) UnknownAuthority() bool           { return f.untrusted }
 
 // fakeTelegram records what "Send test" sent, standing in for tg.HTTP where a
 // test does not need a real Bot API round trip.
@@ -71,7 +74,7 @@ type harness struct {
 	// panelClients records every (url, token) pair the Check button built a
 	// client for, so a test can prove it used the submitted values.
 	panelClients []string
-	newPanel     func(url, token string) panel.Client
+	newPanel     func(url, token string, rootCAs *x509.CertPool) panel.Client
 }
 
 func newHarness(t *testing.T) *harness {
@@ -104,12 +107,12 @@ func newHarness(t *testing.T) *harness {
 		Poller:   mat,
 		Cfg:      &config.Config{Listen: ":443", PublicIP: "192.0.2.44", DataDir: t.TempDir(), TLS: config.TLSConfig{Mode: config.TLSModeACMEIP}},
 		Telegram: h.tg,
-		NewPanelClient: func(url, token string) panel.Client {
+		NewPanelClient: func(url, token string, rootCAs *x509.CertPool) panel.Client {
 			h.panelClients = append(h.panelClients, url+"|"+token)
 			if h.newPanel != nil {
-				return h.newPanel(url, token)
+				return h.newPanel(url, token, rootCAs)
 			}
-			return panel.NewHTTPClient(url, token, clk)
+			return panel.NewHTTPClient(url, token, clk, panel.WithRootCAs(rootCAs))
 		},
 	})
 	h.srv = api.New()
