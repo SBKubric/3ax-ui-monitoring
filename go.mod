@@ -11,6 +11,7 @@ require (
 	golang.org/x/term v0.42.0
 	gorm.io/driver/sqlite v1.6.0
 	gorm.io/gorm v1.31.1
+	gvisor.dev/gvisor v0.0.0-20231202080848-1f7806d17489
 )
 
 require (
@@ -59,5 +60,4 @@ require (
 	golang.org/x/tools v0.44.0 // indirect
 	golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2 // indirect
 	google.golang.org/protobuf v1.36.10 // indirect
-	gvisor.dev/gvisor v0.0.0-20231202080848-1f7806d17489 // indirect
 )

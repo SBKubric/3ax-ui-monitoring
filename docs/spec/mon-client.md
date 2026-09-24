@@ -74,7 +74,7 @@ internal/heartbeat/           — отправка, буфер, ackSeq
 docs/spec/mon-client.md
 ```
 
-Зависимости: `github.com/amnezia-vpn/amneziawg-go/v3` (device, conn, tun/netstack), `golang.org/x/net/proxy` (socks5 dialer не нужен: `Transport.Proxy` умеет `socks5://`), стандартная библиотека.
+Зависимости: `github.com/amnezia-vpn/amneziawg-go/v3` (device, conn, tun) и `gvisor.dev/gvisor` (стек netstack; обёртка TUN своя — копия `tun/netstack` с безопасным `Close`, #69), `golang.org/x/net/proxy` (socks5 dialer не нужен: `Transport.Proxy` умеет `socks5://`), стандартная библиотека.
 
 ## 9. Открытое из research (UNVERIFIED, не блокирует)
 
