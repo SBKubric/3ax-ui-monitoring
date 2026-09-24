@@ -584,3 +584,63 @@ func TestRebuildAllThroughPoller(t *testing.T) {
 		t.Fatalf("config revision unchanged (%q) after a panel revision with new material", first)
 	}
 }
+
+// TestExclusions_Reason is decision #51 §3: a target outside a mon-client's
+// config for a reason that is not its inbound gets the reason it is PAUSED
+// with. An inbound that is disabled or gone is not this function's business
+// (SyncInbounds pauses those with config_disabled), and without material
+// nothing can be said at all.
+func TestExclusions_Reason(t *testing.T) {
+	proxy12 := TargetKey{InboundKind: store.InboundKindXray, InboundID: 12, Path: store.PathProxy}
+	direct12 := TargetKey{InboundKind: store.InboundKindXray, InboundID: 12, Path: store.PathDirect}
+	direct13 := TargetKey{InboundKind: store.InboundKindXray, InboundID: 13, Path: store.PathDirect}
+	direct14 := TargetKey{InboundKind: store.InboundKindXray, InboundID: 14, Path: store.PathDirect}
+	direct99 := TargetKey{InboundKind: store.InboundKindXray, InboundID: 99, Path: store.PathDirect}
+
+	cases := []struct {
+		name     string
+		paths    []string
+		override bool
+		key      TargetKey
+		want     string
+	}{
+		{"path taken off the mon-client", []string{store.PathProxy}, true, direct12, PausePathRemoved},
+		{"override switched off", []string{store.PathProxy, store.PathDirect}, false, proxy12, PauseOverrideDisabled},
+		{"path removed wins over override", []string{store.PathDirect}, false, proxy12, PausePathRemoved},
+		{"enabled inbound without a probe link", []string{store.PathDirect}, true, direct13, PauseNoProbeLink},
+		{"disabled inbound is the inbound's business", []string{store.PathDirect}, true, direct14, ""},
+		{"vanished inbound is the inbound's business", []string{store.PathDirect}, true, direct99, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b, r, st, clk, mat := newTestBuilder(t)
+			savePanelInbound(t, st, store.PanelInbound{InboundKind: store.InboundKindXray, InboundId: 13, Protocol: "vless", Enable: true})
+			savePanelInbound(t, st, store.PanelInbound{InboundKind: store.InboundKindXray, InboundId: 14, Protocol: "vless", Enable: false})
+			m := sampleMaterial()
+			m.Override.Enabled = tc.override
+			mat.m = m
+			mc := approve(t, r, clk, "ams-1", tc.paths)
+
+			x, err := b.Exclusions(context.Background(), mc.Id)
+			if err != nil {
+				t.Fatalf("Exclusions: %v", err)
+			}
+			if got := x.Reason(tc.key); got != tc.want {
+				t.Fatalf("Reason(%+v) = %q, want %q", tc.key, got, tc.want)
+			}
+		})
+	}
+
+	t.Run("no material says nothing", func(t *testing.T) {
+		b, r, _, clk, mat := newTestBuilder(t)
+		mat.ok = false
+		mc := approve(t, r, clk, "ams-1", []string{store.PathProxy})
+		x, err := b.Exclusions(context.Background(), mc.Id)
+		if err != nil {
+			t.Fatalf("Exclusions: %v", err)
+		}
+		if got := x.Reason(direct12); got != "" {
+			t.Fatalf("Reason without material = %q, want empty", got)
+		}
+	})
+}

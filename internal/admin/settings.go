@@ -1,10 +1,12 @@
 package admin
 
 import (
+	"context"
 	"errors"
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -117,14 +119,16 @@ func (p settingsPayload) validate() error {
 	return nil
 }
 
-// rebuildTriggered reports whether the saved settings change anything that
-// appears in a mon-client's config document (spec §9.4: "смена probe-
-// параметров или realHost пересобирает client_configs всем mon-clients").
+// rebuildTriggered reports whether the saved settings change a probe
+// parameter, which appears in every mon-client's config document (spec
+// §9.4: "смена probe-параметров пересобирает client_configs всем
+// mon-clients"). realHost reaches the documents too, but only through the
+// probe material the panel renders for it, so it is materialTriggered's:
+// rebuilding from material fetched for the old host would change nothing.
 // Nothing else in Settings reaches a mon-client, so nothing else may force
 // every box to re-fetch its config.
 func rebuildTriggered(old, updated *store.Settings) bool {
-	return old.RealHost != updated.RealHost ||
-		old.IntervalMs != updated.IntervalMs ||
+	return old.IntervalMs != updated.IntervalMs ||
 		old.BudgetMs != updated.BudgetMs ||
 		old.ConnectMs != updated.ConnectMs ||
 		old.TlsMs != updated.TlsMs ||
@@ -132,6 +136,20 @@ func rebuildTriggered(old, updated *store.Settings) bool {
 		old.StartJitterMs != updated.StartJitterMs ||
 		old.HeartbeatTimeoutMs != updated.HeartbeatTimeoutMs
 }
+
+// materialTriggered reports whether the saved settings change the address
+// the panel renders the direct-path links for (decision #51 §4): realHost,
+// or panelUrl — whose host is realHost's default, and which may point at a
+// different panel altogether. Neither is part of the panel's revision, so
+// the poller would otherwise go on serving links for the old address.
+func materialTriggered(old, updated *store.Settings) bool {
+	return old.RealHost != updated.RealHost || old.PanelURL != updated.PanelURL
+}
+
+// refreshTimeout bounds Save's material refresh: the panel client retries a
+// failing request for up to a minute (spec §4), which is far too long to
+// hold a Save; the poller finishes an unfinished refresh on its own.
+const refreshTimeout = 20 * time.Second
 
 // getSettings answers the Settings page: the editable settings, the panel
 // status line, the read-only proxy front from the last GET /state, and the
@@ -269,7 +287,33 @@ func (h *Handler) saveSettings(c *gin.Context) {
 	}
 
 	rebuilt := false
-	if rebuildTriggered(old, updated) && h.deps.Configs != nil {
+	if materialTriggered(old, updated) && h.deps.Poller != nil {
+		// Decision #51 §4: the cached material holds links for the old
+		// address. Refreshing it rebuilds every config as well, so on
+		// success there is nothing left for the probe-parameter rebuild
+		// below to do.
+		ctx, cancel := context.WithTimeout(c.Request.Context(), refreshTimeout)
+		err := h.deps.Poller.RefreshMaterial(ctx)
+		cancel()
+		switch {
+		case errors.Is(err, panel.ErrPanelNotConfigured):
+			// No panel yet, so no material to refresh: an ordinary save.
+		case err != nil:
+			slog.Warn("admin: re-reading the probe material after a settings save failed", "err", err)
+			if rebuildTriggered(old, updated) && h.deps.Configs != nil {
+				// The probe parameters still reach every mon-client now.
+				if err := h.deps.Configs.RebuildAll(c.Request.Context()); err != nil {
+					slog.Error("admin: rebuilding mon-client configs after a settings save failed", "err", err)
+				}
+			}
+			okMsg(c, "Saved, but re-reading the probe configs from the panel failed ("+err.Error()+") — the next panel poll will retry.",
+				gin.H{"settings": toPayload(updated), "rebuilt": false})
+			return
+		default:
+			rebuilt = true
+		}
+	}
+	if !rebuilt && rebuildTriggered(old, updated) && h.deps.Configs != nil {
 		if err := h.deps.Configs.RebuildAll(c.Request.Context()); err != nil {
 			// The settings are already saved and correct; a failed rebuild
 			// is redone by the next panel revision, so this is a warning to
@@ -296,6 +340,9 @@ type checkBody struct {
 	PanelUrl string `json:"panelUrl"`
 	MonToken string `json:"monToken"`
 	PanelCa  string `json:"panelCa"`
+	// RealHost is the typed realHost the direct probe links are asked for
+	// (decision #51 §4); empty means the host of PanelUrl, as for Save.
+	RealHost string `json:"realHost"`
 }
 
 // msgUnknownAuthority is Check's text for a panel certificate that the
@@ -326,7 +373,8 @@ func (h *Handler) checkPanel(c *gin.Context) {
 		return
 	}
 
-	st, err := h.deps.NewPanelClient(url, token, roots).State(c.Request.Context())
+	cl := h.deps.NewPanelClient(url, token, roots)
+	st, err := cl.State(c.Request.Context())
 	if err != nil {
 		if panel.IsUnknownAuthority(err) {
 			fail(c, http.StatusBadGateway, msgUnknownAuthority)
@@ -348,14 +396,52 @@ func (h *Handler) checkPanel(c *gin.Context) {
 	if st.Probe.SubId != nil {
 		subID = *st.Probe.SubId
 	}
-	okMsg(c, "Panel reachable.", gin.H{
+	host := panel.DirectHost(strings.TrimSpace(body.RealHost), url)
+	items, probeErr := checkProbeConfigs(c.Request.Context(), cl, host, st.Override.Enabled)
+	msg := "Panel reachable."
+	if probeErr != "" {
+		msg = "Panel reachable, but the probe configs could not be read: " + probeErr
+	}
+	okMsg(c, msg, gin.H{
 		"revision":     st.Revision,
 		"inbounds":     len(st.Inbounds),
 		"override":     gin.H{"enabled": st.Override.Enabled, "host": st.Override.Host},
 		"panelVersion": st.PanelVersion,
 		"serverTime":   st.ServerTime,
 		"probeSubId":   subID,
+		"realHost":     host,
+		"probeItems":   items,
+		"probeError":   probeErr,
 	})
+}
+
+// checkProbeConfigs is Check's dry run of the material read (decision #51
+// §4, "Check делает то же на лету без сохранения"): GET /probe/configs for
+// the direct path at host and, with the override on, for the proxy path,
+// counting the links that came back. Nothing is kept — the poller's
+// material and the config documents are untouched. A refusal is reported
+// as text, not as a failed Check: the panel did answer, and the usual
+// cause — a probe set the poller has not ensured yet — is not the typed
+// values' fault.
+func checkProbeConfigs(ctx context.Context, cl panel.Client, host string, override bool) (gin.H, string) {
+	items := gin.H{"direct": 0, "proxy": 0}
+	if host == "" {
+		return items, "no realHost and no host in the panel URL"
+	}
+	direct, err := cl.ProbeConfigs(ctx, host)
+	if err != nil {
+		return items, err.Error()
+	}
+	items["direct"] = len(direct.Items)
+	if !override {
+		return items, ""
+	}
+	proxy, err := cl.ProbeConfigs(ctx, "")
+	if err != nil {
+		return items, err.Error()
+	}
+	items["proxy"] = len(proxy.Items)
+	return items, ""
 }
 
 // telegramBody is the "Send test" button's submission — again the values

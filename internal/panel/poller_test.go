@@ -1268,3 +1268,130 @@ func TestPoll_BrokenPanelCAFailsCycle(t *testing.T) {
 		t.Fatalf("stub saw %d requests, want none with a broken panelCa", n)
 	}
 }
+
+// directHosts lists the ?host= of every GET /probe/configs for the direct
+// path, in order.
+func (h *harness) directHosts() []string {
+	var out []string
+	for _, r := range h.stub.Requests() {
+		if strings.HasSuffix(r.Path, "/probe/configs") && r.Query.Get("host") != "" {
+			out = append(out, r.Query.Get("host"))
+		}
+	}
+	return out
+}
+
+// TestPoll_RealHostChangeRereadsConfigs is decision #51 §4: the direct
+// material is rendered for realHost, and a new realHost does not move the
+// panel's revision, so the revision alone must not decide that the material
+// is current — the next poll re-reads it for the new host and rebuilds.
+func TestPoll_RealHostChangeRereadsConfigs(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	if err := h.poller.Poll(ctx); err != nil {
+		t.Fatalf("first Poll: %v", err)
+	}
+
+	set, err := h.store.LoadSettings()
+	if err != nil {
+		t.Fatalf("LoadSettings: %v", err)
+	}
+	set.RealHost = "new-real.example.net"
+	if err := h.store.SaveSettings(set); err != nil {
+		t.Fatalf("SaveSettings: %v", err)
+	}
+	if err := h.poller.Poll(ctx); err != nil {
+		t.Fatalf("second Poll: %v", err)
+	}
+
+	if got := h.directHosts(); len(got) != 2 || got[1] != "new-real.example.net" {
+		t.Fatalf("direct fetches = %v, want a second one for the new realHost", got)
+	}
+	if h.configs.calls() != 2 {
+		t.Fatalf("RebuildAll called %d times, want 2", h.configs.calls())
+	}
+	if mat, _ := h.poller.Material(); mat.Host != "new-real.example.net" {
+		t.Fatalf("material host = %q, want the new realHost", mat.Host)
+	}
+}
+
+// TestRefreshMaterial_ForcesConfigsAndRebuild is Settings Save's side of
+// decision #51 §4: the cached material is invalidated and re-read right
+// away, and every config rebuilt, even though the panel's revision has not
+// moved.
+func TestRefreshMaterial_ForcesConfigsAndRebuild(t *testing.T) {
+	h := newHarness(t)
+	h.stub.SetOverride(true, "front.example.net")
+	ctx := context.Background()
+	if err := h.poller.Poll(ctx); err != nil {
+		t.Fatalf("Poll: %v", err)
+	}
+
+	if err := h.poller.RefreshMaterial(ctx); err != nil {
+		t.Fatalf("RefreshMaterial: %v", err)
+	}
+	direct, proxy := h.configFetches()
+	if direct != 2 || proxy != 2 {
+		t.Fatalf("fetched direct=%d proxy=%d, want both paths re-read (2 and 2)", direct, proxy)
+	}
+	if h.configs.calls() != 2 {
+		t.Fatalf("RebuildAll called %d times, want 2", h.configs.calls())
+	}
+
+	// The forced read was consumed: an ordinary poll is back to "unchanged
+	// revision, nothing to do".
+	if err := h.poller.Poll(ctx); err != nil {
+		t.Fatalf("Poll: %v", err)
+	}
+	if direct, _ := h.configFetches(); direct != 2 {
+		t.Fatalf("a poll after the refresh re-read configs again (direct=%d)", direct)
+	}
+}
+
+// TestRefreshMaterial_FailureLeavesItToTheNextPoll: a panel that cannot be
+// reached at Save time does not lose the refresh — the invalidation stays,
+// and the next poll re-reads the material although the revision is the
+// same.
+func TestRefreshMaterial_FailureLeavesItToTheNextPoll(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	if err := h.poller.Poll(ctx); err != nil {
+		t.Fatalf("Poll: %v", err)
+	}
+
+	h.stub.FailNextOn("/probe/configs", 4, http.StatusInternalServerError)
+	if err := h.poller.RefreshMaterial(ctx); err == nil {
+		t.Fatal("RefreshMaterial succeeded against a failing panel")
+	}
+	if h.configs.calls() != 1 {
+		t.Fatalf("RebuildAll called %d times after a failed refresh, want 1", h.configs.calls())
+	}
+
+	if err := h.poller.Poll(ctx); err != nil {
+		t.Fatalf("Poll: %v", err)
+	}
+	if h.configs.calls() != 2 {
+		t.Fatalf("RebuildAll called %d times, want the next poll to finish the refresh (2)", h.configs.calls())
+	}
+}
+
+// TestRefreshMaterial_UnconfiguredPanelSaysSo: with no panel URL or token
+// there is nothing to refresh from, and the caller (Settings Save) must not
+// report configs as rebuilt.
+func TestRefreshMaterial_UnconfiguredPanelSaysSo(t *testing.T) {
+	h := newHarness(t)
+	set, err := h.store.LoadSettings()
+	if err != nil {
+		t.Fatalf("LoadSettings: %v", err)
+	}
+	set.MonToken = ""
+	if err := h.store.SaveSettings(set); err != nil {
+		t.Fatalf("SaveSettings: %v", err)
+	}
+	if err := h.poller.RefreshMaterial(context.Background()); !errors.Is(err, panel.ErrPanelNotConfigured) {
+		t.Fatalf("RefreshMaterial = %v, want ErrPanelNotConfigured", err)
+	}
+	if h.configs.calls() != 0 {
+		t.Fatalf("RebuildAll called %d times, want 0", h.configs.calls())
+	}
+}

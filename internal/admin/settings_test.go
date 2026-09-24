@@ -3,6 +3,7 @@ package admin
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -136,9 +137,10 @@ func TestSettings_SaveProbeRebuildsEveryConfig(t *testing.T) {
 }
 
 // TestSettings_SaveRealHostRebuilds: the other trigger spec §9.4 names.
-// The assertion is that the rebuild ran, not that the revision moved: a
-// realHost change reaches a document through the direct probe items the
-// panel hands back for the new host, and this test's material is fixed.
+// The assertion is that the rebuild ran (through the poller's material
+// refresh, decision #51 §4), not that the revision moved: a realHost change
+// reaches a document through the direct probe items the panel hands back
+// for the new host, and this test's material is fixed.
 func TestSettings_SaveRealHostRebuilds(t *testing.T) {
 	h := newHarness(t)
 	h.login()
@@ -445,5 +447,178 @@ func TestSettings_GetStatusUnknownAuthorityAndACMECA(t *testing.T) {
 	b := o["bootstrap"].(map[string]any)
 	if b["acmeCa"] != "staging" || b["acmeDirectory"] != "https://acme-staging-v02.api.letsencrypt.org/directory" {
 		t.Fatalf("bootstrap = %+v, want acmeCa staging and its directory", b)
+	}
+}
+
+// TestSettings_SavePanelAddressRefreshesMaterial is decision #51 §4: the
+// direct links are rendered for realHost (by default the host of
+// panelUrl), and neither moves the panel's revision, so a Save that changes
+// either makes the poller drop its cached material, re-read
+// /probe/configs and rebuild every config — right away, not whenever the
+// panel's revision next happens to move.
+func TestSettings_SavePanelAddressRefreshesMaterial(t *testing.T) {
+	for _, field := range []string{"realHost", "panelUrl"} {
+		t.Run(field, func(t *testing.T) {
+			h := newHarness(t)
+			h.login()
+			h.withMaterial()
+
+			body := h.settingsBody()
+			body[field] = "https://changed.example.net/panel/"
+			if field == "realHost" {
+				body[field] = "changed.example.net"
+			}
+			w := h.do(http.MethodPost, "/admin/api/settings", body)
+			if w.Code != http.StatusOK {
+				t.Fatalf("save: %s", w.Body.String())
+			}
+			if h.mat.refreshes != 1 {
+				t.Fatalf("RefreshMaterial called %d times, want 1", h.mat.refreshes)
+			}
+			if obj(t, w)["rebuilt"] != true {
+				t.Fatalf("rebuilt = %v, want true", obj(t, w)["rebuilt"])
+			}
+		})
+	}
+}
+
+// TestSettings_SaveOtherFieldsDoNotRefreshMaterial: only the panel address
+// reaches the probe material.
+func TestSettings_SaveOtherFieldsDoNotRefreshMaterial(t *testing.T) {
+	h := newHarness(t)
+	h.login()
+	h.withMaterial()
+
+	body := h.settingsBody()
+	body["intervalMs"] = 30000
+	body["tgChatId"] = "-100"
+	if w := h.do(http.MethodPost, "/admin/api/settings", body); w.Code != http.StatusOK {
+		t.Fatalf("save: %s", w.Body.String())
+	}
+	if h.mat.refreshes != 0 {
+		t.Fatalf("RefreshMaterial called %d times, want 0", h.mat.refreshes)
+	}
+}
+
+// TestSettings_SaveRefreshFailureStillSaves: an unreachable panel does not
+// fail the Save — the settings are right, and the poller finishes the
+// refresh on its next cycle — but the answer says the configs were not
+// rebuilt yet.
+func TestSettings_SaveRefreshFailureStillSaves(t *testing.T) {
+	h := newHarness(t)
+	h.login()
+	h.withMaterial()
+	h.mat.refreshErr = errors.New("panel: connection refused")
+
+	body := h.settingsBody()
+	body["realHost"] = "changed.example.net"
+	w := h.do(http.MethodPost, "/admin/api/settings", body)
+	if w.Code != http.StatusOK {
+		t.Fatalf("save: %s", w.Body.String())
+	}
+	if obj(t, w)["rebuilt"] != false {
+		t.Fatalf("rebuilt = %v, want false", obj(t, w)["rebuilt"])
+	}
+	if msg := decode(t, w).Msg; !strings.Contains(msg, "next panel poll") {
+		t.Fatalf("msg = %q, want it to say the next poll retries", msg)
+	}
+	if set, _ := h.st.LoadSettings(); set.RealHost != "changed.example.net" {
+		t.Fatalf("realHost = %q, want it saved anyway", set.RealHost)
+	}
+}
+
+// TestSettings_CheckReadsProbeConfigsForTypedRealHost is Check's half of
+// decision #51 §4: with the typed panel address it also asks for the probe
+// material — the direct path for the typed realHost, the proxy path when the
+// override is on — and reports how many links came back, still saving and
+// refreshing nothing.
+func TestSettings_CheckReadsProbeConfigsForTypedRealHost(t *testing.T) {
+	h := newHarness(t)
+	h.login()
+	h.withMaterial()
+
+	stub := paneltest.NewStub(t)
+	sub := "sub-1"
+	stub.SetProbeSubID(&sub)
+	stub.SetInbounds([]panel.Inbound{{Kind: store.InboundKindXray, InboundId: 12, Protocol: "vless", Port: 443, Enable: true}})
+	stub.SetOverride(true, "front.example.net")
+	stub.SetItems("direct", []panel.ProbeItem{{Kind: store.InboundKindXray, InboundId: 12, Link: "vless://direct"}})
+	stub.SetItems("proxy", []panel.ProbeItem{
+		{Kind: store.InboundKindXray, InboundId: 12, Link: "vless://proxy"},
+		{Kind: store.InboundKindAwg, InboundId: 0, Conf: "[Peer]"},
+	})
+
+	w := h.do(http.MethodPost, "/admin/api/settings/check", map[string]any{
+		"panelUrl": stub.URL(), "monToken": stub.Token(), "realHost": "typed.example.net",
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d, body %s", w.Code, w.Body.String())
+	}
+	o := obj(t, w)
+	if o["realHost"] != "typed.example.net" {
+		t.Fatalf("realHost = %v, want the typed one", o["realHost"])
+	}
+	items, _ := o["probeItems"].(map[string]any)
+	if items["direct"] != float64(1) || items["proxy"] != float64(2) {
+		t.Fatalf("probeItems = %+v, want direct 1, proxy 2", o["probeItems"])
+	}
+	var hosts []string
+	for _, r := range stub.Requests() {
+		if strings.HasSuffix(r.Path, "/probe/configs") {
+			hosts = append(hosts, r.Query.Get("host"))
+		}
+	}
+	if len(hosts) != 2 || hosts[0] != "typed.example.net" || hosts[1] != "" {
+		t.Fatalf("probe/configs hosts = %q, want the typed realHost, then the proxy path", hosts)
+	}
+	if h.mat.refreshes != 0 {
+		t.Fatalf("Check refreshed the poller's material (%d)", h.mat.refreshes)
+	}
+	if set, _ := h.st.LoadSettings(); set.RealHost != "" || set.PanelURL != "" {
+		t.Fatalf("Check saved the settings: %+v", set)
+	}
+}
+
+// TestSettings_CheckProbeConfigsFailureIsReported: the panel answering
+// /state but refusing /probe/configs (a probe set never ensured) is still
+// "reachable", with the refusal named.
+func TestSettings_CheckProbeConfigsFailureIsReported(t *testing.T) {
+	h := newHarness(t)
+	h.login()
+
+	stub := paneltest.NewStub(t)
+	stub.SetInbounds([]panel.Inbound{{Kind: store.InboundKindXray, InboundId: 12, Protocol: "vless", Port: 443, Enable: true}})
+
+	w := h.do(http.MethodPost, "/admin/api/settings/check", map[string]any{
+		"panelUrl": stub.URL(), "monToken": stub.Token(),
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d, body %s", w.Code, w.Body.String())
+	}
+	o := obj(t, w)
+	if msg, _ := o["probeError"].(string); !strings.Contains(msg, "probe_not_ensured") {
+		t.Fatalf("probeError = %v, want the panel's refusal", o["probeError"])
+	}
+	if o["realHost"] != "127.0.0.1" {
+		t.Fatalf("realHost = %v, want the panel URL's host by default", o["realHost"])
+	}
+}
+
+// TestSettings_SaveRealHostWithoutPanelIsJustSaved: before the panel is
+// configured there is no material to refresh, and Save says "Saved." rather
+// than claiming a rebuild or a failure.
+func TestSettings_SaveRealHostWithoutPanelIsJustSaved(t *testing.T) {
+	h := newHarness(t)
+	h.login()
+	h.mat.refreshErr = panel.ErrPanelNotConfigured
+
+	body := h.settingsBody()
+	body["realHost"] = "changed.example.net"
+	w := h.do(http.MethodPost, "/admin/api/settings", body)
+	if w.Code != http.StatusOK {
+		t.Fatalf("save: %s", w.Body.String())
+	}
+	if obj(t, w)["rebuilt"] != false || decode(t, w).Msg != "Saved." {
+		t.Fatalf("answer = %s, want a plain \"Saved.\" with rebuilt=false", w.Body.String())
 	}
 }

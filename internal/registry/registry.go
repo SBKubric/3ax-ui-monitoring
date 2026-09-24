@@ -172,6 +172,15 @@ type Hooks struct {
 	// freshly approved mon-client's very first GET /v1/config would depend
 	// on whenever the next panel revision happens to land.
 	Approved func(ctx context.Context, monClientID string) error
+	// Revoked is called inside Revoke's transaction, before the registry
+	// clears the token and sets state=OFFLINE, with the mon-client row as it
+	// stood until then — so the state engine can file the mon_client
+	// transition from its real from-state and move the targets (decision
+	// #51 §2) in the same commit as the revoke itself. The function it
+	// returns, if any, runs after the commit: that is where Telegram goes,
+	// which must never announce a revoke that was rolled back. An error
+	// rolls the whole revoke back.
+	Revoked func(ctx context.Context, tx *gorm.DB, mc store.MonClient) (after func(context.Context), err error)
 }
 
 // Registry is mon-server's registration desk and mon-client directory. It
@@ -586,6 +595,7 @@ func (r *Registry) Approve(ctx context.Context, requestID string, in ApproveInpu
 				TokenHash:  tokenHash,
 				Enabled:    true,
 				State:      store.MonClientNever,
+				LastAckSeq: 0, // decision #51 §1: a new token is a new seq generation
 				ApprovedAt: clock.Ms(now),
 				RemoteIp:   req.RemoteIp,
 				Version:    req.Version,
@@ -628,9 +638,14 @@ func (r *Registry) ApproveAsReplacement(ctx context.Context, requestID, existing
 	err = r.st.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var innerErr error
 		mc, innerErr = approveTx(tx, requestID, now, token, func(req *store.RegistrationRequest) (*store.MonClient, error) {
+			// last_ack_seq goes back to 0 (decision #51 §1): seq belongs
+			// to one token generation, the box holding the new token
+			// counts from 1, and an ack left over from the old one would
+			// make every cycle up to it look like a duplicate.
 			res := tx.Model(&store.MonClient{}).Where("id = ?", existingID).Updates(map[string]any{
 				"token_hash":        tokenHash,
 				"state":             store.MonClientNever,
+				"last_ack_seq":      0,
 				"approved_at":       clock.Ms(now),
 				"remote_ip":         req.RemoteIp,
 				"version":           req.Version,
@@ -866,8 +881,27 @@ func (r *Registry) SetEnabled(ctx context.Context, id string, enabled bool) erro
 // requests is cleared too — Revoke means "this token must stop working
 // right now", and a plaintext copy waiting to be handed out by a future
 // Poll would defeat that.
+//
+// The revoke goes through the state machine (decision #51 §2): Hooks.Revoked
+// files the mon_client OFFLINE event with reason token_revoked and moves the
+// targets to UNKNOWN, all inside this transaction, so the registry row, the
+// targets and the events commit — or roll back — together.
 func (r *Registry) Revoke(ctx context.Context, id string) error {
-	return r.st.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	var after func(context.Context)
+	err := r.st.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var mc store.MonClient
+		if err := tx.First(&mc, "id = ?", id).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrClientNotFound
+			}
+			return err
+		}
+		if r.hooks.Revoked != nil {
+			var err error
+			if after, err = r.hooks.Revoked(ctx, tx, mc); err != nil {
+				return err
+			}
+		}
 		res := tx.Model(&store.MonClient{}).
 			Where("id = ?", id).
 			Updates(map[string]any{
@@ -879,6 +913,13 @@ func (r *Registry) Revoke(ctx context.Context, id string) error {
 		}
 		return clearParkedToken(tx, id)
 	})
+	if err != nil {
+		return err
+	}
+	if after != nil {
+		after(ctx)
+	}
+	return nil
 }
 
 // Delete permanently removes a mon-client and its targets (spec §6): unlike

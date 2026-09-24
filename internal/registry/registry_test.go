@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"gorm.io/gorm"
+
 	"github.com/SBKubric/3ax-ui-monitoring/internal/clock"
 	"github.com/SBKubric/3ax-ui-monitoring/internal/store"
 )
@@ -984,5 +986,96 @@ func TestAuthenticate_UnknownAndDisabledTokens(t *testing.T) {
 	}
 	if _, err := r.Authenticate(context.Background(), poll.Token); !errors.Is(err, ErrDisabled) {
 		t.Fatalf("Authenticate(disabled) = %v, want ErrDisabled", err)
+	}
+}
+
+// TestApproveAsReplacement_ResetsLastAckSeqAfterRevoke is decision #51 §1:
+// seq belongs to one token generation. The replaced box starts counting at
+// seq 1, so a last_ack_seq carried over from the old box would make
+// mon-server silently discard every cycle up to it (~1440 a day).
+func TestApproveAsReplacement_ResetsLastAckSeqAfterRevoke(t *testing.T) {
+	r, st, clk := newTestRegistry(t)
+
+	out1 := register(t, r, "h1", "", "1.1.1.1")
+	existing, err := r.Approve(context.Background(), out1.RequestID, ApproveInput{Name: "Amsterdam"})
+	if err != nil {
+		t.Fatalf("Approve: %v", err)
+	}
+	if existing.LastAckSeq != 0 {
+		t.Fatalf("new mon-client LastAckSeq = %d, want 0", existing.LastAckSeq)
+	}
+	if err := st.DB.Model(&store.MonClient{}).Where("id = ?", existing.Id).
+		Update("last_ack_seq", 1440).Error; err != nil {
+		t.Fatalf("seed last_ack_seq: %v", err)
+	}
+	if err := r.Revoke(context.Background(), existing.Id); err != nil {
+		t.Fatalf("Revoke: %v", err)
+	}
+
+	clk.Advance(rateLimitWindow)
+	out2 := register(t, r, "h1", "", "2.2.2.2")
+	replaced, err := r.ApproveAsReplacement(context.Background(), out2.RequestID, existing.Id)
+	if err != nil {
+		t.Fatalf("ApproveAsReplacement: %v", err)
+	}
+	if replaced.LastAckSeq != 0 {
+		t.Fatalf("LastAckSeq = %d after replacement, want 0 (a new token starts a new seq generation)", replaced.LastAckSeq)
+	}
+}
+
+// TestRevoke_RevokedHookRunsInTheTransaction pins decision #51 §2's seam:
+// the hook (the state engine) sees the mon-client as it was before the
+// revoke — it needs the from-state for the event — and its writes share
+// the revoke's transaction, so a failing hook leaves the token working.
+// The follow-up it returns runs only after the commit.
+func TestRevoke_RevokedHookRunsInTheTransaction(t *testing.T) {
+	r, st, _ := newTestRegistry(t)
+	out := register(t, r, "h", "", "1.1.1.1")
+	mc, err := r.Approve(context.Background(), out.RequestID, ApproveInput{Name: "Test"})
+	if err != nil {
+		t.Fatalf("Approve: %v", err)
+	}
+	poll, err := r.Poll(context.Background(), out.RequestID)
+	if err != nil {
+		t.Fatalf("Poll: %v", err)
+	}
+	if err := st.DB.Model(&store.MonClient{}).Where("id = ?", mc.Id).
+		Update("state", store.MonClientOnline).Error; err != nil {
+		t.Fatalf("seed state: %v", err)
+	}
+
+	hookErr := errors.New("engine refused")
+	r.SetHooks(Hooks{Revoked: func(_ context.Context, _ *gorm.DB, _ store.MonClient) (func(context.Context), error) {
+		return nil, hookErr
+	}})
+	if err := r.Revoke(context.Background(), mc.Id); !errors.Is(err, hookErr) {
+		t.Fatalf("Revoke err = %v, want the hook's error", err)
+	}
+	if _, err := r.Authenticate(context.Background(), poll.Token); err != nil {
+		t.Fatalf("Authenticate after a rolled-back Revoke = %v, want the token still valid", err)
+	}
+
+	var seen store.MonClient
+	var committedWhenAfterRan string
+	r.SetHooks(Hooks{Revoked: func(_ context.Context, tx *gorm.DB, row store.MonClient) (func(context.Context), error) {
+		seen = row
+		return func(context.Context) {
+			var now store.MonClient
+			if err := st.DB.First(&now, "id = ?", row.Id).Error; err == nil {
+				committedWhenAfterRan = now.State
+			}
+		}, nil
+	}})
+	if err := r.Revoke(context.Background(), mc.Id); err != nil {
+		t.Fatalf("Revoke: %v", err)
+	}
+	if seen.Id != mc.Id || seen.State != store.MonClientOnline {
+		t.Fatalf("hook saw %+v, want %s as it was before the revoke (ONLINE)", seen, mc.Id)
+	}
+	if committedWhenAfterRan != store.MonClientOffline {
+		t.Fatalf("follow-up saw state %q, want it to run after the commit (OFFLINE)", committedWhenAfterRan)
+	}
+	if _, err := r.Authenticate(context.Background(), poll.Token); !errors.Is(err, ErrTokenRevoked) {
+		t.Fatalf("Authenticate after Revoke = %v, want ErrTokenRevoked", err)
 	}
 }

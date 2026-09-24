@@ -37,6 +37,16 @@ type fakeMaterial struct {
 	have      bool
 	down      bool
 	untrusted bool
+
+	// refreshes counts RefreshMaterial calls; refreshErr is what they
+	// answer.
+	refreshes  int
+	refreshErr error
+}
+
+func (f *fakeMaterial) RefreshMaterial(context.Context) error {
+	f.refreshes++
+	return f.refreshErr
 }
 
 func (f *fakeMaterial) Material() (panel.Material, bool) { return f.mat, f.have }

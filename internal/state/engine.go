@@ -34,6 +34,9 @@ const maxClockSkew = 5 * time.Minute
 type ConfigSource interface {
 	TargetKeys(ctx context.Context, monClientID string) ([]registry.TargetKey, error)
 	CurrentRevision(ctx context.Context, monClientID string) (string, error)
+	// Exclusions says why a target is not in the mon-client's config, so
+	// the heartbeat can PAUSE it with the right reason (decision #51 §3).
+	Exclusions(ctx context.Context, monClientID string) (registry.Exclusions, error)
 }
 
 // StatsSink receives every cycle the engine accepted, for the 5-minute
@@ -161,6 +164,10 @@ func (e *Engine) Heartbeat(ctx context.Context, mc *store.MonClient, hb *Heartbe
 	if err != nil {
 		return nil, err
 	}
+	excl, err := e.exclusions(ctx, mc.Id)
+	if err != nil {
+		return nil, err
+	}
 
 	var (
 		ack    int64
@@ -211,6 +218,9 @@ func (e *Engine) Heartbeat(ctx context.Context, mc *store.MonClient, hb *Heartbe
 		// mentions it, so a target is never dropped while its mon-client
 		// might still be probing it.
 		if err := e.retirePaused(tx, mc.Id, keys); err != nil {
+			return err
+		}
+		if err := e.reconcilePauses(tx, mc.Id, keys, excl, clock.Ms(now)); err != nil {
 			return err
 		}
 
@@ -403,6 +413,36 @@ func (e *Engine) MonClientDisabled(ctx context.Context, monClientID string) erro
 	})
 }
 
+// MonClientRevoked is registry Hooks.Revoked (decision #51 §2): a revoke
+// is an OFFLINE like the timeout's, only with its own reasons — the
+// mon_client event says token_revoked, the targets go UNKNOWN with
+// mon_client_revoked, and Telegram follows the same PANEL_DOWN rule as
+// MarkOffline's. PAUSED targets stay PAUSED, as for every liveness move
+// (see targetsToUnknown).
+//
+// It runs inside the registry's revoke transaction, on mc as it stood
+// before the revoke, so the from-state is real and the registry row, the
+// targets and the events commit together; the registry writes the row's
+// own state=OFFLINE. A mon-client that is OFFLINE already (the timeout got
+// there first) makes no second mon_client transition — its targets are
+// UNKNOWN already, which the move below then finds nothing to do about.
+// The returned function sends the Telegram message and must only be run
+// after the commit.
+func (e *Engine) MonClientRevoked(ctx context.Context, tx *gorm.DB, mc store.MonClient) (func(context.Context), error) {
+	tx = tx.WithContext(ctx)
+	nowMs := clock.Ms(e.clk.Now())
+	var notify notices
+	if mc.State != store.MonClientOffline {
+		if err := e.emitMonClient(tx, &notify, &mc, mc.State, store.MonClientOffline, ReasonTokenRevoked, nowMs); err != nil {
+			return nil, err
+		}
+	}
+	if err := e.targetsToUnknown(tx, mc.Id, ReasonMonClientRevoked, nowMs); err != nil {
+		return nil, err
+	}
+	return func(ctx context.Context) { e.flush(ctx, &notify) }, nil
+}
+
 // ---------------------------------------------------------------------
 // heartbeat internals
 // ---------------------------------------------------------------------
@@ -578,6 +618,64 @@ func (e *Engine) retirePaused(tx *gorm.DB, monClientID string, keys map[registry
 	return nil
 }
 
+// reconcilePauses is decision #51 §3, run on every heartbeat against the
+// config the mon-client is on: a target of this mon-client that fell out of
+// its config for a reason other than its inbound goes PAUSED with that
+// reason (override_disabled, path_removed, no_probe_link) — the row and its
+// history are kept — and one PAUSED for such a reason that is back in the
+// config goes UNKNOWN (config_enabled), so the next result decides. A
+// target out of the config because its inbound is disabled or gone gets no
+// reason here; SyncInbounds pauses it (config_disabled) and releases it.
+//
+// It runs in the heartbeat for the same reason retirePaused does: this is
+// where mon-server knows which config the mon-client was actually handed.
+func (e *Engine) reconcilePauses(tx *gorm.DB, monClientID string, keys map[registry.TargetKey]bool, excl registry.Exclusions, nowMs int64) error {
+	var rows []store.Target
+	if err := tx.Where("mon_client_id = ?", monClientID).Order("id").Find(&rows).Error; err != nil {
+		return fmt.Errorf("state: read targets of %s: %w", monClientID, err)
+	}
+	for _, t := range rows {
+		key := registry.TargetKey{InboundKind: t.InboundKind, InboundID: t.InboundId, Path: t.Path}
+		reason := configPause(key, keys, excl)
+		var err error
+		switch {
+		case reason != "" && t.State != store.TargetPaused:
+			err = e.moveRows(tx, []store.Target{t}, store.TargetPaused, reason, nowMs)
+		case reason == "" && t.State == store.TargetPaused && configPauseReasons[t.Reason] && keys[key]:
+			err = e.moveRows(tx, []store.Target{t}, store.TargetUnknown, ReasonConfigEnabled, nowMs)
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// configPause is why one target must be PAUSED by its mon-client's config,
+// or "" when it must not be (it is in the config, or it is out because of
+// its inbound, or nothing is known yet). Every reason it can return is in
+// configPauseReasons.
+func configPause(key registry.TargetKey, keys map[registry.TargetKey]bool, excl registry.Exclusions) string {
+	if keys[key] {
+		return ""
+	}
+	return excl.Reason(key)
+}
+
+// exclusions reads what the config builder knows about targets outside this
+// mon-client's config. No builder wired means nothing is known, which names
+// no reason and so pauses nothing.
+func (e *Engine) exclusions(ctx context.Context, monClientID string) (registry.Exclusions, error) {
+	if e.configs == nil {
+		return registry.Exclusions{}, nil
+	}
+	x, err := e.configs.Exclusions(ctx, monClientID)
+	if err != nil {
+		return registry.Exclusions{}, fmt.Errorf("state: read config exclusions for %s: %w", monClientID, err)
+	}
+	return x, nil
+}
+
 // targetKeys is the set of targets this mon-client's config document names
 // (spec §7.1 step 3: results for anything else are dropped). A mon-server
 // with no config builder wired, or a mon-client with no document yet, has
@@ -642,10 +740,13 @@ func (e *Engine) pauseTargets(tx *gorm.DB, key inboundKey, nowMs int64) error {
 
 // resumeTargets releases an inbound's PAUSED targets back to UNKNOWN with
 // reason config_enabled: the config is live again, and the next result
-// decides what they really are.
+// decides what they really are. Only the targets the inbound itself paused
+// (config_disabled) are released: one paused because its mon-client's config
+// left it out (reconcilePauses) is still out, whatever its inbound does.
 func (e *Engine) resumeTargets(tx *gorm.DB, key inboundKey, nowMs int64) error {
 	return e.moveTargets(tx,
-		tx.Where("inbound_kind = ? AND inbound_id = ? AND state = ?", key.InboundKind, key.InboundID, store.TargetPaused),
+		tx.Where("inbound_kind = ? AND inbound_id = ? AND state = ? AND reason = ?",
+			key.InboundKind, key.InboundID, store.TargetPaused, ReasonConfigDisabled),
 		store.TargetUnknown, ReasonConfigEnabled, nowMs)
 }
 
@@ -681,6 +782,11 @@ func (e *Engine) moveTargets(tx *gorm.DB, q *gorm.DB, to, reason string, nowMs i
 	if err := q.Find(&rows).Error; err != nil {
 		return fmt.Errorf("state: read targets to move to %s: %w", to, err)
 	}
+	return e.moveRows(tx, rows, to, reason, nowMs)
+}
+
+// moveRows is moveTargets' body for rows the caller has already read.
+func (e *Engine) moveRows(tx *gorm.DB, rows []store.Target, to, reason string, nowMs int64) error {
 	for _, t := range rows {
 		from := t.State
 		t.State = to

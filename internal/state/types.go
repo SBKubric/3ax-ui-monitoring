@@ -12,6 +12,8 @@
 // "decided" and "told the panel" loses nothing (spec §4 step 4).
 package state
 
+import "github.com/SBKubric/3ax-ui-monitoring/internal/registry"
+
 // HeartbeatRequest is the POST /v1/heartbeat body (protocol §5.3). Unknown
 // fields are tolerated on decode, as the protocol requires of both sides;
 // nullable numbers and strings are pointers so that "the mon-client did not
@@ -104,7 +106,33 @@ const (
 	// ReasonHeartbeatMissed is the mon_client OFFLINE event's reason
 	// (spec §7.3).
 	ReasonHeartbeatMissed = "heartbeat_missed"
+	// ReasonTokenRevoked is the mon_client OFFLINE event's reason when an
+	// administrator revoked the token (decision #51 §2, contract §4.6).
+	ReasonTokenRevoked = "token_revoked"
+	// ReasonMonClientRevoked marks a target driven to UNKNOWN because its
+	// mon-client's token was revoked.
+	ReasonMonClientRevoked = "mon_client_revoked"
+
+	// Config pauses (decision #51 §3, contract §4.6): a target PAUSED
+	// because it fell out of its mon-client's config for a reason that is
+	// not its inbound. The strings are registry's, which decides them.
+	ReasonOverrideDisabled = registry.PauseOverrideDisabled
+	ReasonPathRemoved      = registry.PausePathRemoved
+	ReasonNoProbeLink      = registry.PauseNoProbeLink
 )
+
+// configPauseReasons are the PAUSED reasons a heartbeat owns: it sets them
+// (reconcilePauses) and it alone releases them, when the target is back in
+// the config. config_disabled is deliberately not here — SyncInbounds owns
+// that one, and each side releasing only its own pauses is what keeps an
+// inbound coming back from un-pausing a target whose path was removed.
+// A new config pause (#67's config_error) is one line here plus its source
+// in configPause.
+var configPauseReasons = map[string]bool{
+	ReasonOverrideDisabled: true,
+	ReasonPathRemoved:      true,
+	ReasonNoProbeLink:      true,
+}
 
 // Event kinds of the panel contract (§4.6). mon-server emits "target" and
 // "mon_client" from this package; "panel" belongs to internal/panel.
