@@ -589,6 +589,48 @@ func TestLoop_RunJittersOnlyTheFirstCycle(t *testing.T) {
 	}
 }
 
+// revivingApplier is a fakeApplier that also implements Reviver and
+// records when it was asked to revive.
+type revivingApplier struct {
+	*fakeApplier
+	note func(string)
+}
+
+func (a *revivingApplier) Revive(context.Context) { a.note("revive") }
+
+// TestLoop_RevivesBeforeEveryCycle is the loop's half of decision #53 п. 4:
+// an applier that keeps a child process alive is given the chance to
+// restart it before every cycle — after the config is applied, before a
+// single probe runs.
+func TestLoop_RevivesBeforeEveryCycle(t *testing.T) {
+	var mu sync.Mutex
+	var events []string
+	note := func(what string) {
+		mu.Lock()
+		defer mu.Unlock()
+		events = append(events, what)
+	}
+	probes := map[proto.TargetKey]probe.Fn{targetKey(): func(ctx context.Context, k proto.TargetKey) proto.Result {
+		note("probe")
+		return okProbe(ctx, k)
+	}}
+	h := newHarness(t, probes)
+	loop := h.withApplier(t, &revivingApplier{fakeApplier: h.applier, note: note})
+	h.stub.SetConfig(doc("rev1"))
+	h.stub.SetRevision("rev1")
+
+	for i := 0; i < 2; i++ {
+		if err := loop.Once(context.Background()); err != nil {
+			t.Fatalf("Once: %v", err)
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if got := strings.Join(events, ","); got != "revive,probe,revive,probe" {
+		t.Errorf("events = %s, want a revive before every cycle's probes", got)
+	}
+}
+
 // runCycles runs h.loop until n heartbeats reached the stub, then stops it
 // and returns the start of every cycle, read from the heartbeats' cycles
 // (protocol §5.3's ts is the cycle start).

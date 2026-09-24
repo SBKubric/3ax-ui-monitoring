@@ -500,3 +500,114 @@ func awgTarget2() proto.Target {
 		Conf:      awgConf,
 	}
 }
+
+// TestRevive_RestartsADeadChild is decision #53 п. 4: an xray child that
+// died between cycles (OOM, a crash) is restarted on the applied xray.json
+// before the next cycle, so its targets are probed rather than reported as
+// a false tcp_refused on a loopback port nobody listens on.
+func TestRevive_RestartsADeadChild(t *testing.T) {
+	h := newApplierHarness(t, true)
+	ctx := context.Background()
+	if err := h.applier.Apply(ctx, revisionDoc("rev1", xrayTarget("proxy", vlessRealityLink))); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	// A healthy child is left alone: no restart, no log line.
+	starts := strings.Count(h.logs.String(), "xray started")
+	h.applier.Revive(ctx)
+	if got := strings.Count(h.logs.String(), "xray started"); got != starts {
+		t.Fatalf("Revive restarted a running child (%d starts, want %d)", got, starts)
+	}
+
+	if err := h.child.Stop(ctx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	h.applier.Revive(ctx)
+
+	if !h.child.Running() {
+		t.Fatal("the dead child was not restarted")
+	}
+	if !dialable(t, config.FirstSocksPort) {
+		t.Errorf("socks port %d is not up after the restart", config.FirstSocksPort)
+	}
+	if _, probes, cfgErr := h.applier.Applied(); cfgErr != nil || len(probes) != 1 {
+		t.Errorf("Applied = %d probes, err %v; want the xray probe and no error", len(probes), cfgErr)
+	}
+}
+
+// TestRevive_ChildThatStaysDownSkipsXrayProbes is the failing half of
+// decision #53 п. 4: one restart attempt per cycle; while it fails, the
+// cycle runs without the xray probes (AWG-targets still probed) and the
+// configError is "xray: <first stderr line>". Once the child is back, the
+// configError returns to the revision's own — here a later revision whose
+// -test failed — and the xray probes return.
+func TestRevive_ChildThatStaysDownSkipsXrayProbes(t *testing.T) {
+	h := newApplierHarness(t, true)
+	ctx := context.Background()
+	xrayKey := xrayTarget("proxy", vlessRealityLink).TargetKey
+	awgKey := awgTarget().TargetKey
+
+	if err := h.applier.Apply(ctx, revisionDoc("rev1", xrayTarget("proxy", vlessRealityLink), awgTarget())); err != nil {
+		t.Fatalf("Apply rev1: %v", err)
+	}
+	xraytest.Scripted(t, xraytest.Script{TestFail: "Failed to start: main: bad outbound in rev2"})
+	if err := h.applier.Apply(ctx, revisionDoc("rev2", xrayTarget("direct", trojanGRPCLink))); err == nil {
+		t.Fatal("Apply rev2 = nil, want the -test failure")
+	}
+
+	if err := h.child.Stop(ctx); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	xraytest.Scripted(t, xraytest.Script{ExitNow: true, ExitMsg: "Failed to start: main: port 10801 taken"})
+	h.applier.Revive(ctx)
+
+	if h.child.Running() {
+		t.Fatal("the scripted child should not have come up")
+	}
+	_, probes, cfgErr := h.applier.Applied()
+	if _, ok := probes[xrayKey]; ok {
+		t.Error("the xray probe is still scheduled although xray is down")
+	}
+	if _, ok := probes[awgKey]; !ok {
+		t.Error("the AWG probe was dropped along with xray's")
+	}
+	if cfgErr == nil || cfgErr.Error() != "xray: Failed to start: main: port 10801 taken" {
+		t.Errorf("configError = %v, want xray's first stderr line", cfgErr)
+	}
+
+	// Still down on the next cycle: one more attempt, same report.
+	h.applier.Revive(ctx)
+	if _, _, cfgErr := h.applier.Applied(); cfgErr == nil || !strings.HasPrefix(cfgErr.Error(), "xray: ") {
+		t.Errorf("configError = %v on the second failed attempt, want the xray error kept", cfgErr)
+	}
+
+	t.Setenv(xraytest.ScriptEnv, "")
+	h.applier.Revive(ctx)
+	if !h.child.Running() {
+		t.Fatal("the child did not come back once it could")
+	}
+	_, probes, cfgErr = h.applier.Applied()
+	if len(probes) != 2 {
+		t.Errorf("%d probes after recovery, want both rev1 targets", len(probes))
+	}
+	if cfgErr == nil || !strings.Contains(cfgErr.Error(), "bad outbound in rev2") {
+		t.Errorf("configError = %v after recovery, want the revision's own error back", cfgErr)
+	}
+}
+
+// TestRevive_NothingToDoWithoutXrayTargets: an AWG-only revision has no
+// child to keep alive, and Revive must not start one.
+func TestRevive_NothingToDoWithoutXrayTargets(t *testing.T) {
+	h := newApplierHarness(t, true)
+	ctx := context.Background()
+	if err := h.applier.Apply(ctx, revisionDoc("rev1", awgTarget())); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	h.applier.Revive(ctx)
+	if h.child.Running() {
+		t.Error("Revive started an xray child for a revision with no xray-targets")
+	}
+	if _, probes, cfgErr := h.applier.Applied(); cfgErr != nil || len(probes) != 1 {
+		t.Errorf("Applied = %d probes, err %v; want the AWG probe and no error", len(probes), cfgErr)
+	}
+}

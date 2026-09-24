@@ -88,6 +88,17 @@ type CycleGuard interface {
 	EndCycle()
 }
 
+// Reviver is an optional extension of Applier for an applier whose probes
+// depend on a long-running child process — RevisionApplier and its xray
+// child. Once calls Revive before every cycle, after any config apply, so
+// a child that died between cycles is restarted (or reported as down)
+// before a single probe runs through it (decision #53 п. 4). Revive
+// reports through Applied, never by failing the cycle: a dead xray must
+// not stop the AWG probes or the heartbeat.
+type Reviver interface {
+	Revive(ctx context.Context)
+}
+
 // Deps are everything the loop needs and does not build itself. Every
 // field that has a sensible production default gets one in NewLoop, so a
 // test only overrides the seams it wants to control (Clock, Sleep, Rand).
@@ -218,6 +229,9 @@ func (l *Loop) Once(ctx context.Context) error {
 		if err := l.fetchAndApply(ctx); err != nil {
 			return err
 		}
+	}
+	if r, ok := l.d.Applier.(Reviver); ok {
+		r.Revive(ctx)
 	}
 
 	doc, results, ts, configErr := l.cycle(ctx)
