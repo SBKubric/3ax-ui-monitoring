@@ -2,6 +2,7 @@ package proto
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -167,5 +168,35 @@ func TestConfigDoc_DecodesProtocolExample(t *testing.T) {
 	}
 	if awg.Conf == "" || awg.Link != "" {
 		t.Errorf("Targets[2] = %+v, want conf, no link", awg)
+	}
+}
+
+// TestClientInfo_RejectedTargetsShape pins protocol §5.3's
+// client.rejectedTargets (decision #53 п. 3): a list of {target, error}
+// with the target in its `<kind>:<inboundId>:<path>` form, and absent
+// altogether when every target was applied — an empty list and no list
+// mean the same thing, and a box with nothing rejected sends neither.
+func TestClientInfo_RejectedTargetsShape(t *testing.T) {
+	info := ClientInfo{
+		Version: "0.1.0",
+		RejectedTargets: []RejectedTarget{{
+			Target: TargetKey{InboundKind: "awg", InboundID: 3, Path: "direct"}.String(),
+			Error:  `[Interface] has an unknown key "Foo"`,
+		}},
+	}
+	raw, err := json.Marshal(info)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if want := `"rejectedTargets":[{"target":"awg:3:direct","error":"[Interface] has an unknown key \"Foo\""}]`; !strings.Contains(string(raw), want) {
+		t.Errorf("client block = %s, want it to carry %s", raw, want)
+	}
+
+	raw, err = json.Marshal(ClientInfo{Version: "0.1.0"})
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if strings.Contains(string(raw), "rejectedTargets") {
+		t.Errorf("client block = %s, want no rejectedTargets when nothing was rejected", raw)
 	}
 }

@@ -62,6 +62,15 @@ func xrayTarget(path, link string) proto.Target {
 	}
 }
 
+// awgTargetWith is an AWG-target on inbound id carrying conf.
+func awgTargetWith(id int, conf string) proto.Target {
+	return proto.Target{
+		TargetKey: proto.TargetKey{InboundKind: "awg", InboundID: id, Path: "proxy"},
+		Protocol:  "awg",
+		Conf:      conf,
+	}
+}
+
 func awgTarget() proto.Target {
 	return proto.Target{
 		TargetKey: proto.TargetKey{InboundKind: "awg", InboundID: 0, Path: "proxy"},
@@ -250,31 +259,141 @@ func TestApply_TestFailureKeepsTheOldRevision(t *testing.T) {
 	}
 }
 
-// TestApply_ParseErrorNamesTheTarget is the other half of spec §4 step 3's
-// error branch ("ссылка не разобралась"): nothing is written, nothing is
-// restarted, and the configError says which target is broken.
-func TestApply_ParseErrorNamesTheTarget(t *testing.T) {
+// TestApply_RejectsBrokenTargetsAndAppliesTheRest is decision #53 п. 3:
+// a revision is applied target by target. A link or .conf that will not
+// parse — an unknown AWG key and an unsupported transport included — and an
+// AWG-target whose trial IpcSet fails are rejected, each with its own
+// error; the rest are applied and appliedRevision moves on. The rejections
+// are what the heartbeat reports as client.rejectedTargets, and the
+// configError stays clear, because the revision itself did apply.
+func TestApply_RejectsBrokenTargetsAndAppliesTheRest(t *testing.T) {
 	h := newApplierHarness(t, true)
 	ctx := context.Background()
 
 	if err := h.applier.Apply(ctx, revisionDoc("rev1", xrayTarget("proxy", vlessRealityLink))); err != nil {
 		t.Fatalf("Apply rev1: %v", err)
 	}
-	before := h.xrayJSON(t)
 
-	bad := xrayTarget("direct", "vless://id@198.51.100.10:443?security=reality&pbk=k") // no fp
-	err := h.applier.Apply(ctx, revisionDoc("rev2", xrayTarget("proxy", vlessRealityLink), bad))
-	if err == nil {
-		t.Fatal("Apply = nil, want the link parse error")
+	noFP := xrayTarget("direct", "vless://id@198.51.100.10:443?security=reality&pbk=k")
+	kcp := proto.Target{
+		TargetKey: proto.TargetKey{InboundKind: "xray", InboundID: 13, Path: "proxy"},
+		Protocol:  "vless",
+		Link:      "vless://id@198.51.100.11:443?type=kcp&encryption=none",
 	}
-	if !strings.Contains(err.Error(), "xray:12:direct") {
-		t.Errorf("error = %q, want the offending target key", err)
+	unknownKey := awgTargetWith(1, strings.Replace(awgConf, "Jc = 4", "Jc = 4\nFoo = 1", 1))
+	badJc := awgTargetWith(2, strings.Replace(awgConf, "Jc = 4", "Jc = four", 1))
+	doc := revisionDoc("rev2", xrayTarget("proxy", vlessRealityLink), noFP, kcp, awgTarget(), unknownKey, badJc)
+
+	if err := h.applier.Apply(ctx, doc); err != nil {
+		t.Fatalf("Apply rev2 = %v, want the valid targets applied", err)
 	}
-	if len(err.Error()) > maxConfigError {
-		t.Errorf("error is %d characters, over the configError limit", len(err.Error()))
+	if h.file.AppliedRevision != "rev2" {
+		t.Errorf("AppliedRevision = %q, want rev2", h.file.AppliedRevision)
 	}
-	if h.file.AppliedRevision != "rev1" || h.xrayJSON(t) != before {
-		t.Error("a document that would not parse changed the applied revision")
+	got, probes, cfgErr := h.applier.Applied()
+	if cfgErr != nil {
+		t.Errorf("configError = %v, want none: the revision applied", cfgErr)
+	}
+	if got.ConfigRevision != "rev2" {
+		t.Errorf("Applied doc = %s, want rev2", got.ConfigRevision)
+	}
+	if len(probes) != 2 {
+		t.Errorf("%d probes, want the valid xray and AWG targets only", len(probes))
+	}
+	for _, k := range []proto.TargetKey{{InboundKind: "xray", InboundID: 12, Path: "proxy"}, awgTarget().TargetKey} {
+		if probes[k] == nil {
+			t.Errorf("no probe for the valid target %s", k)
+		}
+	}
+	if strings.Contains(h.xrayJSON(t), "198.51.100.11") {
+		t.Error("xray.json carries a rejected target's outbound")
+	}
+
+	want := map[string]string{
+		"xray:12:direct": "fp",
+		"xray:13:proxy":  "unsupported transport",
+		"awg:1:proxy":    "unknown key",
+		"awg:2:proxy":    "jc",
+	}
+	rejected := h.applier.Rejected()
+	if len(rejected) != len(want) {
+		t.Fatalf("Rejected = %+v, want %d targets", rejected, len(want))
+	}
+	for _, r := range rejected {
+		sub, ok := want[r.Target]
+		if !ok {
+			t.Errorf("rejected %s, which is valid", r.Target)
+			continue
+		}
+		if !strings.Contains(r.Error, sub) {
+			t.Errorf("%s rejected with %q, want it to name %q", r.Target, r.Error, sub)
+		}
+		if len(r.Error) > maxConfigError || strings.Contains(r.Error, "\n") {
+			t.Errorf("%s error %q is not one line of at most %d characters", r.Target, r.Error, maxConfigError)
+		}
+	}
+
+	// A revision that fixes them clears the rejections.
+	if err := h.applier.Apply(ctx, revisionDoc("rev3", xrayTarget("proxy", vlessRealityLink), awgTarget())); err != nil {
+		t.Fatalf("Apply rev3: %v", err)
+	}
+	if r := h.applier.Rejected(); len(r) != 0 {
+		t.Errorf("Rejected = %+v after a clean revision, want none", r)
+	}
+}
+
+// TestApply_AllTargetsRejectedStillApplies: a revision none of whose
+// targets can be probed is still applied, with an empty probe set, so that
+// the heartbeat carries the rejections under the new revision instead of
+// the box sitting on the old one (decision #53 п. 3).
+func TestApply_AllTargetsRejectedStillApplies(t *testing.T) {
+	h := newApplierHarness(t, true)
+	ctx := context.Background()
+
+	if err := h.applier.Apply(ctx, revisionDoc("rev1", xrayTarget("proxy", vlessRealityLink))); err != nil {
+		t.Fatalf("Apply rev1: %v", err)
+	}
+	bad := xrayTarget("proxy", "vless://id@198.51.100.10:443?security=reality&pbk=k")
+	if err := h.applier.Apply(ctx, revisionDoc("rev2", bad)); err != nil {
+		t.Fatalf("Apply rev2 = %v, want it applied with nothing to probe", err)
+	}
+	if h.file.AppliedRevision != "rev2" {
+		t.Errorf("AppliedRevision = %q, want rev2", h.file.AppliedRevision)
+	}
+	if _, probes, cfgErr := h.applier.Applied(); cfgErr != nil || len(probes) != 0 {
+		t.Errorf("Applied = %d probes, err %v; want an empty probe set and no configError", len(probes), cfgErr)
+	}
+	if h.child.Running() {
+		t.Error("the child still runs with every xray-target rejected")
+	}
+	if r := h.applier.Rejected(); len(r) != 1 || r[0].Target != "xray:12:proxy" {
+		t.Errorf("Rejected = %+v, want the one target", r)
+	}
+}
+
+// TestApply_TestFailureKeepsTheOldRejections: `xray -test` failing still
+// rejects the revision as a whole (decision #53 п. 3), and with it every
+// per-target verdict of that revision — the heartbeat keeps reporting the
+// rejections of the revision that is actually in force.
+func TestApply_TestFailureKeepsTheOldRejections(t *testing.T) {
+	h := newApplierHarness(t, true)
+	ctx := context.Background()
+
+	broken := awgTargetWith(1, strings.Replace(awgConf, "Jc = 4", "Jc = four", 1))
+	if err := h.applier.Apply(ctx, revisionDoc("rev1", xrayTarget("proxy", vlessRealityLink), broken)); err != nil {
+		t.Fatalf("Apply rev1: %v", err)
+	}
+
+	xraytest.Scripted(t, xraytest.Script{TestFail: "Failed to start: main: bad outbound"})
+	bad := xrayTarget("direct", "vless://id@198.51.100.10:443?security=reality&pbk=k")
+	if err := h.applier.Apply(ctx, revisionDoc("rev2", xrayTarget("proxy", vlessRealityLink), bad)); err == nil {
+		t.Fatal("Apply rev2 = nil, want the -test failure")
+	}
+	if h.file.AppliedRevision != "rev1" {
+		t.Errorf("AppliedRevision = %q, want rev1 kept", h.file.AppliedRevision)
+	}
+	if r := h.applier.Rejected(); len(r) != 1 || r[0].Target != "awg:1:proxy" {
+		t.Errorf("Rejected = %+v, want rev1's rejection kept", r)
 	}
 }
 
@@ -442,6 +561,53 @@ func TestLoop_ConfigErrorFromARealApplyReachesTheHeartbeat(t *testing.T) {
 	// child's socks ports, which is the whole point of the restart.
 	if got := hbs[2].Cycles[0].Results; len(got) != 2 {
 		t.Fatalf("%d results, want one per applied target", len(got))
+	}
+}
+
+// TestLoop_RejectedTargetsReachTheHeartbeat: the applier's rejections ride
+// along in every heartbeat as client.rejectedTargets (protocol §5.3), under
+// the revision they belong to, and disappear once a revision applies
+// without any.
+func TestLoop_RejectedTargetsReachTheHeartbeat(t *testing.T) {
+	h := newHarness(t, nil)
+	applier := NewRevisionApplier(ApplierDeps{
+		Dir:  h.dir,
+		File: h.file,
+		Log:  slog.New(slog.NewTextHandler(h.logs, nil)),
+	})
+	loop := h.withApplier(t, applier)
+	ctx := context.Background()
+
+	broken := awgTargetWith(3, strings.Replace(awgConf, "Jc = 4", "Jc = four", 1))
+	h.stub.SetConfig(revisionDoc("rev1", broken))
+	h.stub.SetRevision("rev1")
+	if err := loop.Once(ctx); err != nil {
+		t.Fatalf("Once: %v", err)
+	}
+	hbs := h.stub.Heartbeats()
+	if len(hbs) != 1 {
+		t.Fatalf("%d heartbeats, want 1", len(hbs))
+	}
+	hb := hbs[0]
+	if hb.ConfigRevision != "rev1" || hb.Client.ConfigError != nil {
+		t.Errorf("heartbeat = rev %q, configError %v; want rev1 applied with no configError", hb.ConfigRevision, hb.Client.ConfigError)
+	}
+	if r := hb.Client.RejectedTargets; len(r) != 1 || r[0].Target != "awg:3:proxy" || !strings.Contains(r[0].Error, "jc") {
+		t.Errorf("rejectedTargets = %+v, want awg:3:proxy with its IpcSet error", r)
+	}
+
+	h.stub.SetConfig(revisionDoc("rev2"))
+	h.stub.SetRevision("rev2")
+	if err := loop.Once(ctx); err != nil { // learns of rev2
+		t.Fatalf("Once: %v", err)
+	}
+	if err := loop.Once(ctx); err != nil { // applies it
+		t.Fatalf("Once: %v", err)
+	}
+	hbs = h.stub.Heartbeats()
+	last := hbs[len(hbs)-1]
+	if last.ConfigRevision != "rev2" || len(last.Client.RejectedTargets) != 0 {
+		t.Errorf("last heartbeat = rev %q, rejectedTargets %+v; want rev2 with none", last.ConfigRevision, last.Client.RejectedTargets)
 	}
 }
 

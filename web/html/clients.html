@@ -49,6 +49,7 @@
           <a-tag color="error" v-if="c.configError" :title="c.configError">⚠ config error · rev [[ shortRev(c.appliedRevision) ]]</a-tag>
           <span class="mono muted" v-else-if="c.appliedRevision || c.serverRevision">[[ shortRev(c.appliedRevision || c.serverRevision) ]]</span>
           <span class="muted" v-else>—</span>
+          <a-tag color="warning" v-if="c.rejectedTargets && c.rejectedTargets.length" :title="rejectedTitle(c)" data-testid="client-rejected">⚠ [[ c.rejectedTargets.length ]] rejected</a-tag>
         </td>
       </tr>
       <tr v-if="!clients.length"><td colspan="8" class="muted" data-testid="clients-empty">No mon-clients yet. Approve a registration request first.</td></tr>
@@ -90,6 +91,15 @@
     <div class="fi" v-if="edit.client.configError">
       <label>Config error reported by the box</label>
       <pre class="pre" data-testid="edit-config-error">[[ edit.client.configError ]]</pre>
+    </div>
+    <div class="fi" v-if="edit.client.rejectedTargets && edit.client.rejectedTargets.length">
+      <label>Targets rejected by the box (not probed, PAUSED config_error)</label>
+      <div data-testid="edit-rejected-targets">
+        <div v-for="r in edit.client.rejectedTargets" :key="r.target" data-testid="edit-rejected-target">
+          <span class="mono small" data-testid="edit-rejected-target-key">[[ r.target ]]</span>
+          <pre class="pre" data-testid="edit-rejected-target-error">[[ r.error ]]</pre>
+        </div>
+      </div>
     </div>
     <div class="hd right">
       <a-button data-testid="edit-cancel" @click="edit.open = false">Cancel</a-button>

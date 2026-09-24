@@ -175,3 +175,40 @@ func TestClients_Delete(t *testing.T) {
 		t.Fatalf("deleting twice: status %d, want 404", w.Code)
 	}
 }
+
+// TestClients_ListShowsRejectedTargets: the targets a mon-client reported
+// as rejected from its applied revision (protocol §5.3
+// client.rejectedTargets), each with its error, are on the row the
+// mon-clients page renders (spec §9.3), and a row with none has an empty
+// list rather than null.
+func TestClients_ListShowsRejectedTargets(t *testing.T) {
+	h := newHarness(t)
+	h.login()
+	id := h.approveOne("7K3F9Q", "vps-ams-2", "203.0.113.5", "Amsterdam #2", "NL", []string{"proxy"})
+
+	rows := func() map[string]any {
+		t.Helper()
+		w := h.do(http.MethodGet, "/admin/api/clients", nil)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status %d, body %s", w.Code, w.Body.String())
+		}
+		return obj(t, w)["clients"].([]any)[0].(map[string]any)
+	}
+	if got, ok := rows()["rejectedTargets"].([]any); !ok || len(got) != 0 {
+		t.Fatalf("rejectedTargets = %#v, want an empty list", rows()["rejectedTargets"])
+	}
+
+	var mc store.MonClient
+	mc.SetRejected([]store.RejectedTarget{{Target: "awg:3:proxy", Error: `[Interface] has an unknown key "Foo"`}})
+	if err := h.st.DB.Model(&store.MonClient{}).Where("id = ?", id).Update("rejected_targets", mc.RejectedTargets).Error; err != nil {
+		t.Fatalf("store rejected targets: %v", err)
+	}
+	got, _ := rows()["rejectedTargets"].([]any)
+	if len(got) != 1 {
+		t.Fatalf("rejectedTargets = %#v, want one", got)
+	}
+	r := got[0].(map[string]any)
+	if r["target"] != "awg:3:proxy" || r["error"] != `[Interface] has an unknown key "Foo"` {
+		t.Fatalf("rejected target = %+v, want the stored one", r)
+	}
+}

@@ -177,6 +177,10 @@ type MonClient struct {
 	AppliedRevision string `json:"appliedRevision" gorm:"column:applied_revision"`
 	ConfigError     string `json:"configError" gorm:"column:config_error"`
 	ConfigErrorAt   *int64 `json:"configErrorAt" gorm:"column:config_error_at"`
+	// RejectedTargets is the JSON list of targets the mon-client's last
+	// heartbeat reported as rejected from its applied revision (protocol
+	// §5.3 client.rejectedTargets); see RejectedList/SetRejected.
+	RejectedTargets string `json:"-" gorm:"column:rejected_targets;not null;default:'[]'"`
 
 	RemoteIp         string `json:"remoteIp" gorm:"column:remote_ip"`
 	ApprovedAt       int64  `json:"approvedAt" gorm:"column:approved_at"`
@@ -192,6 +196,39 @@ type MonClient struct {
 }
 
 func (MonClient) TableName() string { return "mon_clients" }
+
+// RejectedTarget is one entry of MonClient.RejectedTargets: a target key
+// as "<kind>:<inboundId>:<path>" and the mon-client's reason for rejecting
+// it.
+type RejectedTarget struct {
+	Target string `json:"target"`
+	Error  string `json:"error"`
+}
+
+// RejectedList decodes RejectedTargets. An empty or malformed column is no
+// rejections.
+func (m *MonClient) RejectedList() []RejectedTarget {
+	if m.RejectedTargets == "" {
+		return nil
+	}
+	var out []RejectedTarget
+	if err := json.Unmarshal([]byte(m.RejectedTargets), &out); err != nil {
+		return nil
+	}
+	return out
+}
+
+// SetRejected encodes list into RejectedTargets, nil as "[]".
+func (m *MonClient) SetRejected(list []RejectedTarget) {
+	if list == nil {
+		list = []RejectedTarget{}
+	}
+	b, err := json.Marshal(list)
+	if err != nil {
+		panic("store: marshal rejected targets: " + err.Error())
+	}
+	m.RejectedTargets = string(b)
+}
 
 // PathsList decodes Paths into a []string. A malformed or empty column
 // (e.g. a row created before Paths was set) decodes to nil rather than

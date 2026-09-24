@@ -30,11 +30,24 @@ type HeartbeatRequest struct {
 // the wire but a mon-client may send either, and spec §7.1 step 2 turns the
 // transition between "absent" and "present" into a Telegram message — so the
 // distinction has to survive decoding.
+//
+// RejectedTargets are the targets of the applied revision the mon-client
+// could not turn into probes (decision #53 п. 3); absent or empty means
+// all of them are probed. Each goes PAUSED with reason config_error.
 type ClientInfo struct {
-	Version     string  `json:"version"`
-	XrayVersion string  `json:"xrayVersion"`
-	UptimeMs    int64   `json:"uptimeMs"`
-	ConfigError *string `json:"configError"`
+	Version         string           `json:"version"`
+	XrayVersion     string           `json:"xrayVersion"`
+	UptimeMs        int64            `json:"uptimeMs"`
+	ConfigError     *string          `json:"configError"`
+	RejectedTargets []RejectedTarget `json:"rejectedTargets"`
+}
+
+// RejectedTarget is one entry of client.rejectedTargets (protocol §5.3):
+// the target as "<kind>:<inboundId>:<path>" and why the mon-client rejected
+// it (first line, ≤ 256 characters).
+type RejectedTarget struct {
+	Target string `json:"target"`
+	Error  string `json:"error"`
 }
 
 // Cycle is one probe round of a mon-client (protocol §5.1, §5.3). Seq is the
@@ -119,6 +132,11 @@ const (
 	ReasonOverrideDisabled = registry.PauseOverrideDisabled
 	ReasonPathRemoved      = registry.PausePathRemoved
 	ReasonNoProbeLink      = registry.PauseNoProbeLink
+	// ReasonConfigError marks a target PAUSED because its mon-client
+	// rejected it when applying the revision — its link or .conf would not
+	// parse, or the AWG device refused it (decision #53 п. 3). The
+	// mon-client says so in client.rejectedTargets, not the builder.
+	ReasonConfigError = "config_error"
 )
 
 // configPauseReasons are the PAUSED reasons a heartbeat owns: it sets them
@@ -126,12 +144,12 @@ const (
 // the config. config_disabled is deliberately not here — SyncInbounds owns
 // that one, and each side releasing only its own pauses is what keeps an
 // inbound coming back from un-pausing a target whose path was removed.
-// A new config pause (#67's config_error) is one line here plus its source
-// in configPause.
+// A new config pause is one line here plus its source in configPause.
 var configPauseReasons = map[string]bool{
 	ReasonOverrideDisabled: true,
 	ReasonPathRemoved:      true,
 	ReasonNoProbeLink:      true,
+	ReasonConfigError:      true,
 }
 
 // Event kinds of the panel contract (§4.6). mon-server emits "target" and

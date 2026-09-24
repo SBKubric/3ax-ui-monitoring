@@ -99,6 +99,15 @@ type Reviver interface {
 	Revive(ctx context.Context)
 }
 
+// Rejecter is an optional extension of Applier for an applier that applies
+// a revision target by target (decision #53 п. 3): Rejected lists the
+// targets of the applied revision it could not turn into probes, which
+// every heartbeat reports as client.rejectedTargets (protocol §5.3). An
+// applier that does not implement it rejects nothing.
+type Rejecter interface {
+	Rejected() []proto.RejectedTarget
+}
+
 // Deps are everything the loop needs and does not build itself. Every
 // field that has a sensible production default gets one in NewLoop, so a
 // test only overrides the seams it wants to control (Clock, Sleep, Rand).
@@ -239,7 +248,7 @@ func (l *Loop) Once(ctx context.Context) error {
 		r.Revive(ctx)
 	}
 
-	doc, results, ts, configErr := l.cycle(ctx)
+	doc, results, ts, rejected, configErr := l.cycle(ctx)
 	if _, err := l.d.Buffer.Add(ts, results); err != nil {
 		// The cycle is in the buffer, just not on disk: the heartbeat
 		// below still carries it, and only a restart before the next
@@ -250,7 +259,7 @@ func (l *Loop) Once(ctx context.Context) error {
 	hb := &proto.HeartbeatRequest{
 		MonClientID:    l.d.File.MonClientID,
 		ConfigRevision: l.d.File.AppliedRevision,
-		Client:         l.clientInfo(configErr),
+		Client:         l.clientInfo(configErr, rejected),
 		Cycles:         l.d.Buffer.Pending(),
 	}
 
@@ -307,8 +316,8 @@ func (l *Loop) rememberAck(ackSeq int64) {
 }
 
 // cycle runs one probe cycle against whatever is applied and returns it
-// together with the applied document, the configError and the cycle's
-// start timestamp.
+// together with the applied document, the cycle's start timestamp, the
+// applied revision's rejected targets and the configError.
 //
 // It is a method of its own because of the guard around it: while the
 // cycle runs, an Applier that is a CycleGuard cannot swap the probe set
@@ -318,15 +327,25 @@ func (l *Loop) rememberAck(ackSeq int64) {
 // runner only ever probes what it was handed, a result for a key the
 // applied document no longer has must not reach a heartbeat even if some
 // future applier hands one back.
-func (l *Loop) cycle(ctx context.Context) (doc *proto.ConfigDoc, results []proto.Result, ts int64, configErr error) {
+func (l *Loop) cycle(ctx context.Context) (doc *proto.ConfigDoc, results []proto.Result, ts int64, rejected []proto.RejectedTarget, configErr error) {
 	if g, ok := l.d.Applier.(CycleGuard); ok {
 		g.BeginCycle()
 		defer g.EndCycle()
 	}
 	doc, probes, configErr := l.d.Applier.Applied()
+	rejected = l.rejected()
 	ts = clock.Ms(l.d.Clock.Now())
 	results = l.d.Runner.Cycle(ctx, probes, probe.BudgetsFrom(probeParams(doc)))
-	return doc, applied(results, probes), ts, configErr
+	return doc, applied(results, probes), ts, rejected, configErr
+}
+
+// rejected is the applier's Rejected, or nothing for an applier that is
+// not a Rejecter.
+func (l *Loop) rejected() []proto.RejectedTarget {
+	if r, ok := l.d.Applier.(Rejecter); ok {
+		return r.Rejected()
+	}
+	return nil
 }
 
 // applied drops every result whose target is not in the applied probe set
@@ -476,18 +495,19 @@ func (l *Loop) heartbeatTimeout(doc *proto.ConfigDoc) time.Duration {
 // as long as it is disabled instead of going quiet about it.
 func (l *Loop) ClientInfo() proto.ClientInfo {
 	_, _, configErr := l.d.Applier.Applied()
-	return l.clientInfo(configErr)
+	return l.clientInfo(configErr, l.rejected())
 }
 
-// clientInfo builds the client block over an already-known configError —
-// the cycle has one in hand and must report exactly the error that cycle
-// probed under, not whatever the applier holds a moment later.
-func (l *Loop) clientInfo(configErr error) proto.ClientInfo {
+// clientInfo builds the client block over an already-known configError and
+// rejected set — the cycle has both in hand and must report exactly what
+// that cycle probed under, not whatever the applier holds a moment later.
+func (l *Loop) clientInfo(configErr error, rejected []proto.RejectedTarget) proto.ClientInfo {
 	return proto.ClientInfo{
-		Version:     l.d.Version,
-		XrayVersion: l.xrayVersion(),
-		UptimeMs:    l.uptimeMs(),
-		ConfigError: configErrorText(configErr),
+		Version:         l.d.Version,
+		XrayVersion:     l.xrayVersion(),
+		UptimeMs:        l.uptimeMs(),
+		ConfigError:     configErrorText(configErr),
+		RejectedTargets: rejected,
 	}
 }
 

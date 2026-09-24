@@ -162,3 +162,21 @@ func errorCode(t *testing.T, body []byte) string {
 	}
 	return e.Error
 }
+
+// TestHeartbeat_DecodesRejectedTargets: protocol §5.3's
+// client.rejectedTargets reaches the engine as sent (decision #53 п. 3).
+func TestHeartbeat_DecodesRejectedTargets(t *testing.T) {
+	eng := &stubEngine{resp: &state.HeartbeatResponse{}}
+	s := newHeartbeatTestServer(stubAuthenticator{client: &store.MonClient{Id: "ams-1"}}, eng)
+
+	rec := postHeartbeat(s, "tok", `{"monClientId":"ams-1","configRevision":"r","client":{"version":"0.1.0",
+		"configError":null,"rejectedTargets":[{"target":"awg:3:direct","error":"[Interface] has an unknown key \"Foo\""}]},
+		"cycles":[]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+	got := eng.seen.Client.RejectedTargets
+	if len(got) != 1 || got[0].Target != "awg:3:direct" || got[0].Error != `[Interface] has an unknown key "Foo"` {
+		t.Fatalf("engine got rejectedTargets %+v, want the one sent", got)
+	}
+}

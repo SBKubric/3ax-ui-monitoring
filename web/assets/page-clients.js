@@ -1,6 +1,7 @@
 /* mon-clients page (spec §9.3): the registry as the panel's inbound table —
  * "⋯" for Edit / Revoke / Delete, a switch for Enabled, the full config
- * error and both revisions in the Edit modal. Target state is deliberately
+ * error, the targets the box rejected with their errors, and both revisions
+ * in the Edit modal. Target state is deliberately
  * absent: the panel's Monitoring page owns it. */
 (function () {
   'use strict';
@@ -37,6 +38,9 @@
         return c.state;
       },
       stateClass: function (c) { return c.enabled ? c.state : 'DISABLED'; },
+      rejectedTitle: function (c) {
+        return (c.rejectedTargets || []).map(function (r) { return r.target + ': ' + r.error; }).join('\n');
+      },
       openEdit: function (c) {
         this.edit = {
           open: true,

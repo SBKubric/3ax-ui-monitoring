@@ -65,15 +65,19 @@ type ApplierDeps struct {
 // RevisionApplier applies a config document the way spec §4 step 3
 // prescribes: between two probe cycles, never during one.
 //
-// One apply is: parse every target (a link that will not become an
-// outbound and a .conf that will not become UAPI are both failures before
-// anything on disk is touched), write the generated xray.json, gate it on
-// `xray -test`, restart the child and wait for its socks ports, then swap
-// the probe set and record appliedRevision. Any failure on that path
-// leaves the previous revision in force — the same document, the same
-// probes, the same running child — and comes back as the error the loop
-// reports as client.configError in every heartbeat until a later revision
-// applies cleanly (spec §4 step 3).
+// One apply is: parse every target on its own (decision #53 п. 3: a link
+// that will not become an outbound, a .conf that will not become UAPI and
+// an AWG config the device refuses in a trial IpcSet reject that target
+// only), write the xray.json generated from the accepted xray-targets,
+// gate it on `xray -test`, restart the child and wait for its socks ports,
+// then swap the probe set and record appliedRevision. Rejected targets do
+// not stop the revision — it applies with the rest, even with none left,
+// and Rejected reports them for the heartbeat's client.rejectedTargets.
+// Any failure of the revision as a whole (`-test`, the restart, saving
+// state.json) leaves the previous revision in force — the same document,
+// the same probes, the same rejections, the same running child — and comes
+// back as the error the loop reports as client.configError in every
+// heartbeat until a later revision applies cleanly (spec §4 step 3).
 //
 // Applying is exclusive with probing: Apply takes the write side of the
 // cycle lock that BeginCycle/EndCycle take the read side of, so a cycle
@@ -93,6 +97,7 @@ type RevisionApplier struct {
 	probes   map[proto.TargetKey]probe.Fn
 	xrayKeys map[proto.TargetKey]bool // the applied xray-targets, skipped while xray is down
 	ports    []int                    // the socks ports of the applied revision, for recovery
+	rejected []proto.RejectedTarget   // the applied revision's targets that are not probed
 	lastErr  error
 	// xrayDown is set while the xray child is dead and a restart before
 	// the cycle did not bring it back (decision #53 п. 4). It overrides
@@ -106,6 +111,7 @@ var (
 	_ Applier    = (*RevisionApplier)(nil)
 	_ CycleGuard = (*RevisionApplier)(nil)
 	_ Reviver    = (*RevisionApplier)(nil)
+	_ Rejecter   = (*RevisionApplier)(nil)
 )
 
 // NewRevisionApplier wires an applier to its probers, its xray child and
@@ -163,6 +169,17 @@ func (a *RevisionApplier) Applied() (*proto.ConfigDoc, map[proto.TargetKey]probe
 		}
 	}
 	return a.doc, probes, a.xrayDown
+}
+
+// Rejected is the loop's Rejecter: the targets of the applied revision
+// that were rejected when it was applied, in document order, for the
+// heartbeat's client.rejectedTargets (decision #53 п. 3). They change only
+// when a revision applies, so a revision that failed as a whole keeps the
+// previous one's.
+func (a *RevisionApplier) Rejected() []proto.RejectedTarget {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.rejected
 }
 
 // Revive is the loop's Reviver (decision #53 п. 4): before every cycle, if
@@ -231,13 +248,15 @@ func (a *RevisionApplier) apply(ctx context.Context, doc *proto.ConfigDoc) error
 		doc = &proto.ConfigDoc{}
 	}
 
-	// Everything that can fail on the document's own material fails here,
-	// before a byte is written or the child is touched (spec §4 step 3
-	// lists "ссылка не разобралась" and ".conf не разобрался" next to a
-	// failed -test: all three keep the old revision).
-	cfgJSON, plans, awgs, err := parseDoc(doc)
+	// Everything that can fail on one target's own material fails here,
+	// before a byte is written or the child is touched, and rejects that
+	// target only (decision #53 п. 3).
+	cfgJSON, plans, awgs, rejected, err := parseDoc(doc)
 	if err != nil {
 		return err
+	}
+	for _, r := range rejected {
+		a.d.Log.Warn("target rejected", "target", r.Target, "error", r.Error)
 	}
 	if len(plans) > 0 && a.d.Xray == nil {
 		return fmt.Errorf("no xray binary: %d xray targets cannot be probed", len(plans))
@@ -280,7 +299,7 @@ func (a *RevisionApplier) apply(ctx context.Context, doc *proto.ConfigDoc) error
 	}
 
 	a.mu.Lock()
-	a.doc, a.probes, a.ports, a.lastErr = doc, probes, ports, nil
+	a.doc, a.probes, a.ports, a.rejected, a.lastErr = doc, probes, ports, rejected, nil
 	a.xrayKeys = xrayKeys(plans)
 	// The child was just (re)started on this revision, or the revision has
 	// no xray-targets: either way there is no dead child to report.
@@ -288,8 +307,8 @@ func (a *RevisionApplier) apply(ctx context.Context, doc *proto.ConfigDoc) error
 	a.mu.Unlock()
 
 	// Spec §7's revision line: what was applied and how much of it.
-	a.d.Log.Info(fmt.Sprintf("applied revision %s: %d xray targets, %d awg targets",
-		doc.ConfigRevision, len(plans), len(awgs)))
+	a.d.Log.Info(fmt.Sprintf("applied revision %s: %d xray targets, %d awg targets, %d rejected",
+		doc.ConfigRevision, len(plans), len(awgs), len(rejected)))
 	return nil
 }
 
@@ -459,28 +478,52 @@ func (a *RevisionApplier) token() string {
 	return a.d.File.Token
 }
 
-// parseDoc turns a document into everything an apply needs: the generated
-// xray.json, the plan behind it, and one parsed AWG config per AWG-target.
-// The first target that will not parse fails the whole document, naming
-// itself — that text is the configError an operator reads (spec §4 step 3).
-func parseDoc(doc *proto.ConfigDoc) ([]byte, []config.XrayPlan, map[proto.TargetKey]*config.AWGConfig, error) {
-	cfgJSON, plans, err := config.BuildXray(doc.Targets, config.FirstSocksPort)
-	if err != nil {
-		return nil, nil, nil, err
+// parseDoc turns a document into everything an apply needs: the xray.json
+// generated from the xray-targets that parsed, the plan behind it, one
+// parsed AWG config per AWG-target that parsed and passed awg.Check, and
+// the targets that did not, each with the first line of its own error
+// (decision #53 п. 3). A rejected target is left out of everything else,
+// so it is neither in xray.json nor probed. The error is for the document
+// as a whole — a generated config that could not be marshalled.
+func parseDoc(doc *proto.ConfigDoc) ([]byte, []config.XrayPlan, map[proto.TargetKey]*config.AWGConfig, []proto.RejectedTarget, error) {
+	var (
+		accepted []proto.Target
+		rejected []proto.RejectedTarget
+		awgs     = make(map[proto.TargetKey]*config.AWGConfig)
+	)
+	reject := func(key proto.TargetKey, err error) {
+		rejected = append(rejected, proto.RejectedTarget{Target: key.String(), Error: firstLine(err.Error())})
+	}
+	for _, t := range doc.Targets {
+		switch {
+		case t.Link != "":
+			// BuildXray parses the link again; parsing it here first is
+			// what lets one bad link cost only its own target.
+			if _, _, _, err := config.ParseLink(t.Link); err != nil {
+				reject(t.TargetKey, err)
+				continue
+			}
+			accepted = append(accepted, t)
+		case t.Conf != "":
+			cfg, err := config.ParseAWGConf(t.Conf)
+			if err == nil {
+				err = awg.Check(cfg)
+			}
+			if err != nil {
+				reject(t.TargetKey, err)
+				continue
+			}
+			awgs[t.TargetKey] = cfg
+		default:
+			reject(t.TargetKey, errors.New("target has neither a link nor a conf"))
+		}
 	}
 
-	awgs := make(map[proto.TargetKey]*config.AWGConfig)
-	for _, t := range doc.Targets {
-		if t.Conf == "" {
-			continue
-		}
-		cfg, err := config.ParseAWGConf(t.Conf)
-		if err != nil {
-			return nil, nil, nil, fmt.Errorf("target %s: %w", t.TargetKey, err)
-		}
-		awgs[t.TargetKey] = cfg
+	cfgJSON, plans, err := config.BuildXray(accepted, config.FirstSocksPort)
+	if err != nil {
+		return nil, nil, nil, nil, err
 	}
-	return cfgJSON, plans, awgs, nil
+	return cfgJSON, plans, awgs, rejected, nil
 }
 
 // xrayKeys is the set of targets a revision probes through the xray child.
