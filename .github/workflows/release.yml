@@ -31,12 +31,14 @@ jobs:
                   CGO_ENABLED: 1
               run: go vet ./...
 
-            # Docker-backed tests (real xray, real AmneziaWG) skip without their
-            # images; CI on main already runs them.
+            # -short skips the tests against a real xray and a real AmneziaWG
+            # server in docker: the runner has docker, so they would run, and
+            # they belong to CI on main (ci.yml pre-pulls their images), not to
+            # the release gate.
             - name: Test with the race detector
               env:
                   CGO_ENABLED: 1
-              run: go test -race -count=1 ./...
+              run: go test -race -short -count=1 ./...
 
     build:
         name: Build linux/amd64
