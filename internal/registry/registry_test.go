@@ -536,7 +536,8 @@ func TestSlugify(t *testing.T) {
 		{"Amsterdam #1", "amsterdam-1"},
 		{"  Moscow  ", "moscow"},
 		{"###", "mon-client"},
-		{"already-a-slug_1.2", "already-a-slug_1.2"},
+		{"already-a-slug_1-2", "already-a-slug_1-2"},
+		{"msk.1", "msk-1"},
 	}
 	for _, c := range cases {
 		if got := slugify(c.name); got != c.want {

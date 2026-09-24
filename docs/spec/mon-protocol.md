@@ -37,7 +37,7 @@ GET /v1/register/<requestId>
 → 410 request_expired
 ```
 
-- В admin UI администратор видит IP, hostname, версию и pairing code, сверяет код с логом коробки, вводит `name` и `region`, выбирает paths и жмёт **Approve** — либо **Approve as replacement** для существующего mon-client (id, история, paths сохраняются, старый client token отзывается). `monClientId` — slug из `name` (`ams-1`), уникален, ≤ 64 символов `[A-Za-z0-9_.-]` (форма контракта панели).
+- В admin UI администратор видит IP, hostname, версию и pairing code, сверяет код с логом коробки, вводит `name` и `region`, выбирает paths и жмёт **Approve** — либо **Approve as replacement** для существующего mon-client (id, история, paths сохраняются, старый client token отзывается). `monClientId` — slug из `name` (`ams-1`), уникален, ≤ 32 символов `[A-Za-z0-9_-]` (из него панель называет AWG probe-пиры, решение [#80](https://github.com/SBKubric/3ax-ui-monitoring/issues/80)).
 - Одобренная заявка отдаёт `token` один раз; mon-client сохраняет `monClientId` + `token` в state-файл (`/var/lib/mon-client/state.json`, 0600) и больше `/register` не зовёт.
 - Запись реестра появляется при одобрении в состоянии `ONLINE`/`OFFLINE` по первому heartbeat (до него — `never seen`).
 
