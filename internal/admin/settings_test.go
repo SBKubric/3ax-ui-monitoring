@@ -332,3 +332,118 @@ func TestSettings_TelegramTestReportsRefusal(t *testing.T) {
 		t.Fatalf("msg = %q, want Telegram's own description", msg)
 	}
 }
+
+// TestSettings_PanelCASaveValidatesPEM checks decision #52 §1's Save side:
+// panelCa is a PEM chain that replaces the system pool for panel requests,
+// so a value that does not parse as certificates is refused with a message
+// naming the field, and nothing is saved; a real certificate round-trips.
+func TestSettings_PanelCASaveValidatesPEM(t *testing.T) {
+	h := newHarness(t)
+	h.login()
+
+	body := h.settingsBody()
+	body["panelCa"] = "not a certificate"
+	w := h.do(http.MethodPost, "/admin/api/settings", body)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status %d, want 400; body %s", w.Code, w.Body.String())
+	}
+	if msg := decode(t, w).Msg; !strings.Contains(msg, "panelCa") {
+		t.Fatalf("msg = %q, want it to name panelCa", msg)
+	}
+	if set, _ := h.st.LoadSettings(); set.PanelCA != "" {
+		t.Fatalf("a broken panelCa was saved: %q", set.PanelCA)
+	}
+
+	pem := paneltest.NewTLSStub(t).CertPEM()
+	body["panelCa"] = pem
+	if w := h.do(http.MethodPost, "/admin/api/settings", body); w.Code != http.StatusOK {
+		t.Fatalf("save with a valid panelCa: status %d, body %s", w.Code, w.Body.String())
+	}
+	if got := h.settingsBody()["panelCa"]; got != strings.TrimSpace(pem) {
+		t.Fatalf("panelCa after save = %q, want the certificate", got)
+	}
+}
+
+// TestSettings_CheckUnknownAuthority checks the Check button's own text for
+// a panel whose certificate the current trust (here: the system pool) does
+// not cover — decision #52 §1 — so an operator is pointed at panelCa rather
+// than told the panel "did not answer".
+func TestSettings_CheckUnknownAuthority(t *testing.T) {
+	h := newHarness(t)
+	h.login()
+	stub := paneltest.NewTLSStub(t)
+
+	w := h.do(http.MethodPost, "/admin/api/settings/check", map[string]any{
+		"panelUrl": stub.URL(), "monToken": stub.Token(),
+	})
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("status %d, want 502; body %s", w.Code, w.Body.String())
+	}
+	msg := decode(t, w).Msg
+	for _, want := range []string{"unknown authority", "Panel CA"} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("msg = %q, want it to mention %q", msg, want)
+		}
+	}
+}
+
+// TestSettings_CheckUsesSubmittedPanelCA checks that Check trusts the
+// panelCa typed into the form (not the saved one, spec §9.4 "без Save"):
+// with the panel's self-signed certificate pasted in, the same panel is
+// reachable, and still nothing is saved.
+func TestSettings_CheckUsesSubmittedPanelCA(t *testing.T) {
+	h := newHarness(t)
+	h.login()
+	stub := paneltest.NewTLSStub(t)
+
+	w := h.do(http.MethodPost, "/admin/api/settings/check", map[string]any{
+		"panelUrl": stub.URL(), "monToken": stub.Token(), "panelCa": stub.CertPEM(),
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d, body %s", w.Code, w.Body.String())
+	}
+	if set, _ := h.st.LoadSettings(); set.PanelCA != "" {
+		t.Fatalf("Check saved panelCa: %q", set.PanelCA)
+	}
+}
+
+// TestSettings_CheckRejectsBrokenPanelCA: a panelCa that does not parse is
+// the form's error, reported before any request is made.
+func TestSettings_CheckRejectsBrokenPanelCA(t *testing.T) {
+	h := newHarness(t)
+	h.login()
+
+	w := h.do(http.MethodPost, "/admin/api/settings/check", map[string]any{
+		"panelUrl": "https://192.0.2.10/", "monToken": "t", "panelCa": "garbage",
+	})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status %d, want 400", w.Code)
+	}
+	if msg := decode(t, w).Msg; !strings.Contains(msg, "panelCa") {
+		t.Fatalf("msg = %q, want it to name panelCa", msg)
+	}
+	if len(h.panelClients) != 0 {
+		t.Fatalf("a panel client was built for a broken panelCa: %+v", h.panelClients)
+	}
+}
+
+// TestSettings_GetStatusUnknownAuthorityAndACMECA checks the two read-only
+// additions of decision #52 to GET /admin/api/settings: the status line
+// learns that the poller's last failure was an untrusted panel certificate,
+// and the "TLS & admin" block shows which ACME CA the bootstrap config
+// chose, both as named and as the directory URL it resolves to.
+func TestSettings_GetStatusUnknownAuthorityAndACMECA(t *testing.T) {
+	h := newHarness(t)
+	h.login()
+	h.mat.untrusted = true
+	h.handler.deps.Cfg.TLS.ACMECA = "staging"
+
+	o := obj(t, h.do(http.MethodGet, "/admin/api/settings", nil))
+	if p := o["panel"].(map[string]any); p["unknownAuthority"] != true {
+		t.Fatalf("panel status = %+v, want unknownAuthority true", p)
+	}
+	b := o["bootstrap"].(map[string]any)
+	if b["acmeCa"] != "staging" || b["acmeDirectory"] != "https://acme-staging-v02.api.letsencrypt.org/directory" {
+		t.Fatalf("bootstrap = %+v, want acmeCa staging and its directory", b)
+	}
+}

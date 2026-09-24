@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 )
 
@@ -28,11 +29,23 @@ func Version() string { return version }
 
 // Default bootstrap values (spec §2). A fresh install with no config file and
 // no MON_* environment gets these; only publicIp has no sane default because
-// it names *this* box, so acme-ip mode without it fails Validate below.
+// it names *this* box, so a config without it fails Validate below.
 const (
 	DefaultListen  = ":443"
 	DefaultDataDir = "/var/lib/mon-server"
 	DefaultTLSMode = "acme-ip"
+	DefaultACMECA  = ACMECAProduction
+)
+
+// tls.acmeCa names (spec §2.1, decision #52 §2): which ACME directory
+// "acme-ip" mode asks for its certificate. production is Let's Encrypt
+// proper and the default; staging is Let's Encrypt's staging directory,
+// for stands that are rebuilt often enough to hit production's rate limits
+// on one IP. Any other value must be an ACME directory URL (Pebble in
+// e2e/CI); internal/tlsx resolves the names to URLs.
+const (
+	ACMECAProduction = "production"
+	ACMECAStaging    = "staging"
 )
 
 // TLS mode names (spec §2.1). acme-ip is the default: an embedded certmagic
@@ -45,11 +58,13 @@ const (
 )
 
 // TLSConfig is the tls.* bootstrap block. Cert and Key are only meaningful
-// (and only required, see Validate) when Mode is "files".
+// (and only required, see Validate) when Mode is "files"; ACMECA only when
+// it is "acme-ip".
 type TLSConfig struct {
-	Mode string `json:"mode"`
-	Cert string `json:"cert"`
-	Key  string `json:"key"`
+	Mode   string `json:"mode"`
+	Cert   string `json:"cert"`
+	Key    string `json:"key"`
+	ACMECA string `json:"acmeCa"`
 }
 
 // Config is mon-server's whole bootstrap surface (spec §2): where to listen,
@@ -67,12 +82,13 @@ type Config struct {
 // the file so an operator can override one field (e.g. in a systemd unit or a
 // container) without templating the whole JSON file.
 const (
-	envListen   = "MON_LISTEN"
-	envPublicIP = "MON_PUBLIC_IP"
-	envDataDir  = "MON_DATA_DIR"
-	envTLSMode  = "MON_TLS_MODE"
-	envTLSCert  = "MON_TLS_CERT"
-	envTLSKey   = "MON_TLS_KEY"
+	envListen    = "MON_LISTEN"
+	envPublicIP  = "MON_PUBLIC_IP"
+	envDataDir   = "MON_DATA_DIR"
+	envTLSMode   = "MON_TLS_MODE"
+	envTLSCert   = "MON_TLS_CERT"
+	envTLSKey    = "MON_TLS_KEY"
+	envTLSACMECA = "MON_TLS_ACME_CA"
 )
 
 // defaults returns a Config holding only the built-in defaults, the base
@@ -81,7 +97,7 @@ func defaults() *Config {
 	return &Config{
 		Listen:  DefaultListen,
 		DataDir: DefaultDataDir,
-		TLS:     TLSConfig{Mode: DefaultTLSMode},
+		TLS:     TLSConfig{Mode: DefaultTLSMode, ACMECA: DefaultACMECA},
 	}
 }
 
@@ -151,6 +167,9 @@ func mergeFile(cfg *Config, path string, explicit bool) error {
 	if file.TLS.Key != "" {
 		cfg.TLS.Key = file.TLS.Key
 	}
+	if file.TLS.ACMECA != "" {
+		cfg.TLS.ACMECA = file.TLS.ACMECA
+	}
 	return nil
 }
 
@@ -176,38 +195,68 @@ func mergeEnv(cfg *Config) {
 	if v, ok := os.LookupEnv(envTLSKey); ok && v != "" {
 		cfg.TLS.Key = v
 	}
+	if v, ok := os.LookupEnv(envTLSACMECA); ok && v != "" {
+		cfg.TLS.ACMECA = v
+	}
 }
 
 // Validate checks that Config is internally consistent enough to start the
-// listener (spec §2.1): "files" mode needs both halves of a keypair, and
-// "acme-ip" needs a publicIp that is actually an IP address certmagic can
-// request a certificate for, not a hostname, a host:port pair, or a
-// loopback/private address that Let's Encrypt could never validate as
-// reachable from this box. It does not check that the paths exist or that
-// the IP is reachable from the internet — that surfaces naturally when TLS
-// setup (step 2) tries to use them.
+// listener (spec §2.1). Both TLS modes need publicIp as an IP literal:
+// probeUrl, the address mon-clients send tunnel probes to, is always
+// https://<publicIp>:<port>/v1/probe (decision #52 §4 — the AWG probe runs
+// in a netstack that cannot resolve names, so there is no host-name
+// alternative). "files" mode also needs both halves of a keypair; "acme-ip"
+// also refuses a loopback or private publicIp that Let's Encrypt could never
+// validate as reachable from this box. tls.acmeCa must be production,
+// staging or an ACME directory URL. Validate does not check that the paths
+// exist or that the IP is reachable from the internet — that surfaces
+// naturally when TLS setup (internal/tlsx) tries to use them, which is also
+// where a "files" certificate is checked for an IP SAN equal to publicIp.
 func (c *Config) Validate() error {
+	if c.TLS.Mode != TLSModeFiles && c.TLS.Mode != TLSModeACMEIP {
+		return fmt.Errorf("config: unknown tls.mode %q (want %q or %q)", c.TLS.Mode, TLSModeACMEIP, TLSModeFiles)
+	}
+	if c.PublicIP == "" {
+		return fmt.Errorf("config: tls.mode=%s requires publicIp", c.TLS.Mode)
+	}
+	ip := net.ParseIP(c.PublicIP)
+	if ip == nil {
+		return fmt.Errorf("config: publicIp %q is not an IP address", c.PublicIP)
+	}
+	if err := validateACMECA(c.TLS.ACMECA); err != nil {
+		return err
+	}
+
 	switch c.TLS.Mode {
 	case TLSModeFiles:
 		if c.TLS.Cert == "" || c.TLS.Key == "" {
 			return errors.New("config: tls.mode=files requires tls.cert and tls.key")
 		}
 	case TLSModeACMEIP:
-		if c.PublicIP == "" {
-			return errors.New("config: tls.mode=acme-ip requires publicIp")
-		}
-		ip := net.ParseIP(c.PublicIP)
-		if ip == nil {
-			return fmt.Errorf("tls.mode acme-ip: publicIp %q is not an IP address", c.PublicIP)
-		}
 		if ip.IsLoopback() {
 			return fmt.Errorf("tls.mode acme-ip: publicIp %q is a loopback address, not reachable from the internet", c.PublicIP)
 		}
 		if ip.IsPrivate() {
 			return fmt.Errorf("tls.mode acme-ip: publicIp %q is a private address, not reachable from the internet", c.PublicIP)
 		}
-	default:
-		return fmt.Errorf("config: unknown tls.mode %q (want %q or %q)", c.TLS.Mode, TLSModeACMEIP, TLSModeFiles)
+	}
+	return nil
+}
+
+// validateACMECA accepts the two names and any absolute http(s) URL with a
+// host. Empty is accepted too and means production — a Config built in
+// code (tests, mostly) rather than by Load never went through defaults().
+// Anything else is most likely a typo ("prod"), which certmagic would
+// otherwise take as a relative directory URL and fail on at the first
+// issuance attempt, long after start-up.
+func validateACMECA(ca string) error {
+	switch ca {
+	case "", ACMECAProduction, ACMECAStaging:
+		return nil
+	}
+	u, err := url.Parse(ca)
+	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
+		return fmt.Errorf("config: tls.acmeCa %q is not %q, %q or an ACME directory URL", ca, ACMECAProduction, ACMECAStaging)
 	}
 	return nil
 }

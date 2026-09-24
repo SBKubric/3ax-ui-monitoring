@@ -29,6 +29,11 @@
       </div>
 
       <div class="sli">
+        <div><div class="tt">Panel CA</div><div class="d">[[ strings.panelCa ]]</div></div>
+        <div><a-textarea v-model:value="form.panelCa" class="mono" :rows="4" data-testid="field-panelCa" placeholder="-----BEGIN CERTIFICATE-----"></a-textarea></div>
+      </div>
+
+      <div class="sli">
         <div><div class="tt">Address for path direct</div><div class="d">[[ strings.realHost ]]</div></div>
         <div><a-input v-model:value="form.realHost" class="mono" data-testid="field-realHost" :placeholder="panelHost"></a-input></div>
       </div>

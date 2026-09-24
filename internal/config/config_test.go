@@ -12,7 +12,7 @@ import (
 // leak state into each other via the process environment.
 func clearEnv(t *testing.T) {
 	t.Helper()
-	for _, k := range []string{envListen, envPublicIP, envDataDir, envTLSMode, envTLSCert, envTLSKey} {
+	for _, k := range []string{envListen, envPublicIP, envDataDir, envTLSMode, envTLSCert, envTLSKey, envTLSACMECA} {
 		t.Setenv(k, "")
 		os.Unsetenv(k)
 	}
@@ -46,7 +46,7 @@ func TestLoad_DefaultMissingFileUsesDefaults(t *testing.T) {
 	want := &Config{
 		Listen:  DefaultListen,
 		DataDir: DefaultDataDir,
-		TLS:     TLSConfig{Mode: DefaultTLSMode},
+		TLS:     TLSConfig{Mode: DefaultTLSMode, ACMECA: DefaultACMECA},
 	}
 	if *cfg != *want {
 		t.Fatalf("Load() = %+v, want %+v", cfg, want)
@@ -196,7 +196,7 @@ func TestValidate_FilesRequiresCertAndKey(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			cfg := &Config{Listen: DefaultListen, DataDir: DefaultDataDir, TLS: tc.tls}
+			cfg := &Config{Listen: DefaultListen, DataDir: DefaultDataDir, PublicIP: "127.0.0.1", TLS: tc.tls}
 			err := cfg.Validate()
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("Validate() error = %v, wantErr %v", err, tc.wantErr)
@@ -243,6 +243,90 @@ func TestValidate_ACMEIPRequiresIPLiteral(t *testing.T) {
 			err := cfg.Validate()
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("Validate() with publicIp=%q: error = %v, wantErr %v", tc.publicIP, err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// TestValidate_FilesRequiresPublicIP checks decision #52 §4: probeUrl is
+// always built from publicIp, so "files" mode needs one just like "acme-ip"
+// does, and it has to be an IP literal (a mon-client's AWG probe runs in a
+// netstack that cannot resolve names). Unlike acme-ip, loopback and private
+// addresses are fine here: "files" is also the test and e2e mode, where
+// nothing outside the box ever validates the address.
+func TestValidate_FilesRequiresPublicIP(t *testing.T) {
+	cases := []struct {
+		name     string
+		publicIP string
+		wantErr  bool
+	}{
+		{"missing", "", true},
+		{"hostname", "mon.example.com", true},
+		{"host:port pair", "203.0.113.5:443", true},
+		{"public", "203.0.113.5", false},
+		{"loopback", "127.0.0.1", false},
+		{"private", "10.0.0.5", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &Config{Listen: DefaultListen, DataDir: DefaultDataDir, PublicIP: tc.publicIP,
+				TLS: TLSConfig{Mode: TLSModeFiles, Cert: "c", Key: "k"}}
+			err := cfg.Validate()
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("Validate() with files and publicIp=%q: error = %v, wantErr %v", tc.publicIP, err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// TestLoad_ACMECA checks that tls.acmeCa (decision #52 §2) reads from the
+// file and that MON_TLS_ACME_CA overrides it, like every other field.
+func TestLoad_ACMECA(t *testing.T) {
+	clearEnv(t)
+	path := writeConfigFile(t, Config{TLS: TLSConfig{ACMECA: ACMECAStaging}})
+
+	cfg, err := Load(path, true)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.TLS.ACMECA != ACMECAStaging {
+		t.Fatalf("TLS.ACMECA = %q, want the file's %q", cfg.TLS.ACMECA, ACMECAStaging)
+	}
+
+	t.Setenv(envTLSACMECA, "https://pebble:14000/dir")
+	cfg, err = Load(path, true)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.TLS.ACMECA != "https://pebble:14000/dir" {
+		t.Fatalf("TLS.ACMECA = %q, want the ENV value", cfg.TLS.ACMECA)
+	}
+}
+
+// TestValidate_ACMECA checks the three accepted shapes of tls.acmeCa —
+// production, staging, or an ACME directory URL (Pebble in e2e/CI) — and
+// that anything else, most likely a typo such as "prod", is refused at
+// start-up instead of being handed to certmagic as a directory URL.
+func TestValidate_ACMECA(t *testing.T) {
+	cases := []struct {
+		ca      string
+		wantErr bool
+	}{
+		{ACMECAProduction, false},
+		{ACMECAStaging, false},
+		{"https://pebble:14000/dir", false},
+		{"http://127.0.0.1:14000/dir", false},
+		{"prod", true},
+		{"ftp://example.com/dir", true},
+		{"https://", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.ca, func(t *testing.T) {
+			cfg := &Config{Listen: DefaultListen, DataDir: DefaultDataDir, PublicIP: "203.0.113.10",
+				TLS: TLSConfig{Mode: TLSModeACMEIP, ACMECA: tc.ca}}
+			err := cfg.Validate()
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("Validate() with acmeCa=%q: error = %v, wantErr %v", tc.ca, err, tc.wantErr)
 			}
 		})
 	}

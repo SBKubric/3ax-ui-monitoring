@@ -9,11 +9,12 @@
   var strings = {
     panelUrl: 'The panel on the real server: where /mon/v1/* answers. Polled every minute for state and probe configs. Include the webBasePath.',
     monToken: "The monToken from the panel's Monitoring settings tab. Check asks the panel for GET /state with what is typed here — nothing is saved.",
+    panelCa: "Optional. PEM certificate chain the panel's TLS certificate is checked against, replacing the system CAs for panel requests — paste the panel's own certificate if it is self-signed. Empty: system CAs. Check uses what is typed here.",
     realHost: "Host substituted into direct targets: the real server as clients reach it without the override. Defaults to the panel URL's host. Only mon-clients with the direct path ever see it.",
     proxyFront: "Read-only, as the panel reports it in GET /state. mon-server has no setting of its own: the front lives in the panel's host override, and /probe/configs already carries it.",
     telegram: 'Used when the panel is unreachable (PANEL_DOWN) and for config errors reported by mon-clients.',
     probe: 'Sent to every mon-client in its config; changing any of these bumps every config revision.',
-    tls: 'From the bootstrap config, read-only here. In acme-ip mode the certificate is issued for this box\'s IP from the Let\'s Encrypt short-lived profile.',
+    tls: 'From the bootstrap config (tls.mode, tls.acmeCa), read-only here. In acme-ip mode the certificate is issued for this box\'s IP from the Let\'s Encrypt short-lived profile, by the CA shown.',
     saved: 'Saved.'
   };
 
@@ -39,8 +40,8 @@
         probeFields: probeFields,
         tab: 'real',
         form: {},
-        status: { configured: false, reachable: false, polled: false, revision: '', inbounds: 0, override: { enabled: false, host: '' } },
-        bootstrap: { listen: '', publicIp: '', dataDir: '', tlsMode: '', adminCommand: '', cert: null },
+        status: { configured: false, reachable: false, unknownAuthority: false, polled: false, revision: '', inbounds: 0, override: { enabled: false, host: '' } },
+        bootstrap: { listen: '', publicIp: '', dataDir: '', tlsMode: '', acmeCa: '', acmeDirectory: '', adminCommand: '', cert: null },
         busy: false,
         checking: false,
         sending: false,
@@ -50,6 +51,7 @@
     computed: {
       statusLine: function () {
         if (!this.status.configured) { return 'Panel not configured yet — fill in the panel URL and the monitoring token, then Check.'; }
+        if (this.status.unknownAuthority) { return '✗ Panel certificate not trusted (x509: unknown authority) — paste the panel\'s certificate into Panel CA.'; }
         if (!this.status.polled) { return 'Panel not polled yet.'; }
         var line = (this.status.reachable ? '✓ Panel reachable' : '✗ Panel unreachable (PANEL_DOWN)');
         line += ' · revision ' + (this.status.revision || '—');
@@ -66,6 +68,7 @@
       },
       tlsLine: function () {
         var line = this.bootstrap.tlsMode || '—';
+        if (this.bootstrap.tlsMode === 'acme-ip') { line += ' · CA ' + (this.bootstrap.acmeCa || 'production') + ' (' + this.bootstrap.acmeDirectory + ')'; }
         var cert = this.bootstrap.cert;
         if (!cert) { return line + ' · no certificate yet'; }
         line += ' · ' + cert.subject + ' · expires in ' + mon.dur(cert.notAfter - this.now);
@@ -120,7 +123,7 @@
         this.checking = true;
         this.checkResult = '';
         var env = await mon.api('POST', '/admin/api/settings/check', {
-          panelUrl: this.form.panelUrl, monToken: this.form.monToken
+          panelUrl: this.form.panelUrl, monToken: this.form.monToken, panelCa: this.form.panelCa
         });
         this.checking = false;
         if (!env.success) { this.checkResult = env.msg; mon.notifyErr(env.msg); return; }

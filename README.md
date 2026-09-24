@@ -46,10 +46,11 @@ mon-server needs a minimal bootstrap config *before* it has a database to keep s
 | key | ENV | default | meaning |
 |---|---|---|---|
 | `listen` | `MON_LISTEN` | `:443` | address the single HTTPS listener binds — serves `/v1/*` (mon-clients), `/admin/*` (admin UI) and `/healthz` on the same port |
-| `publicIp` | `MON_PUBLIC_IP` | — | this box's public IP; required in `acme-ip` mode (Let's Encrypt needs to know what to request a certificate for) |
-| `dataDir` | `MON_DATA_DIR` | `/var/lib/mon-server` | where the SQLite file and, in `acme-ip` mode, certmagic's certificate cache live |
-| `tls.mode` | `MON_TLS_MODE` | `acme-ip` | `acme-ip` (built-in Let's Encrypt cert for `publicIp`, no domain needed) or `files` (bring your own cert/key — a real domain, or a test environment that must not touch the ACME network) |
-| `tls.cert` | `MON_TLS_CERT` | — | certificate path, required when `tls.mode=files` |
+| `publicIp` | `MON_PUBLIC_IP` | — | this box's public IP, required in **both** TLS modes and always an IP literal: mon-clients send tunnel probes to `https://<publicIp>:<port>/v1/probe`, and in `acme-ip` mode it is what Let's Encrypt certifies |
+| `dataDir` | `MON_DATA_DIR` | `/var/lib/mon-server` | where the SQLite file and, in `acme-ip` mode, certmagic's certificate cache live; kept at `0700` (database `0600`) on every start |
+| `tls.mode` | `MON_TLS_MODE` | `acme-ip` | `acme-ip` (built-in Let's Encrypt cert for `publicIp`, no domain needed) or `files` (bring your own cert/key — a test environment that must not touch the ACME network, or your own CA) |
+| `tls.acmeCa` | `MON_TLS_ACME_CA` | `production` | `acme-ip` only: `production` (Let's Encrypt), `staging` (Let's Encrypt staging — for stands rebuilt often enough to hit production's per-IP rate limits; mon-clients then need the staging roots, see [mon-client](#mon-client)), or an ACME directory URL (e.g. Pebble in CI) |
+| `tls.cert` | `MON_TLS_CERT` | — | certificate path, required when `tls.mode=files`; the certificate must carry `publicIp` as an **IP SAN** (mon-clients connect by IP), otherwise start-up fails with `cert has no IP SAN for publicIp` |
 | `tls.key` | `MON_TLS_KEY` | — | key path, required when `tls.mode=files` |
 
 ENV always wins over the file, so a systemd unit or container can override a single field without templating the whole JSON. An unknown key in the file is a hard error (almost always a typo, or a setting that belongs in the admin UI instead).
@@ -57,10 +58,10 @@ ENV always wins over the file, so a systemd unit or container can override a sin
 ### 3. Set the admin login
 
 ```sh
-mon-server admin set alice -config /etc/mon-server/config.json
+mon-server admin set -config /etc/mon-server/config.json alice
 ```
 
-Prompts for the password twice on a terminal (bcrypt hash only, never stored in the clear); running it again changes the login and/or password. For scripted provisioning, set `MON_ADMIN_PASSWORD` to skip the prompt.
+Flags go before the username (`-config` after it is taken as a second positional argument and refused). Prompts for the password twice on a terminal (bcrypt hash only, never stored in the clear); running it again changes the login and/or password. For scripted provisioning, set `MON_ADMIN_PASSWORD` to skip the prompt.
 
 ### 4. Run
 
@@ -68,7 +69,7 @@ Prompts for the password twice on a terminal (bcrypt hash only, never stored in 
 mon-server run -config /etc/mon-server/config.json
 ```
 
-Then open `https://<publicIp>/admin/`, log in, and fill in **Settings → Real server**: `panelUrl` (the panel's base URL) and `monToken` (from the panel's Monitoring tab). Use **Check** to verify those two values reach the panel before saving. While you're there, the **Telegram** tab (`tgToken`, `tgChatId`) lets mon-server send its own alerts (panel unreachable, config errors) — optional, but recommended.
+Then open `https://<publicIp>/admin/`, log in, and fill in **Settings → Real server**: `panelUrl` (the panel's base URL) and `monToken` (from the panel's Monitoring tab). Use **Check** to verify those two values reach the panel before saving. If the panel runs on a self-signed or private-CA certificate, Check reports `x509: unknown authority`: paste the panel's certificate (or its CA chain) as PEM into **Panel CA** (`panelCa`) — mon-server then trusts exactly that chain for panel requests instead of the system CAs; leave it empty for a panel with a public certificate. The value can be fetched from the panel box, e.g. `openssl s_client -connect <panel-ip>:<port> </dev/null | openssl x509`. While you're there, the **Telegram** tab (`tgToken`, `tgChatId`) lets mon-server send its own alerts (panel unreachable, config errors) — optional, but recommended.
 
 ### What happens next
 
@@ -96,6 +97,8 @@ Restart=on-failure
 RestartSec=5
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 StateDirectory=mon-server
+StateDirectoryMode=0700
+UMask=0077
 User=mon-server
 
 [Install]
@@ -103,6 +106,8 @@ WantedBy=multi-user.target
 ```
 
 `AmbientCapabilities=CAP_NET_BIND_SERVICE` lets the process bind `:443` without running as root; `StateDirectory=mon-server` gives it `/var/lib/mon-server` (matching `dataDir`'s default) owned by the service user. Adjust `dataDir`/`MON_DATA_DIR` if you point `StateDirectory` elsewhere.
+
+The database holds the panel's `monToken` and the Telegram bot token, so `dataDir` is private: `StateDirectoryMode=0700` and `UMask=0077` keep systemd and every file the process creates owner-only, and mon-server itself also sets `dataDir` to `0700` and `mon-server.db` to `0600` on every start (so an older install with `0755`/`0644` is repaired by a restart). Run `admin set` as the service user (`sudo -u mon-server mon-server admin set …`) so the database is not created owned by root.
 
 ## mon-client
 
@@ -132,6 +137,24 @@ The single required parameter is `MON_SERVER_URL` (or `--server`), mon-server's 
 mon-client dials it with a pairing code, prints that code to `docker logs`, and waits for an
 administrator to approve the resulting request under mon-server's admin UI **Requests** page.
 Everything else it needs (targets, probe accounts, config revisions) comes from mon-server itself.
+
+mon-client verifies mon-server's certificate against the system CAs and has no CA flag. A mon-server
+on `tls.acmeCa=staging` presents a chain from Let's Encrypt's staging roots, which no trust store
+carries, so on such a stand point Go's `SSL_CERT_FILE` at a file with the four staging roots
+(`(STAGING) Pretend Pear X1`, `Bogus Broccoli X2`, `Yearning Yucca YE`, `Yonder Yam YR`, from
+[letsencrypt.org/docs/staging-environment](https://letsencrypt.org/docs/staging-environment/)):
+
+```sh
+docker run -d --name mon-client \
+  -v mon-client-state:/var/lib/mon-client \
+  -v /etc/mon-client/le-staging-roots.pem:/etc/mon-client/le-staging-roots.pem:ro \
+  -e SSL_CERT_FILE=/etc/mon-client/le-staging-roots.pem \
+  -e MON_SERVER_URL=https://<mon-server-ip>:443 \
+  mon-client:dev
+```
+
+Go still reads the system directory `/etc/ssl/certs` alongside that file, so public CAs keep working.
+A production mon-server (`tls.acmeCa=production`) needs none of this.
 
 State — `state.json` (registration), `cycles.json` (unverified heartbeat buffer) and `xray.json`
 (generated xray config) — lives under `/var/lib/mon-client`, which the image declares as a

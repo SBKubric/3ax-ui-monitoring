@@ -2,6 +2,7 @@ package panel
 
 import (
 	"context"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -169,10 +170,11 @@ type PollerDeps struct {
 	Inbounds InboundSync
 	Stats    StatsFlusher
 
-	// NewClient builds the client for a (panelUrl, monToken) pair. It
-	// defaults to NewHTTPClient; a test overrides it to point a real
-	// HTTPClient at a stub, or to inject a short timeout.
-	NewClient func(baseURL, token string) Client
+	// NewClient builds the client for a (panelUrl, monToken, panelCa)
+	// triple; rootCAs is the parsed panelCa, nil for the system pool. It
+	// defaults to NewHTTPClient with WithRootCAs; a test overrides it to
+	// point a real HTTPClient at a stub, or to inject a short timeout.
+	NewClient func(baseURL, token string, rootCAs *x509.CertPool) Client
 }
 
 // Poller runs the once-a-minute cycle of spec §4 and owns the PANEL_DOWN
@@ -187,12 +189,20 @@ type Poller struct {
 	inbounds  InboundSync
 	stats     StatsFlusher
 	fixed     Client
-	newClient func(baseURL, token string) Client
+	newClient func(baseURL, token string, rootCAs *x509.CertPool) Client
 
 	mu          sync.Mutex
 	client      Client
 	clientURL   string
 	clientToken string
+	clientCA    string
+
+	// unknownAuthority is whether the last panel request that failed
+	// without an answer failed on an untrusted certificate (decision #52
+	// §1) — the Settings status line then says so and points at panelCa.
+	// Any success clears it; so does any other kind of failure, which then
+	// is the more current story.
+	unknownAuthority bool
 
 	material     Material
 	haveMaterial bool
@@ -253,8 +263,8 @@ func NewPoller(d PollerDeps) *Poller {
 		p.notifier = tg.Nop{}
 	}
 	if p.newClient == nil {
-		p.newClient = func(baseURL, token string) Client {
-			return NewHTTPClient(baseURL, token, p.clk)
+		p.newClient = func(baseURL, token string, rootCAs *x509.CertPool) Client {
+			return NewHTTPClient(baseURL, token, p.clk, WithRootCAs(rootCAs))
 		}
 	}
 	return p
@@ -284,6 +294,16 @@ func (p *Poller) PanelDown() bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.down
+}
+
+// UnknownAuthority reports whether the panel's certificate was untrusted on
+// the last request that could not reach it (decision #52 §1): the admin UI's
+// status line then names the cause and the panelCa setting that cures it,
+// instead of a bare "unreachable".
+func (p *Poller) UnknownAuthority() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.unknownAuthority
 }
 
 // Material returns the last probe material accepted from the panel and
@@ -352,7 +372,12 @@ func (p *Poller) Poll(ctx context.Context) error {
 		return nil
 	}
 	p.clearUnconfigured()
-	cl := p.clientFor(set)
+	cl, err := p.clientFor(set)
+	if err != nil {
+		// Only a hand-edited database gets here (Save validates panelCa).
+		// Not a panel failure, so no PANEL_DOWN: nothing was sent.
+		return err
+	}
 
 	// Step 1: GET /state.
 	st, err := cl.State(ctx)
@@ -770,6 +795,7 @@ func firstIDs(ids []string) []string {
 // and an operator needs to know the panelUrl or a proxy ahead of it is
 // wrong.
 func (p *Poller) observe(ctx context.Context, set *store.Settings, err error) error {
+	p.noteUnknownAuthority(err)
 	if err == nil {
 		if p.markUp() {
 			p.onPanelUp()
@@ -788,6 +814,15 @@ func (p *Poller) observe(ctx context.Context, set *store.Settings, err error) er
 		p.onPanelDown(ctx, reason)
 	}
 	return err
+}
+
+// noteUnknownAuthority records whether err, the latest request's outcome,
+// was an untrusted panel certificate. Answers from the panel (a 404, a 4xx,
+// a bad body) prove TLS worked, so they clear it just like a success.
+func (p *Poller) noteUnknownAuthority(err error) {
+	p.mu.Lock()
+	p.unknownAuthority = IsUnknownAuthority(err)
+	p.mu.Unlock()
 }
 
 // markUp resets the failure run and reports whether this success was the
@@ -943,21 +978,27 @@ func (p *Poller) enqueuePanelEvent(from, to, reason string) error {
 }
 
 // clientFor returns the client for the current settings, rebuilding it when
-// the panel URL or the token has changed — an operator can edit either on
-// the settings page (§9.4) without restarting mon-server. A client injected
-// through PollerDeps.Client is used as-is and never rebuilt.
-func (p *Poller) clientFor(set *store.Settings) Client {
+// the panel URL, the token or panelCa has changed — an operator can edit any
+// of them on the settings page (§9.4) without restarting mon-server. A
+// client injected through PollerDeps.Client is used as-is and never
+// rebuilt. A panelCa that does not parse is an error rather than a silent
+// fall-back to the system pool: the operator asked for a specific trust.
+func (p *Poller) clientFor(set *store.Settings) (Client, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.fixed != nil {
-		return p.fixed
+		return p.fixed, nil
 	}
-	if p.client == nil || p.clientURL != set.PanelURL || p.clientToken != set.MonToken {
-		p.client = p.newClient(set.PanelURL, set.MonToken)
-		p.clientURL, p.clientToken = set.PanelURL, set.MonToken
-		slog.Info("panel: client built", "url", set.PanelURL)
+	if p.client == nil || p.clientURL != set.PanelURL || p.clientToken != set.MonToken || p.clientCA != set.PanelCA {
+		roots, err := ParseCA(set.PanelCA)
+		if err != nil {
+			return nil, fmt.Errorf("panel: settings: %w", err)
+		}
+		p.client = p.newClient(set.PanelURL, set.MonToken, roots)
+		p.clientURL, p.clientToken, p.clientCA = set.PanelURL, set.MonToken, set.PanelCA
+		slog.Info("panel: client built", "url", set.PanelURL, "panelCa", roots != nil)
 	}
-	return p.client
+	return p.client, nil
 }
 
 // logUnconfigured says once, not every minute, that there is no panel to

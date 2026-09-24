@@ -87,10 +87,10 @@ services:
       MON_SERVER_URL: "https://mon-server:443"
       # mon-client has no --insecure and no CA flag (spec §2: it trusts the
       # system store), so the harness' self-signed certificate is handed to
-      # it the way Go's crypto/x509 accepts one on Linux: SSL_CERT_FILE,
-      # which replaces the system pool with exactly this file. mon-server
-      # is the only host a mon-client ever talks to, so replacing the pool
-      # costs nothing.
+      # it the way Go's crypto/x509 accepts one on Linux: SSL_CERT_FILE.
+      # It replaces only the default bundle file; Go still loads the system
+      # directory /etc/ssl/certs alongside it (research #59), so public CAs
+      # keep working and this certificate is simply trusted in addition.
       SSL_CERT_FILE: "/certs/mon-server.pem"
     # There is no MON_LOG_LEVEL (cmd/mon-client/cli.go has --log-level
     # only), and debug is what makes `docker compose logs mon-client` worth

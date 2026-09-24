@@ -65,10 +65,17 @@ func models() []any {
 // creates the database file itself but not the directory it lives in, so a
 // fresh install whose dataDir does not exist yet would otherwise fail on the
 // very first `admin set` or `run`.
+//
+// The file holds monToken and tgToken, so Open also keeps it private
+// (decision #52 §5): the directory is created 0700 and, on every open, set
+// to 0700 with the database file set to 0600. Doing it on every open rather
+// than only at creation is what repairs an install whose directory or file
+// were created looser (umask, an older build, a StateDirectory default).
+// certmagic's dataDir/certs is already 0700/0600 by its own FileStorage.
 func Open(path string) (*Store, error) {
 	if path != ":memory:" {
-		if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
-			return nil, fmt.Errorf("store: create data dir for %s: %w", path, err)
+		if err := ensurePrivateDir(filepath.Dir(path)); err != nil {
+			return nil, fmt.Errorf("store: data dir for %s: %w", path, err)
 		}
 	}
 
@@ -100,7 +107,34 @@ func Open(path string) (*Store, error) {
 	if err := s.Migrate(); err != nil {
 		return nil, err
 	}
+	// Migrate has touched the database, so sqlite has created the file by
+	// now if it did not exist; tighten it whether new or old.
+	if path != ":memory:" {
+		file, _, _ := strings.Cut(path, "?")
+		if err := os.Chmod(file, privateFileMode); err != nil {
+			return nil, fmt.Errorf("store: chmod %s: %w", file, err)
+		}
+	}
 	return s, nil
+}
+
+// privateDirMode and privateFileMode are dataDir's and mon-server.db's
+// permissions (decision #52 §5, spec §2): owner only.
+const (
+	privateDirMode  os.FileMode = 0o700
+	privateFileMode os.FileMode = 0o600
+)
+
+// ensurePrivateDir creates dir (and any missing parents) and sets dir itself
+// to privateDirMode, whatever it was before.
+func ensurePrivateDir(dir string) error {
+	if err := os.MkdirAll(dir, privateDirMode); err != nil {
+		return fmt.Errorf("create %s: %w", dir, err)
+	}
+	if err := os.Chmod(dir, privateDirMode); err != nil {
+		return fmt.Errorf("chmod %s: %w", dir, err)
+	}
+	return nil
 }
 
 // Migrate brings the schema up to date with every model this step declares.
