@@ -23,15 +23,18 @@ const (
 )
 
 // XrayPlan is what the probe needs to reach one target through the generated
-// config (spec §5): which loopback socks port belongs to it, and which real
-// server address the xray stderr reader has to match `dialing TCP to
-// tcp:<addr>:<port>` against (research §2.4).
+// config (spec §5): which loopback socks port belongs to it, and how the xray
+// stderr reader tells its sessions from every other target's — by the
+// outbound tag xray's dispatcher names (`taking detour [<tag>] for [...]`,
+// unique per target), falling back to the real server address of `dialing
+// TCP to tcp:<addr>:<port>` (research §2.4, decision #53 п. 6).
 type XrayPlan struct {
-	Key        proto.TargetKey
-	SocksPort  int
-	InboundTag string
-	ServerAddr string
-	ServerPort int
+	Key         proto.TargetKey
+	SocksPort   int
+	InboundTag  string
+	OutboundTag string
+	ServerAddr  string
+	ServerPort  int
 }
 
 // BuildXray generates the single xray.json that serves every xray-target
@@ -84,11 +87,12 @@ func BuildXray(targets []proto.Target, firstPort int) ([]byte, []XrayPlan, error
 			"outboundTag": outTag,
 		})
 		plans = append(plans, XrayPlan{
-			Key:        key,
-			SocksPort:  port,
-			InboundTag: inTag,
-			ServerAddr: addr,
-			ServerPort: serverPort,
+			Key:         key,
+			SocksPort:   port,
+			InboundTag:  inTag,
+			OutboundTag: outTag,
+			ServerAddr:  addr,
+			ServerPort:  serverPort,
 		})
 		port++
 	}

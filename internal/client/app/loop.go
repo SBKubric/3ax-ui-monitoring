@@ -88,6 +88,17 @@ type CycleGuard interface {
 	EndCycle()
 }
 
+// Reviver is an optional extension of Applier for an applier whose probes
+// depend on a long-running child process — RevisionApplier and its xray
+// child. Once calls Revive before every cycle, after any config apply, so
+// a child that died between cycles is restarted (or reported as down)
+// before a single probe runs through it (decision #53 п. 4). Revive
+// reports through Applied, never by failing the cycle: a dead xray must
+// not stop the AWG probes or the heartbeat.
+type Reviver interface {
+	Revive(ctx context.Context)
+}
+
 // Deps are everything the loop needs and does not build itself. Every
 // field that has a sensible production default gets one in NewLoop, so a
 // test only overrides the seams it wants to control (Clock, Sleep, Rand).
@@ -110,8 +121,8 @@ type Deps struct {
 	Runner *probe.Runner
 	// Applier converges the box on a config document (see Applier).
 	Applier Applier
-	// Clock stamps each cycle's ts and computes uptimeMs. Defaults to
-	// clock.Real.
+	// Clock stamps each cycle's ts, computes uptimeMs and places the
+	// cycle ticks (Run). Defaults to clock.Real.
 	Clock clock.Clock
 	// Sleep is the interval wait; the zero value is a cancellable timer.
 	// Tests inject one that advances the fake Clock instead, so a full
@@ -142,9 +153,6 @@ type Loop struct {
 	// start (spec §4.1) and set again whenever a heartbeat answers with a
 	// revision other than the applied one (spec §6).
 	needConfig bool
-	// first marks the cycle that has not run yet, the only one the start
-	// jitter applies to (spec §5).
-	first bool
 }
 
 // NewLoop returns a Loop over d, filling in every dependency with a
@@ -168,7 +176,7 @@ func NewLoop(d Deps) *Loop {
 	if d.StartedAt.IsZero() {
 		d.StartedAt = d.Clock.Now()
 	}
-	return &Loop{d: d, needConfig: true, first: true}
+	return &Loop{d: d, needConfig: true}
 }
 
 // Run drives the loop until ctx ends (a normal shutdown, reported as nil)
@@ -181,13 +189,21 @@ func NewLoop(d Deps) *Loop {
 // down, a 5xx, a timeout, a config that would not apply) is handled inside
 // the loop and never stops the probes (spec §6: "Пробы при этом
 // продолжаются").
+//
+// Cycles start on a fixed grid (spec §5, decision #53 п. 5): the first one
+// after the start jitter, every later one intervalMs after the previous
+// one's scheduled start, however long that cycle took. A cycle that runs
+// past the next tick does not trigger an immediate catch-up cycle — the
+// ticks it overran are skipped and the next cycle starts on the next tick
+// still ahead.
 func (l *Loop) Run(ctx context.Context) error {
+	if err := l.d.Sleep(ctx, l.startJitter()); err != nil {
+		return nil // ctx ended during the wait: an ordinary shutdown
+	}
+	start := l.d.Clock.Now()
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil
-		}
-		if err := l.d.Sleep(ctx, l.nextWait()); err != nil {
-			return nil // ctx ended during the wait: an ordinary shutdown
 		}
 		if err := l.Once(ctx); err != nil {
 			if ctx.Err() != nil {
@@ -196,6 +212,11 @@ func (l *Loop) Run(ctx context.Context) error {
 			l.log().Error("mon-client stopping", "error", err)
 			return err
 		}
+		next, wait := l.nextStart(start)
+		if err := l.d.Sleep(ctx, wait); err != nil {
+			return nil
+		}
+		start = next
 	}
 }
 
@@ -204,12 +225,13 @@ func (l *Loop) Run(ctx context.Context) error {
 // without any waiting of its own. Run calls it once per interval; a test
 // calls it directly, which is why the interval wait lives in Run.
 func (l *Loop) Once(ctx context.Context) error {
-	l.first = false
-
 	if l.needConfig {
 		if err := l.fetchAndApply(ctx); err != nil {
 			return err
 		}
+	}
+	if r, ok := l.d.Applier.(Reviver); ok {
+		r.Revive(ctx)
 	}
 
 	doc, results, ts, configErr := l.cycle(ctx)
@@ -353,27 +375,56 @@ func (l *Loop) emptyDoc() *proto.ConfigDoc {
 	}
 }
 
-// nextWait is how long Run waits before the next cycle: the applied
-// document's intervalMs, except before the very first cycle, which waits
-// only the start jitter.
+// startJitter is how long Run waits before the very first cycle: a random
+// share of the applied document's startJitterMs, and the only jitter a
+// mon-client ever applies (spec §5).
 //
-// Spec §5 asks for "старт со случайным джиттером [0, startJitterMs]" — the
-// jitter exists so that a fleet of boxes restarted together does not hit
-// mon-server in lockstep. Waiting a whole interval *plus* jitter before
-// the first cycle would instead leave a freshly started box silent for a
+// The jitter exists so that a fleet of boxes restarted together does not
+// hit mon-server in lockstep; once the first starts are spread, the fixed
+// grid keeps them spread. Waiting a whole interval *plus* jitter before the
+// first cycle would instead leave a freshly started box silent for a
 // minute, which is exactly the minute an operator watching a new
 // registration is looking at.
-func (l *Loop) nextWait() time.Duration {
+func (l *Loop) startJitter() time.Duration {
 	doc, _, _ := l.d.Applier.Applied()
-	p := probeParams(doc)
-	if l.first {
-		jitter := p.StartJitterMs
-		if jitter <= 0 {
-			return 0
-		}
-		return time.Duration(l.d.Rand.Int64N(jitter)) * time.Millisecond
+	jitter := probeParams(doc).StartJitterMs
+	if jitter <= 0 {
+		return 0
 	}
-	interval := p.IntervalMs
+	return time.Duration(l.d.Rand.Int64N(jitter)) * time.Millisecond
+}
+
+// nextStart is the tick the cycle after the one scheduled at prev starts
+// on, and how long to wait for it from now (decision #53 п. 5).
+//
+// The tick is prev + intervalMs — the scheduled start, not the moment the
+// timer actually fired, so a timer's lateness never accumulates into
+// drift. When the cycle ran past that tick, the ticks it overran are
+// skipped and the next one still ahead is taken: the period stretches to a
+// whole number of intervals instead of a burst of back-to-back cycles. The
+// wait is capped at one interval, so a wall clock stepped backwards costs
+// at most one late cycle rather than a silence as long as the step.
+func (l *Loop) nextStart(prev time.Time) (next time.Time, wait time.Duration) {
+	interval := l.interval()
+	now := l.d.Clock.Now()
+	next = prev.Add(interval)
+	if late := now.Sub(next); late > 0 {
+		skipped := (late + interval - 1) / interval
+		next = next.Add(skipped * interval)
+		l.log().Warn(fmt.Sprintf("cycle overran the %s interval, skipping %d tick(s)", interval, skipped))
+	}
+	wait = next.Sub(now)
+	if wait > interval {
+		next, wait = now.Add(interval), interval
+	}
+	return next, wait
+}
+
+// interval is the applied document's intervalMs, defaulted like
+// everything else in probeParams.
+func (l *Loop) interval() time.Duration {
+	doc, _, _ := l.d.Applier.Applied()
+	interval := probeParams(doc).IntervalMs
 	if interval <= 0 {
 		interval = DefaultIntervalMs
 	}

@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -93,6 +94,11 @@ func TestProbeBadConfig(t *testing.T) {
 		proto.TargetKey{InboundKind: "awg", InboundID: 0, Path: "proxy"}, cfg, probe.Budgets{Budget: time.Second, Connect: 100 * time.Millisecond})
 	if res.Ok || deref(res.Reason) != proto.ReasonAWGNoHandshake {
 		t.Fatalf("got %+v, want a failed awg_no_handshake result", res)
+	}
+	// Decision #53 п. 2: a device error stays a probe failure, and its text
+	// is the detail, so the operator sees what amneziawg-go refused.
+	if d := deref(res.Detail); !strings.Contains(d, "apply uapi config") {
+		t.Errorf("detail = %q, want the IpcSet error", d)
 	}
 }
 

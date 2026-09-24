@@ -8,6 +8,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/SBKubric/3ax-ui-monitoring/internal/client/awg"
 	"github.com/SBKubric/3ax-ui-monitoring/internal/client/config"
@@ -29,6 +30,12 @@ const xrayConfigName = "xray.json"
 // пробы по старому конфигу") and which is impossible once the file the old
 // child ran on has been overwritten.
 const prevSuffix = ".prev"
+
+// reviveTimeout bounds one attempt to bring a dead xray child back before a
+// cycle (decision #53 п. 4). A child that has not bound its socks ports in
+// that time will not do better by being waited on, and the cycle — AWG
+// probes and the heartbeat included — must still start close to its tick.
+const reviveTimeout = 10 * time.Second
 
 // ApplierDeps are the collaborators RevisionApplier cannot make up for
 // itself. It is not called Deps because that name belongs to the loop's
@@ -81,12 +88,25 @@ type RevisionApplier struct {
 
 	// mu guards everything below, which Applied reads from the loop's
 	// goroutine while Apply writes it.
-	mu      sync.Mutex
-	doc     *proto.ConfigDoc
-	probes  map[proto.TargetKey]probe.Fn
-	ports   []int // the socks ports of the applied revision, for recovery
-	lastErr error
+	mu       sync.Mutex
+	doc      *proto.ConfigDoc
+	probes   map[proto.TargetKey]probe.Fn
+	xrayKeys map[proto.TargetKey]bool // the applied xray-targets, skipped while xray is down
+	ports    []int                    // the socks ports of the applied revision, for recovery
+	lastErr  error
+	// xrayDown is set while the xray child is dead and a restart before
+	// the cycle did not bring it back (decision #53 п. 4). It overrides
+	// lastErr as the configError until the child is up again.
+	xrayDown error
 }
+
+// RevisionApplier is the production Applier, and the loop finds its cycle
+// guard and its xray revival through these interfaces only.
+var (
+	_ Applier    = (*RevisionApplier)(nil)
+	_ CycleGuard = (*RevisionApplier)(nil)
+	_ Reviver    = (*RevisionApplier)(nil)
+)
 
 // NewRevisionApplier wires an applier to its probers, its xray child and
 // the state file whose appliedRevision it maintains.
@@ -124,10 +144,69 @@ func (a *RevisionApplier) Apply(ctx context.Context, doc *proto.ConfigDoc) error
 
 // Applied reports the document the box is currently probing by, its probe
 // map and the configError (see the Applier contract).
+//
+// While the xray child is down (see Revive) the xray-targets are left out
+// of the probe map — probing them through socks ports nobody listens on
+// would report a false tcp_refused for every one of them — and the
+// configError is xray's own. mon-server passes no verdict on results that
+// did not arrive, so those targets age to STALE rather than DOWN.
 func (a *RevisionApplier) Applied() (*proto.ConfigDoc, map[proto.TargetKey]probe.Fn, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return a.doc, a.probes, a.lastErr
+	if a.xrayDown == nil {
+		return a.doc, a.probes, a.lastErr
+	}
+	probes := make(map[proto.TargetKey]probe.Fn, len(a.probes))
+	for k, fn := range a.probes {
+		if !a.xrayKeys[k] {
+			probes[k] = fn
+		}
+	}
+	return a.doc, probes, a.xrayDown
+}
+
+// Revive is the loop's Reviver (decision #53 п. 4): before every cycle, if
+// the applied revision has xray-targets and the child is not running, it
+// restarts the child on the applied xray.json — one attempt per cycle, so
+// the interval is the backoff. A child that comes back clears the xray
+// error, and the configError returns to the revision's own (or none); one
+// that does not keeps its xray-targets out of the cycle and reports
+// "xray: <first line it printed>" as the configError.
+func (a *RevisionApplier) Revive(ctx context.Context) {
+	if a.d.Xray == nil || a.d.Dir == nil {
+		return
+	}
+	a.cycle.Lock()
+	defer a.cycle.Unlock()
+
+	a.mu.Lock()
+	ports := a.ports
+	a.mu.Unlock()
+	if len(ports) == 0 {
+		return
+	}
+	if a.d.Xray.Running() {
+		a.setXrayDown(nil)
+		return
+	}
+
+	a.d.Log.Warn("xray is not running, restarting it")
+	rctx, cancel := context.WithTimeout(ctx, reviveTimeout)
+	defer cancel()
+	if err := a.d.Xray.Restart(rctx, a.d.Dir.Path(xrayConfigName), ports); err != nil {
+		down := errors.New(firstLine("xray: " + strings.TrimPrefix(err.Error(), "xray: ")))
+		a.d.Log.Error("xray did not come back, its targets are not probed this cycle", "error", down)
+		a.setXrayDown(down)
+		return
+	}
+	a.d.Log.Info("xray restarted on the applied revision")
+	a.setXrayDown(nil)
+}
+
+func (a *RevisionApplier) setXrayDown(err error) {
+	a.mu.Lock()
+	a.xrayDown = err
+	a.mu.Unlock()
 }
 
 // BeginCycle and EndCycle are the loop's CycleGuard: they hold the read
@@ -202,6 +281,10 @@ func (a *RevisionApplier) apply(ctx context.Context, doc *proto.ConfigDoc) error
 
 	a.mu.Lock()
 	a.doc, a.probes, a.ports, a.lastErr = doc, probes, ports, nil
+	a.xrayKeys = xrayKeys(plans)
+	// The child was just (re)started on this revision, or the revision has
+	// no xray-targets: either way there is no dead child to report.
+	a.xrayDown = nil
 	a.mu.Unlock()
 
 	// Spec §7's revision line: what was applied and how much of it.
@@ -398,6 +481,15 @@ func parseDoc(doc *proto.ConfigDoc) ([]byte, []config.XrayPlan, map[proto.Target
 		awgs[t.TargetKey] = cfg
 	}
 	return cfgJSON, plans, awgs, nil
+}
+
+// xrayKeys is the set of targets a revision probes through the xray child.
+func xrayKeys(plans []config.XrayPlan) map[proto.TargetKey]bool {
+	keys := make(map[proto.TargetKey]bool, len(plans))
+	for _, p := range plans {
+		keys[p.Key] = true
+	}
+	return keys
 }
 
 // socksPorts is the set of loopback ports the restarted child has to be

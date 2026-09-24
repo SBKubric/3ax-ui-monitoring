@@ -382,7 +382,7 @@ func TestProcessStderrRingAndDiagnose(t *testing.T) {
 		t.Fatalf("ring does not hold both dial lines: %+v", snap)
 	}
 
-	m, ok := p.Diagnose("www.cloudflare.com", 443, since, time.Now())
+	m, ok := p.Diagnose(Target{Addr: "www.cloudflare.com", Port: 443}, since, time.Now())
 	if !ok {
 		t.Fatalf("Diagnose found nothing in %+v", snap)
 	}

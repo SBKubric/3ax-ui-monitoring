@@ -39,6 +39,11 @@ type Prober struct {
 	// slog.Default().
 	Log *slog.Logger
 
+	// Resolver turns a peer Endpoint that names a host into the IP
+	// amneziawg-go insists on (decision #53 п. 1). Nil means
+	// net.DefaultResolver, the host's own resolver.
+	Resolver Resolver
+
 	// tlsConfig overrides the probe's TLS settings. In production it is
 	// always nil: mon-server presents a publicly trusted certificate
 	// (mon-server spec §2), so the system roots are exactly right. The
@@ -88,10 +93,25 @@ func (p Prober) probe(ctx context.Context, probeURL, token string, key proto.Tar
 		return failure(key, probe.Phases{}, handshakeMs, proto.ReasonHTTPError, err.Error())
 	}
 
-	dev, err := Open(cfg)
+	// The endpoint is resolved on every probe, right before the device is
+	// built, so a name whose address changed is followed within a cycle
+	// (decision #53 п. 1). A name that does not resolve means no tunnel,
+	// so it is the same awg_no_handshake as a device that would not come
+	// up — the reason dictionary has no DNS entry, and detail names the
+	// host.
+	uapi, err := resolveEndpoints(ctx, p.resolver(), cfg.UAPI)
+	if err != nil {
+		return failure(key, probe.Phases{}, handshakeMs, proto.ReasonAWGNoHandshake, err.Error())
+	}
+	resolved := *cfg
+	resolved.UAPI = uapi
+
+	dev, err := Open(&resolved)
 	if err != nil {
 		// The tunnel never existed, so no handshake ever happened:
-		// awg_no_handshake is the dictionary's word for it (spec §5).
+		// awg_no_handshake is the dictionary's word for it (spec §5), and
+		// the device's own error (IpcSet, Up) is the detail. It is retried
+		// next cycle like any other failed probe (decision #53 п. 2).
 		return failure(key, probe.Phases{}, handshakeMs, proto.ReasonAWGNoHandshake, err.Error())
 	}
 	defer dev.Close()
@@ -253,6 +273,14 @@ type onceConn struct {
 func (c *onceConn) Close() error {
 	c.once.Do(func() { c.err = c.Conn.Close() })
 	return c.err
+}
+
+// resolver is the Resolver to use, defaulting to the host's own.
+func (p Prober) resolver() Resolver {
+	if p.Resolver == nil {
+		return net.DefaultResolver
+	}
+	return p.Resolver
 }
 
 // log writes the one line per probe spec §7 asks for.

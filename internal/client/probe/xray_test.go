@@ -27,12 +27,11 @@ type fakeDiagnoser struct {
 	match xray.Match
 	ok    bool
 
-	addr string
-	port int
+	target xray.Target
 }
 
-func (d *fakeDiagnoser) Diagnose(addr string, port int, _, _ time.Time) (xray.Match, bool) {
-	d.addr, d.port = addr, port
+func (d *fakeDiagnoser) Diagnose(target xray.Target, _, _ time.Time) (xray.Match, bool) {
+	d.target = target
 	return d.match, d.ok
 }
 
@@ -77,11 +76,12 @@ func (f *probeFixture) probeURL() string { return f.stub.URL() + "/v1/probe" }
 // asked about (config.XrayPlan, step 3).
 func plan(socksPort int) config.XrayPlan {
 	return config.XrayPlan{
-		Key:        testKey,
-		SocksPort:  socksPort,
-		InboundTag: "in-xray-12-proxy",
-		ServerAddr: "real.example",
-		ServerPort: 443,
+		Key:         testKey,
+		SocksPort:   socksPort,
+		InboundTag:  "in-xray-12-proxy",
+		OutboundTag: "out-xray-12-proxy",
+		ServerAddr:  "real.example",
+		ServerPort:  443,
 	}
 }
 
@@ -208,8 +208,12 @@ func TestProberXray_RealityRealCertOverridesReason(t *testing.T) {
 	if d := deref(res.Detail); d != "REALITY: received real certificate" {
 		t.Errorf("detail = %q, want xray's own line", d)
 	}
-	if diag.addr != "real.example" || diag.port != 443 {
-		t.Errorf("diagnosed %s:%d, want the plan's real server", diag.addr, diag.port)
+	// The outbound tag is what tells this target's session apart from
+	// another target's on the same real server (decision #53 п. 6); the
+	// address and port are the fallback.
+	want := xray.Target{OutboundTag: "out-xray-12-proxy", Addr: "real.example", Port: 443}
+	if diag.target != want {
+		t.Errorf("diagnosed %+v, want the plan's outbound and real server %+v", diag.target, want)
 	}
 }
 

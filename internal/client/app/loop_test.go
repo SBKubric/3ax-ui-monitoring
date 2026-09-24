@@ -589,6 +589,138 @@ func TestLoop_RunJittersOnlyTheFirstCycle(t *testing.T) {
 	}
 }
 
+// revivingApplier is a fakeApplier that also implements Reviver and
+// records when it was asked to revive.
+type revivingApplier struct {
+	*fakeApplier
+	note func(string)
+}
+
+func (a *revivingApplier) Revive(context.Context) { a.note("revive") }
+
+// TestLoop_RevivesBeforeEveryCycle is the loop's half of decision #53 п. 4:
+// an applier that keeps a child process alive is given the chance to
+// restart it before every cycle — after the config is applied, before a
+// single probe runs.
+func TestLoop_RevivesBeforeEveryCycle(t *testing.T) {
+	var mu sync.Mutex
+	var events []string
+	note := func(what string) {
+		mu.Lock()
+		defer mu.Unlock()
+		events = append(events, what)
+	}
+	probes := map[proto.TargetKey]probe.Fn{targetKey(): func(ctx context.Context, k proto.TargetKey) proto.Result {
+		note("probe")
+		return okProbe(ctx, k)
+	}}
+	h := newHarness(t, probes)
+	loop := h.withApplier(t, &revivingApplier{fakeApplier: h.applier, note: note})
+	h.stub.SetConfig(doc("rev1"))
+	h.stub.SetRevision("rev1")
+
+	for i := 0; i < 2; i++ {
+		if err := loop.Once(context.Background()); err != nil {
+			t.Fatalf("Once: %v", err)
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if got := strings.Join(events, ","); got != "revive,probe,revive,probe" {
+		t.Errorf("events = %s, want a revive before every cycle's probes", got)
+	}
+}
+
+// runCycles runs h.loop until n heartbeats reached the stub, then stops it
+// and returns the start of every cycle, read from the heartbeats' cycles
+// (protocol §5.3's ts is the cycle start).
+func runCycles(t *testing.T, h *harness, n int) []int64 {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- h.loop.Run(ctx) }()
+
+	deadline := time.After(10 * time.Second)
+	for len(h.stub.Heartbeats()) < n {
+		select {
+		case <-deadline:
+			cancel()
+			t.Fatalf("timed out waiting for %d cycles", n)
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	var starts []int64
+	for _, hb := range h.stub.Heartbeats()[:n] {
+		c := hb.Cycles[len(hb.Cycles)-1]
+		starts = append(starts, c.Ts)
+	}
+	return starts
+}
+
+// slowProbe is a probe that takes d of the harness' fake time, so a cycle
+// has a length without the test waiting for it.
+func slowProbe(clk **clock.Fake, d time.Duration) probe.Fn {
+	return func(ctx context.Context, k proto.TargetKey) proto.Result {
+		(*clk).Advance(d)
+		return okProbe(ctx, k)
+	}
+}
+
+// TestLoop_RunKeepsAFixedPeriod is decision #53 п. 5: the next cycle
+// starts intervalMs after the previous one *started*, so a 25 s cycle at a
+// 60 s interval still gives a 60 s period — not the 85 s a sleep after the
+// cycle used to give.
+func TestLoop_RunKeepsAFixedPeriod(t *testing.T) {
+	var clk *clock.Fake
+	h := newHarness(t, map[proto.TargetKey]probe.Fn{targetKey(): slowProbe(&clk, 25*time.Second)})
+	clk = h.clk
+	h.stub.SetConfig(doc("rev1"))
+	h.stub.SetRevision("rev1")
+
+	starts := runCycles(t, h, 4)
+	for i := 1; i < len(starts); i++ {
+		if got := time.Duration(starts[i]-starts[i-1]) * time.Millisecond; got != time.Minute {
+			t.Errorf("cycle %d started %s after cycle %d, want the 60s interval (starts %v)", i+1, got, i, starts)
+		}
+	}
+	sleeps := *h.sleeps
+	for i, d := range sleeps[1:4] {
+		if d != 35*time.Second {
+			t.Errorf("wait %d = %s, want 35s (the interval minus the 25s cycle)", i+2, d)
+		}
+	}
+}
+
+// TestLoop_RunSkipsMissedTicks is the other half of decision #53 п. 5: a
+// cycle longer than the interval skips the tick it overran instead of
+// starting the next cycle at once to catch up — no burst, the period
+// simply becomes two intervals while the cycles stay that slow.
+func TestLoop_RunSkipsMissedTicks(t *testing.T) {
+	var clk *clock.Fake
+	h := newHarness(t, map[proto.TargetKey]probe.Fn{targetKey(): slowProbe(&clk, 70*time.Second)})
+	clk = h.clk
+	h.stub.SetConfig(doc("rev1"))
+	h.stub.SetRevision("rev1")
+
+	starts := runCycles(t, h, 3)
+	for i := 1; i < len(starts); i++ {
+		if got := time.Duration(starts[i]-starts[i-1]) * time.Millisecond; got != 2*time.Minute {
+			t.Errorf("cycle %d started %s after cycle %d, want 120s (one tick skipped; starts %v)", i+1, got, i, starts)
+		}
+	}
+	for i, d := range (*h.sleeps)[1:3] {
+		if d != 50*time.Second {
+			t.Errorf("wait %d = %s, want 50s to the next tick on the grid, never an immediate catch-up", i+2, d)
+		}
+	}
+}
+
 // TestLoop_RunStopsOnContextCancellation checks an ordinary shutdown is
 // not an error: SIGINT/SIGTERM cancels the context, Run returns nil, and
 // cmd/mon-client exits 0.
