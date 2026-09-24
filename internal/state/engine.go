@@ -787,13 +787,23 @@ func (e *Engine) enqueueTarget(tx *gorm.DB, t store.Target, from, to, reason str
 // emitMonClient publishes a mon-client's own ONLINE/OFFLINE transition
 // (spec §7.3), with the same PANEL_DOWN rule — and the same deferred send —
 // as a target's.
+//
+// A first transition out of NEVER goes to the panel with an empty from
+// (decision #50, spec §7.1): NEVER is the registry's own "never heard from"
+// state, the panel's dictionary for mon_client is ONLINE/OFFLINE, and it
+// rejects anything else. mon-server's own Telegram message keeps the real
+// from — that text never reaches the panel.
 func (e *Engine) emitMonClient(tx *gorm.DB, notify *notices, mc *store.MonClient, from, to, reason string, nowMs int64) error {
+	wireFrom := from
+	if wireFrom == store.MonClientNever {
+		wireFrom = ""
+	}
 	worthy := e.panelDown()
 	ev, err := e.enqueue(tx, store.EventPayload{
 		Ts:          nowMs,
 		Kind:        eventKindMonClient,
 		MonClientID: mc.Id,
-		From:        from,
+		From:        wireFrom,
 		To:          to,
 		Reason:      reason,
 		Notified:    worthy,

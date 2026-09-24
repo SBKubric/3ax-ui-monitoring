@@ -732,6 +732,9 @@ func TestPoll_EventBatchRejectedWithFourXXIsDropped(t *testing.T) {
 		if row.SentAt == nil {
 			t.Fatalf("event %s is still queued; a rejected batch must be dropped, not left to wedge the outbox", row.Id)
 		}
+		if want := row.Id <= "seed-0999"; row.Dropped != want {
+			t.Fatalf("event %s dropped = %v, want %v (only the rejected batch is dropped)", row.Id, row.Dropped, want)
+		}
 	}
 }
 
@@ -1119,5 +1122,84 @@ func TestPoll_TruncatesMonClientSnapshotToContractLimit(t *testing.T) {
 	}
 	if len(ensured[0]) != 200 {
 		t.Fatalf("ensure sent %d mon-clients, want the contract's limit of 200", len(ensured[0]))
+	}
+}
+
+// TestPoll_RejectedEventsAreDroppedAndTheRestSent pins decision #50 on the
+// sending side: the panel answers a batch element by element, only the
+// accepted events are marked sent, and a rejected one is logged and marked
+// dropped — out of the queue for good, never resent — instead of the whole
+// batch sharing one fate. The rejected event is the mon_client NEVER → ONLINE
+// regression the stub's dictionary check exists to catch.
+func TestPoll_RejectedEventsAreDroppedAndTheRestSent(t *testing.T) {
+	h := newHarness(t)
+	ids := h.seedEvents(t, 3, clock.Ms(testTime))
+	bad := store.EventPayload{ID: "never-online", Ts: clock.Ms(testTime) + 1500,
+		Kind: "mon_client", MonClientID: "ams-1", From: store.MonClientNever, To: store.MonClientOnline}
+	if err := h.store.EnqueueEvent(bad); err != nil {
+		t.Fatalf("EnqueueEvent: %v", err)
+	}
+
+	if err := h.poller.Poll(context.Background()); err != nil {
+		t.Fatalf("Poll: %v", err)
+	}
+	if h.poller.PanelDown() {
+		t.Fatal("a per-element rejection must not count toward PANEL_DOWN — the panel answered")
+	}
+
+	got := map[string]bool{}
+	for _, ev := range h.stub.Events() {
+		got[ev.ID] = true
+	}
+	for _, id := range ids {
+		if !got[id] {
+			t.Fatalf("valid event %s was not delivered alongside the rejected one", id)
+		}
+	}
+	if got[bad.ID] {
+		t.Fatal("the NEVER event was stored by the panel stub; its dictionary check is not biting")
+	}
+	for _, row := range h.outbox(t) {
+		if row.SentAt == nil {
+			t.Fatalf("event %s is still queued after the panel answered for it", row.Id)
+		}
+		if want := row.Id == bad.ID; row.Dropped != want {
+			t.Fatalf("event %s dropped = %v, want %v (only the rejected event is dropped)", row.Id, row.Dropped, want)
+		}
+	}
+
+	// The next cycle must not offer the rejected event to the panel again.
+	if err := h.poller.Poll(context.Background()); err != nil {
+		t.Fatalf("second Poll: %v", err)
+	}
+	if n := len(h.stub.RejectedEvents()); n != 1 {
+		t.Fatalf("panel saw %d rejections, want exactly 1: a dropped event is never retried", n)
+	}
+}
+
+// TestPoll_EmptyEventsAnswerMarksTheBatchSent covers the old panel: a bare
+// 200 with no body answers POST /events, which is "all accepted", so the
+// batch is marked sent and the cycle is a success rather than a failure
+// that would count toward PANEL_DOWN.
+func TestPoll_EmptyEventsAnswerMarksTheBatchSent(t *testing.T) {
+	h := newHarness(t)
+	h.stub.SetLegacyAnswers(true)
+	h.seedEvents(t, 3, clock.Ms(testTime))
+
+	for i := 0; i < 3; i++ {
+		if err := h.poller.Poll(context.Background()); err != nil {
+			t.Fatalf("Poll %d: %v", i+1, err)
+		}
+	}
+	if h.poller.PanelDown() {
+		t.Fatal("an empty 200 on POST /events was counted as a panel failure")
+	}
+	for _, row := range h.outbox(t) {
+		if row.SentAt == nil || row.Dropped {
+			t.Fatalf("event %s sent_at=%v dropped=%v, want sent and not dropped", row.Id, row.SentAt, row.Dropped)
+		}
+	}
+	if n := len(h.stub.Events()); n != 3 {
+		t.Fatalf("panel holds %d events, want 3", n)
 	}
 }

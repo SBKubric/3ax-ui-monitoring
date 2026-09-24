@@ -383,3 +383,104 @@ func TestHTTPClient_IgnoresUnknownResponseFields(t *testing.T) {
 		t.Fatalf("decoded state = %+v, want the known fields kept", st)
 	}
 }
+
+// TestHTTPClient_EmptyBatchAnswerMeansAllAccepted pins decision #50's
+// compatibility rule: a panel from before per-element answers replies to
+// POST /events and /stats with a bare 200 and no body, which is success with
+// nothing rejected — not a failed request to retry (the empty body used to
+// surface as a decode netError, i.e. a retryable "panel failure").
+func TestHTTPClient_EmptyBatchAnswerMeansAllAccepted(t *testing.T) {
+	s := paneltest.NewStub(t)
+	s.SetLegacyAnswers(true)
+	c, log := newClient(t, s)
+
+	ev := store.EventPayload{ID: "e0", Ts: 1757721540000, Kind: "panel", From: "PANEL_UP", To: "PANEL_DOWN"}
+	evRes, err := c.PostEvents(context.Background(), []store.EventPayload{ev})
+	if err != nil {
+		t.Fatalf("PostEvents: %v, want an empty 200 read as success", err)
+	}
+	if len(evRes.Rejected) != 0 {
+		t.Fatalf("events result = %+v, want nothing rejected", evRes)
+	}
+
+	st := panel.StatPayload{MonClientId: "ams-1", InboundKind: "xray", InboundId: 12, Path: "direct", BucketStart: 1757721300000}
+	stRes, err := c.PostStats(context.Background(), []panel.StatPayload{st})
+	if err != nil {
+		t.Fatalf("PostStats: %v, want an empty 200 read as success", err)
+	}
+	if len(stRes.Rejected) != 0 {
+		t.Fatalf("stats result = %+v, want nothing rejected", stRes)
+	}
+	wantDelays(t, log.delays())
+}
+
+// TestHTTPClient_EmptyStateBodyIsStillAnError keeps the empty-body allowance
+// where it belongs: GET /state has no "nothing to say" answer, and an empty
+// 200 there must not decode as a zero-value snapshot.
+func TestHTTPClient_EmptyStateBodyIsStillAnError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("X-Mon-Contract", "1")
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	c := panel.NewHTTPClient(srv.URL, "t", clock.NewFake(testTime),
+		panel.WithSleeper(func(context.Context, time.Duration) error { return nil }))
+	if _, err := c.State(context.Background()); err == nil {
+		t.Fatal("State on an empty 200 = nil error, want a failure")
+	}
+}
+
+// TestHTTPClient_DecodesRejected checks the per-element answer shape of
+// decision #50: {accepted, rejected:[{index, id?, error}]}.
+func TestHTTPClient_DecodesRejected(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("X-Mon-Contract", "1")
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		_, _ = w.Write([]byte(`{"accepted":1,"rejected":[{"index":1,"id":"e1","error":"from: unknown value \"NEVER\""}]}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	c := panel.NewHTTPClient(srv.URL, "t", clock.NewFake(testTime))
+	res, err := c.PostEvents(context.Background(), make([]store.EventPayload, 2))
+	if err != nil {
+		t.Fatalf("PostEvents: %v", err)
+	}
+	if res.Accepted != 1 || len(res.Rejected) != 1 || res.Rejected[0] != (panel.Rejected{Index: 1, Id: "e1", Error: `from: unknown value "NEVER"`}) {
+		t.Fatalf("result = %+v, want accepted 1 and index 1 rejected", res)
+	}
+}
+
+// TestRejections_PlacesEntriesOnTheBatch checks how a rejected list maps
+// back onto the batch that was sent: by index, by id when the two disagree
+// (the id is the event's real identity), and not at all for an entry that
+// names nothing in the batch — that element stays accepted.
+func TestRejections_PlacesEntriesOnTheBatch(t *testing.T) {
+	ids := []string{"a", "b", "c"}
+	cases := []struct {
+		name string
+		ids  []string
+		in   []panel.Rejected
+		want []int
+	}{
+		{"by index", nil, []panel.Rejected{{Index: 2, Error: "x"}}, []int{2}},
+		{"index and id agree", ids, []panel.Rejected{{Index: 1, Id: "b", Error: "x"}}, []int{1}},
+		{"id wins over a wrong index", ids, []panel.Rejected{{Index: 0, Id: "c", Error: "x"}}, []int{2}},
+		{"index out of range", nil, []panel.Rejected{{Index: 3, Error: "x"}, {Index: -1, Error: "x"}}, nil},
+		{"unknown id", ids, []panel.Rejected{{Index: 1, Id: "zzz", Error: "x"}}, nil},
+		{"nothing rejected", ids, nil, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := panel.Rejections(3, tc.in, tc.ids)
+			if len(got) != len(tc.want) {
+				t.Fatalf("Rejections = %v, want indices %v", got, tc.want)
+			}
+			for _, i := range tc.want {
+				if _, ok := got[i]; !ok {
+					t.Fatalf("Rejections = %v, want indices %v", got, tc.want)
+				}
+			}
+		})
+	}
+}

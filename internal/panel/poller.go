@@ -595,7 +595,7 @@ func (p *Poller) flush(ctx context.Context, set *store.Settings, cl Client) erro
 		events, ids, dropped := decodeBatch(rows)
 		if len(dropped) > 0 {
 			slog.Warn("panel: dropping unreadable outbox rows", "ids", dropped)
-			if err := p.markSent(ctx, dropped); err != nil {
+			if err := p.markDropped(ctx, dropped); err != nil {
 				return err
 			}
 		}
@@ -609,13 +609,15 @@ func (p *Poller) flush(ctx context.Context, set *store.Settings, cl Client) erro
 			if errors.As(err, &apiErr) && !apiErr.Retryable() {
 				// Contract §3 / spec §4: a 4xx is the panel rejecting the
 				// batch itself, and resending it would fail identically
-				// every minute forever. Drop it — marked sent, so the queue
-				// cannot wedge behind it — but name the ids, because those
-				// transitions are now lost.
+				// every minute forever. Drop it — marked dropped, so the
+				// queue cannot wedge behind it — but name the ids, because
+				// those transitions are now lost. Since decision #50 the
+				// panel answers invalid elements one by one, so this is
+				// left for a body it cannot read at all.
 				slog.Warn("panel: dropping event batch the panel rejected",
 					"status", apiErr.Status, "code", apiErr.Code, "message", apiErr.Message,
 					"count", len(ids), "ids", firstIDs(ids))
-				if err := p.markSent(ctx, ids); err != nil {
+				if err := p.markDropped(ctx, ids); err != nil {
 					return err
 				}
 				continue
@@ -623,14 +625,35 @@ func (p *Poller) flush(ctx context.Context, set *store.Settings, cl Client) erro
 			return err
 		}
 
+		// Decision #50: the panel answers element by element. Only what it
+		// accepted is sent; what it rejected would be rejected again on
+		// every resend, so it is logged with the panel's reason and
+		// dropped. An empty answer (an older panel) rejects nothing.
+		rejected := Rejections(len(ids), res.Rejected, ids)
+		sent := make([]string, 0, len(ids))
+		var refused []string
+		for i, id := range ids {
+			r, ok := rejected[i]
+			if !ok {
+				sent = append(sent, id)
+				continue
+			}
+			slog.Warn("panel: dropping event the panel rejected",
+				"id", id, "kind", events[i].Kind, "from", events[i].From, "to", events[i].To,
+				"error", r.Error)
+			refused = append(refused, id)
+		}
 		if res.Duplicates > 0 || len(res.Ignored) > 0 {
 			slog.Info("panel: events accepted with remarks",
 				"accepted", res.Accepted, "duplicates", res.Duplicates, "ignored", len(res.Ignored))
 		}
-		if err := p.markSent(ctx, ids); err != nil {
+		if err := p.markSent(ctx, sent); err != nil {
 			return err
 		}
-		p.addRecoverySent(len(ids))
+		if err := p.markDropped(ctx, refused); err != nil {
+			return err
+		}
+		p.addRecoverySent(len(sent))
 	}
 
 	p.finishRecovery(ctx)
@@ -677,8 +700,8 @@ func (p *Poller) Prune(ctx context.Context) error {
 	return nil
 }
 
-// markSent stamps sent_at on a batch the panel has accepted (or that was
-// dropped on purpose), which is what takes it out of every later flush.
+// markSent stamps sent_at on the events the panel has accepted, which is
+// what takes them out of every later flush.
 func (p *Poller) markSent(ctx context.Context, ids []string) error {
 	if len(ids) == 0 {
 		return nil
@@ -688,6 +711,21 @@ func (p *Poller) markSent(ctx context.Context, ids []string) error {
 		Model(&store.EventOutbox{}).
 		Where("id IN ?", ids).
 		Update("sent_at", now).Error
+}
+
+// markDropped takes events out of the queue without their having reached
+// the panel: sent_at is stamped like markSent's, so no later flush offers
+// them again and retention ages them out, and dropped records that they
+// were given up on rather than delivered.
+func (p *Poller) markDropped(ctx context.Context, ids []string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	now := clock.Ms(p.clk.Now())
+	return p.store.DB.WithContext(ctx).
+		Model(&store.EventOutbox{}).
+		Where("id IN ?", ids).
+		Updates(map[string]any{"sent_at": now, "dropped": true}).Error
 }
 
 // decodeBatch turns outbox rows into wire events, separating out rows whose

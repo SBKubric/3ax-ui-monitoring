@@ -235,8 +235,8 @@ func TestHeartbeat_FirstHeartbeatBringsTheClientOnline(t *testing.T) {
 	}
 
 	evs := f.events()
-	if len(evs) != 1 || evs[0].Kind != eventKindMonClient || evs[0].From != store.MonClientNever || evs[0].To != store.MonClientOnline {
-		t.Fatalf("events = %+v, want one mon_client NEVER → ONLINE", evs)
+	if len(evs) != 1 || evs[0].Kind != eventKindMonClient || evs[0].From != "" || evs[0].To != store.MonClientOnline {
+		t.Fatalf("events = %+v, want one mon_client \"\" → ONLINE", evs)
 	}
 	if evs[0].Notified {
 		t.Fatalf("event notified = true, want the panel to send it (the panel is up)")
@@ -456,6 +456,44 @@ func TestHeartbeat_ConfigErrorNotifiesAndClears(t *testing.T) {
 	mc = f.reload()
 	if mc.ConfigError != "" || mc.ConfigErrorAt != nil {
 		t.Fatalf("row = %+v, want the configError cleared", mc)
+	}
+}
+
+// TestHeartbeat_NeverIsNotSentToThePanel pins decision #50 item 1: a
+// mon-client's first transition goes to the panel with an empty from. NEVER
+// is mon-server's internal registry state (spec §3); the panel's dictionary
+// for kind mon_client is ONLINE/OFFLINE, and a NEVER there made it reject
+// the event (and, before per-element answers, the whole batch around it).
+// A later OFFLINE → ONLINE keeps its from — only NEVER is hidden.
+func TestHeartbeat_NeverIsNotSentToThePanel(t *testing.T) {
+	f := newFixture(t)
+	f.clk.Advance(time.Minute)
+	f.beat()
+
+	var rows []store.EventOutbox
+	if err := f.st.DB.Find(&rows).Error; err != nil {
+		t.Fatalf("read outbox: %v", err)
+	}
+	for _, row := range rows {
+		if strings.Contains(row.Payload, store.MonClientNever) {
+			t.Fatalf("outbox payload %s carries NEVER to the panel", row.Payload)
+		}
+	}
+	evs := f.events()
+	if len(evs) != 1 || evs[0].From != "" || evs[0].To != store.MonClientOnline {
+		t.Fatalf("events = %+v, want one mon_client with an empty from", evs)
+	}
+
+	if err := f.st.DB.Model(&store.MonClient{}).Where("id = ?", f.mc.Id).
+		Update("state", store.MonClientOffline).Error; err != nil {
+		t.Fatalf("mark offline: %v", err)
+	}
+	f.mc.State = store.MonClientOffline
+	f.clk.Advance(time.Minute)
+	f.beat()
+	evs = f.events()
+	if last := evs[len(evs)-1]; last.From != store.MonClientOffline || last.To != store.MonClientOnline {
+		t.Fatalf("event = %+v, want OFFLINE → ONLINE kept as is", last)
 	}
 }
 
