@@ -67,14 +67,26 @@ export async function registerClient(
   opts: { hostname?: string; version?: string; publicIp?: string } = {},
 ): Promise<RegisteredRequest> {
   const pairingCode = randomPairingCode();
-  const res = await request.post('/v1/register', {
-    data: {
-      pairingCode,
-      hostname: opts.hostname ?? `e2e-${Date.now()}-${Math.floor(Math.random() * 1e6)}`,
-      version: opts.version ?? '0.1.0',
-      publicIp: opts.publicIp ?? '203.0.113.5',
-    },
-  });
+  const post = () =>
+    request.post('/v1/register', {
+      data: {
+        pairingCode,
+        hostname: opts.hostname ?? `e2e-${Date.now()}-${Math.floor(Math.random() * 1e6)}`,
+        version: opts.version ?? '0.1.0',
+        publicIp: opts.publicIp ?? '203.0.113.5',
+      },
+    });
+  let res = await post();
+  if (res.status() === 429) {
+    // Every spec registers from the same address, and mon-server takes one
+    // request per IP per minute (spec §6). A second spec that registers
+    // waits the throttle out, as a real box would, with its own timeout
+    // stretched by that wait.
+    const waitMs = (Number(res.headers()['retry-after'] || '60') + 1) * 1000;
+    base.info().setTimeout(base.info().timeout + waitMs);
+    await new Promise((resolve) => setTimeout(resolve, waitMs));
+    res = await post();
+  }
   expect(res.status(), await res.text()).toBe(202);
   const body = await res.json();
   return { requestId: body.requestId, pairingCode };
