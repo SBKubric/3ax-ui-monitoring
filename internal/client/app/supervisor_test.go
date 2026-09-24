@@ -368,6 +368,12 @@ func TestSupervisor_DisabledHeartbeatsEveryFiveMinutesThenResumes(t *testing.T) 
 
 	h.waitFor("the loop to probe and heartbeat", func() bool { return h.probes() > 0 && h.heartbeats() > 0 })
 
+	// The five-minute waits are counted from before the 403 is even
+	// served: the supervisor logs "disabled" and then goes straight into
+	// its first wait, so a snapshot taken after the log line may or may
+	// not already include that wait, while the heartbeat that follows it
+	// is counted below as a disabled one either way.
+	fiveMinFrom := h.slept(disabledHeartbeatInterval)
 	h.stub.SetTokenStatus(http.StatusForbidden)
 	h.waitFor("the disabled branch", func() bool {
 		return strings.Contains(h.logs.String(), "mon-client disabled, probing stopped")
@@ -375,7 +381,6 @@ func TestSupervisor_DisabledHeartbeatsEveryFiveMinutesThenResumes(t *testing.T) 
 
 	probesAtDisable := h.probes()
 	disabledFrom := h.heartbeats()
-	fiveMinFrom := h.slept(disabledHeartbeatInterval)
 
 	// Three heartbeats later, still no probes and three more five-minute
 	// waits — the whole of disabled mode.
