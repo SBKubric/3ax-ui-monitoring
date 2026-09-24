@@ -528,6 +528,8 @@ func TestSupervisor_TokenRevokedClearsCycles(t *testing.T) {
 	}
 
 	h.stub.SetTokenStatus(http.StatusUnauthorized)
+	// clearState removes cycles.json before state.json, so once the
+	// identity is gone the buffer is already gone with it.
 	h.waitFor("state.json to be cleared", func() bool { return !h.stateExists() })
 	if _, err := os.Stat(h.dir.Path("cycles.json")); !os.IsNotExist(err) {
 		t.Fatalf("cycles.json survived the 401: %v", err)
@@ -557,5 +559,29 @@ func TestSupervisor_TokenRevokedClearsCycles(t *testing.T) {
 			t.Fatalf("the new identity's first cycle has seq %d, want 1", got)
 		}
 		break
+	}
+}
+
+// TestSupervisor_TokenRevokedKeepsIdentityUntilCyclesCleared pins the order
+// of clearState: cycles.json is removed before state.json. Removing the
+// identity first left a window in which the box had no state file but
+// still held the revoked identity's cycles — a crash there, or a failed
+// second remove, and the next identity would deliver them as its own
+// (issue #76). Here the buffer cannot be removed (it is a non-empty
+// directory), and the identity must survive so the next pass meets the
+// same 401 and tries again.
+func TestSupervisor_TokenRevokedKeepsIdentityUntilCyclesCleared(t *testing.T) {
+	h := newSupHarness(t)
+	h.registered("ams-1", "tok")
+	if err := os.MkdirAll(h.dir.Path("cycles.json")+"/stuck", 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	s := &supervisor{d: h.deps().withDefaults()}
+	if err := s.clearState(); err == nil {
+		t.Fatal("clearState = nil with an unremovable cycles.json, want an error")
+	}
+	if !h.stateExists() {
+		t.Fatal("state.json was removed although cycles.json was not; the next identity would inherit the old cycles")
 	}
 }

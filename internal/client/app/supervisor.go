@@ -304,13 +304,23 @@ const cyclesFileName = "cycles.json"
 // a counter that has just restarted at 1 (protocol §5.3's ackSeq is
 // per-mon-client). Losing them is the right trade — a revoked mon-client's
 // statistics are not worth mixing into its successor's.
+//
+// The order is the point: cycles.json goes first, state.json last. The
+// state file is the identity, and its absence is what makes the next boot
+// (or the next pass of RunSupervisor) register a new one. Removing it
+// first would leave a window — a crash, a kill, a failed second remove —
+// in which the box has already given up the old identity but still holds
+// the old identity's cycles, and the new one would pick them up and
+// deliver them. The other way round, an interruption leaves state.json in
+// place: the box comes back on the revoked token, gets the same 401, and
+// clears again.
 func (s *supervisor) clearState() error {
 	s.d.Log.Info("token revoked, re-registering")
-	if err := s.d.Dir.Clear(); err != nil {
-		return fmt.Errorf("clear state: %w", err)
-	}
 	if err := os.Remove(s.d.Dir.Path(cyclesFileName)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("clear cycles: %w", err)
+	}
+	if err := s.d.Dir.Clear(); err != nil {
+		return fmt.Errorf("clear state: %w", err)
 	}
 	return nil
 }
