@@ -81,6 +81,10 @@ type Stub struct {
 	failHeartbeatN      int
 	failHeartbeatStatus int
 	dropHeartbeatN      int
+	// lastAck is mon-server's last_ack_seq per monClientId: ackSeq never
+	// goes below it, and cycles at or below it are the duplicates
+	// mon-server drops (spec §7.1 step 3).
+	lastAck map[string]int64
 
 	// tunnel probe (protocol §5.2)
 	probeNonceOverride *string
@@ -94,6 +98,7 @@ func NewStub(t testing.TB) *Stub {
 	s := &Stub{
 		registrations: map[string]*registration{},
 		validTokens:   map[string]string{},
+		lastAck:       map[string]int64{},
 	}
 	s.srv = httptest.NewTLSServer(http.HandlerFunc(s.serve))
 	t.Cleanup(s.srv.Close)
@@ -155,12 +160,15 @@ func (s *Stub) FailNextPolls(n, status int) {
 // Approve marks requestID approved, to be handed out with monClientID and
 // token on the next poll (protocol §2.2). It also registers token as valid
 // for every authenticated route, standing in for mon-server actually
-// issuing the client token at approval time.
+// issuing the client token at approval time. Like mon-server, it resets
+// the mon-client's last_ack_seq: seq belongs to one token generation
+// (decision #51 §1).
 func (s *Stub) Approve(requestID, monClientID, token string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.registrations[requestID] = &registration{status: "approved", monClientID: monClientID, token: token}
 	s.validTokens[token] = monClientID
+	delete(s.lastAck, monClientID)
 }
 
 // Reject marks requestID rejected (protocol §2.2: mon-client waits an hour
@@ -426,11 +434,22 @@ func (s *Stub) handleConfig(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.configDoc)
 }
 
+// SetLastAckSeq programs mon-server's remembered last_ack_seq for one
+// mon-client — a box that lost its cycles.json and state.json behind a
+// mon-server that still remembers the seqs it acknowledged.
+func (s *Stub) SetLastAckSeq(monClientID string, seq int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lastAck[monClientID] = seq
+}
+
 // handleHeartbeat implements POST /v1/heartbeat (protocol §5.3): ackSeq is
-// the highest seq among the cycles in this request, mirroring mon-server
-// taking responsibility for everything it was just sent.
+// the highest seq among the cycles in this request or mon-server's own
+// last_ack_seq, whichever is higher, mirroring mon-server taking
+// responsibility for everything it was just sent (spec §7.1 step 4).
 func (s *Stub) handleHeartbeat(w http.ResponseWriter, r *http.Request, body []byte) {
-	if _, failStatus := s.authenticate(r); failStatus != 0 {
+	monClientID, failStatus := s.authenticate(r)
+	if failStatus != 0 {
 		writeErr(w, failStatus, authCode(failStatus), "injected auth failure")
 		return
 	}
@@ -457,14 +476,14 @@ func (s *Stub) handleHeartbeat(w http.ResponseWriter, r *http.Request, body []by
 		return
 	}
 
-	var ackSeq int64
+	s.mu.Lock()
+	ackSeq := s.lastAck[monClientID]
 	for _, c := range hb.Cycles {
 		if c.Seq > ackSeq {
 			ackSeq = c.Seq
 		}
 	}
-
-	s.mu.Lock()
+	s.lastAck[monClientID] = ackSeq
 	s.heartbeats = append(s.heartbeats, hb)
 	rev := s.revision
 	s.mu.Unlock()

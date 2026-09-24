@@ -266,3 +266,49 @@ func registeredStateDir(t *testing.T) string {
 	}
 	return dir
 }
+
+// TestRun_CorruptCyclesContinueAfterLastAck is decision #51 §1 end to end:
+// a corrupt cycles.json is discarded, and the first cycle after it goes out
+// as lastAckSeq + 1 from state.json — not seq 1, which mon-server would drop
+// as a duplicate — without re-registering.
+func TestRun_CorruptCyclesContinueAfterLastAck(t *testing.T) {
+	clearEnv(t)
+	stub := servertest.NewStub(t)
+	stub.Approve("req-1", "ams-1", "tok")
+	stub.SetLastAckSeq("ams-1", 1440)
+
+	dir := t.TempDir()
+	d, err := state.Open(dir)
+	if err != nil {
+		t.Fatalf("state.Open: %v", err)
+	}
+	if err := d.Save(&state.File{MonClientID: "ams-1", Token: "tok", ServerURL: stub.URL(), LastAckSeq: 1440}); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "cycles.json"), []byte("{not json"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	h := hooks{Sleep: fastSleep, HTTP: stub.HTTPClient(), BeforeLoop: func(cancel context.CancelFunc) {
+		go func() {
+			deadline := time.Now().Add(10 * time.Second)
+			for len(stub.Heartbeats()) == 0 && time.Now().Before(deadline) {
+				time.Sleep(time.Millisecond)
+			}
+			cancel()
+		}()
+	}}
+	var stdout, stderr bytes.Buffer
+	code := runCtx(context.Background(), []string{"run", "--server", stub.URL(), "--state-dir", dir, "--xray-bin", filepath.Join(dir, "no-xray")}, &stdout, &stderr, h)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr.String())
+	}
+
+	hbs := stub.Heartbeats()
+	if len(hbs) == 0 || len(hbs[0].Cycles) != 1 || hbs[0].Cycles[0].Seq != 1441 {
+		t.Fatalf("first heartbeat = %+v, want one cycle with seq 1441", hbs)
+	}
+	if strings.Contains(stdout.String(), "registration required") {
+		t.Fatalf("stdout = %q, want no re-registration", stdout.String())
+	}
+}

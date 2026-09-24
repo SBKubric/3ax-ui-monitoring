@@ -106,10 +106,9 @@ type Deps struct {
 	// API talks to mon-server off-tunnel: GET /v1/config and POST
 	// /v1/heartbeat (spec §4, §6).
 	API *api.Client
-	// State is the state directory. The loop itself never writes it — the
-	// Applier does, when it records a new appliedRevision — but it is here
-	// because the Applier is handed it by the same wiring and step 9's
-	// 401 branch (state.Clear) belongs to this loop.
+	// State is the state directory. The Applier writes it when it records
+	// a new appliedRevision; the loop writes it after each acknowledged
+	// heartbeat, to keep the last ackSeq (decision #51 §1).
 	State *state.Dir
 	// File is the loaded state.json. AppliedRevision is read from it every
 	// cycle (it is what the heartbeat's configRevision reports and what a
@@ -175,6 +174,12 @@ func NewLoop(d Deps) *Loop {
 	}
 	if d.StartedAt.IsZero() {
 		d.StartedAt = d.Clock.Now()
+	}
+	if d.Buffer != nil && d.File != nil {
+		// Decision #51 §1: a cycles.json that was lost or discarded as
+		// corrupt restarts the counter; continue after the last ack
+		// mon-server gave instead of at 1.
+		d.Buffer.ContinueAfter(d.File.LastAckSeq)
 	}
 	return &Loop{d: d, needConfig: true}
 }
@@ -270,6 +275,7 @@ func (l *Loop) Once(ctx context.Context) error {
 	if err := l.d.Buffer.Ack(resp.AckSeq); err != nil {
 		l.log().Error("cycles buffer not persisted", "error", err)
 	}
+	l.rememberAck(resp.AckSeq)
 	// Spec §7's heartbeat line.
 	l.log().Info(fmt.Sprintf("ack %d", resp.AckSeq))
 
@@ -281,6 +287,23 @@ func (l *Loop) Once(ctx context.Context) error {
 		l.needConfig = true
 	}
 	return nil
+}
+
+// rememberAck keeps mon-server's latest ackSeq in state.json (decision #51
+// §1), so a box whose cycles.json is lost continues after it (NewLoop). A
+// failed write is logged, not fatal: cycles.json still carries the counter,
+// and the copy here only matters if that file is lost too.
+func (l *Loop) rememberAck(ackSeq int64) {
+	if l.d.File == nil || ackSeq <= l.d.File.LastAckSeq {
+		return
+	}
+	l.d.File.LastAckSeq = ackSeq
+	if l.d.State == nil {
+		return
+	}
+	if err := l.d.State.Save(l.d.File); err != nil {
+		l.log().Error("state not persisted", "error", err)
+	}
 }
 
 // cycle runs one probe cycle against whatever is applied and returns it

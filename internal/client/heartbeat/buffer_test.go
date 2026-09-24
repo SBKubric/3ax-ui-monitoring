@@ -255,3 +255,43 @@ func TestAdd_PersistFailure(t *testing.T) {
 		t.Errorf("pending = %d cycles, want the unpersisted one", len(got))
 	}
 }
+
+// TestBuffer_ContinueAfterSkipsPastTheAck is decision #51 §1's client half:
+// a buffer that starts empty because cycles.json was lost continues after
+// the last ack mon-server gave, not at 1 — mon-server would drop every seq
+// at or below that ack as a duplicate.
+func TestBuffer_ContinueAfterSkipsPastTheAck(t *testing.T) {
+	b, _ := tempBuffer(t)
+	b.ContinueAfter(1440)
+	if c := add(t, b, 1, result(true)); c.Seq != 1441 {
+		t.Fatalf("seq = %d, want 1441", c.Seq)
+	}
+
+	// Never backwards: a counter already past the ack keeps going.
+	b.ContinueAfter(10)
+	if c := add(t, b, 2, result(true)); c.Seq != 1442 {
+		t.Fatalf("seq = %d, want 1442", c.Seq)
+	}
+}
+
+// TestBuffer_AckAheadOfTheCounterMovesItPast: an ack above anything this
+// buffer handed out means mon-server remembers a later seq than the box
+// does (both cycles.json and state.json lost); the next cycle goes after it
+// instead of being dropped again.
+func TestBuffer_AckAheadOfTheCounterMovesItPast(t *testing.T) {
+	b, path := tempBuffer(t)
+	add(t, b, 1, result(true))
+	if err := b.Ack(1440); err != nil {
+		t.Fatalf("Ack: %v", err)
+	}
+	if c := add(t, b, 2, result(true)); c.Seq != 1441 {
+		t.Fatalf("seq = %d, want 1441", c.Seq)
+	}
+	reopened, err := OpenBuffer(path)
+	if err != nil {
+		t.Fatalf("OpenBuffer: %v", err)
+	}
+	if c := add(t, reopened, 3, result(true)); c.Seq != 1442 {
+		t.Fatalf("seq after reopen = %d, want 1442", c.Seq)
+	}
+}

@@ -144,7 +144,13 @@ type StatsFlusher interface {
 // of it, which is why it is a value: a builder gets a snapshot that cannot
 // change under it mid-build.
 type Material struct {
-	Revision   string
+	Revision string
+	// Host is the realHost the direct items were fetched for
+	// (?host=, spec §4 step 3). The panel renders the direct links with it
+	// but it is not part of the panel's revision, so a material is only
+	// current while both the revision and the host still match (decision
+	// #51 §4).
+	Host       string
 	Override   Override
 	ProbeSubID string
 	Proxy      []ProbeItem
@@ -206,6 +212,11 @@ type Poller struct {
 
 	material     Material
 	haveMaterial bool
+	// materialStale is RefreshMaterial's invalidation of the cached
+	// material (decision #51 §4): set when Settings changes realHost or
+	// panelUrl, cleared only when a fresh material has been accepted, so a
+	// refresh the panel could not answer is finished by the next poll.
+	materialStale bool
 
 	// down, failures, rejected and pendingRecovery are deliberately
 	// in-memory only: a restart starts "up" and re-detects the panel on its
@@ -533,22 +544,34 @@ func (p *Poller) snapshotOrEmpty(ctx context.Context) []MonClientSnapshot {
 // configuration mon-server has already moved past, so both answers are
 // discarded and the old material kept until the next cycle.
 func (p *Poller) refreshMaterial(ctx context.Context, set *store.Settings, cl Client, st *State, revision, subID string) error {
+	_, err := p.readMaterial(ctx, set, cl, st, revision, subID)
+	return err
+}
+
+// readMaterial is refreshMaterial reporting whether it accepted a new
+// material (and so rebuilt the configs). The material is re-read when there
+// is none, when the panel's revision moved, when realHost is no longer the
+// host the direct items were fetched for — the panel renders the direct
+// links with it, yet it is not part of the revision — and when
+// RefreshMaterial invalidated it (decision #51 §4).
+func (p *Poller) readMaterial(ctx context.Context, set *store.Settings, cl Client, st *State, revision, subID string) (bool, error) {
+	host := realHost(set)
+
 	p.mu.Lock()
-	fresh := !p.haveMaterial || p.material.Revision != revision
+	fresh := !p.haveMaterial || p.material.Revision != revision || p.material.Host != host || p.materialStale
 	p.mu.Unlock()
 	if !fresh {
-		return nil
+		return false, nil
 	}
 
-	host := realHost(set)
 	if host == "" {
 		slog.Warn("panel: no realHost and no host in panelUrl, skipping probe configs")
-		return nil
+		return false, nil
 	}
 
 	direct, err := cl.ProbeConfigs(ctx, host)
 	if err := p.observe(ctx, set, err); err != nil {
-		return err
+		return false, err
 	}
 
 	var proxyItems []ProbeItem
@@ -556,7 +579,7 @@ func (p *Poller) refreshMaterial(ctx context.Context, set *store.Settings, cl Cl
 	if st.Override.Enabled {
 		proxy, err := cl.ProbeConfigs(ctx, "")
 		if err := p.observe(ctx, set, err); err != nil {
-			return err
+			return false, err
 		}
 		proxyItems = proxy.Items
 		proxyRevision = proxy.Revision
@@ -565,30 +588,87 @@ func (p *Poller) refreshMaterial(ctx context.Context, set *store.Settings, cl Cl
 	if direct.Revision != revision || proxyRevision != revision {
 		slog.Warn("panel: discarding probe configs from a foreign revision",
 			"current", revision, "direct", direct.Revision, "proxy", proxyRevision)
-		return nil
+		return false, nil
 	}
 
 	p.mu.Lock()
 	p.material = Material{
 		Revision:   revision,
+		Host:       host,
 		Override:   st.Override,
 		ProbeSubID: subID,
 		Proxy:      proxyItems,
 		Direct:     direct.Items,
 	}
 	p.haveMaterial = true
+	p.materialStale = false
 	builder := p.configs
 	p.mu.Unlock()
 
 	slog.Info("panel: new probe material",
-		"revision", revision, "direct", len(direct.Items), "proxy", len(proxyItems),
+		"revision", revision, "host", host, "direct", len(direct.Items), "proxy", len(proxyItems),
 		"override", st.Override.Enabled)
 
 	if builder == nil {
-		return nil
+		return true, nil
 	}
 	if err := builder.RebuildAll(ctx); err != nil {
-		return fmt.Errorf("panel: rebuilding mon-client configs: %w", err)
+		return true, fmt.Errorf("panel: rebuilding mon-client configs: %w", err)
+	}
+	return true, nil
+}
+
+// ErrMaterialNotRefreshed is RefreshMaterial's answer when the panel
+// answered but no new material could be accepted (its configs came back
+// stamped with another revision, or there is no host to ask for): the
+// invalidation stays, and the next poll finishes the job.
+var ErrMaterialNotRefreshed = errors.New("panel: probe material not refreshed, the next poll retries")
+
+// ErrPanelNotConfigured is RefreshMaterial's answer before the panel URL
+// and token are set: there is no panel to read material from, which is not
+// a failure but also not a rebuild.
+var ErrPanelNotConfigured = errors.New("panel: panel URL or monitoring token not set")
+
+// RefreshMaterial is decision #51 §4, for Settings Save after realHost or
+// panelUrl changed: it invalidates the cached probe material and re-reads
+// it right away — GET /state, then GET /probe/configs for each path — and,
+// once accepted, rebuilds every mon-client's config (the links are part of
+// the config document, so the config revisions change). It uses the saved
+// settings, so the caller saves first.
+//
+// A failure leaves the material invalidated: the ordinary poll re-reads it
+// on its next cycle. Running alongside Run's own cycle is harmless — both
+// would at worst read the same material and rebuild twice.
+func (p *Poller) RefreshMaterial(ctx context.Context) error {
+	p.mu.Lock()
+	p.materialStale = true
+	p.mu.Unlock()
+
+	set, err := p.store.LoadSettings()
+	if err != nil {
+		return fmt.Errorf("panel: load settings: %w", err)
+	}
+	if set.PanelURL == "" || set.MonToken == "" {
+		return ErrPanelNotConfigured
+	}
+	cl, err := p.clientFor(set)
+	if err != nil {
+		return err
+	}
+	st, err := cl.State(ctx)
+	if err := p.observe(ctx, set, err); err != nil {
+		return err
+	}
+	subID := ""
+	if st.Probe.SubId != nil {
+		subID = *st.Probe.SubId
+	}
+	accepted, err := p.readMaterial(ctx, set, cl, st, st.Revision, subID)
+	if err != nil {
+		return err
+	}
+	if !accepted {
+		return ErrMaterialNotRefreshed
 	}
 	return nil
 }
@@ -1057,10 +1137,18 @@ func isXrayUnavailable(err error) bool {
 // own host is right by construction: that is the address mon-server already
 // reaches the panel at, which is exactly what "direct" means.
 func realHost(set *store.Settings) string {
-	if set.RealHost != "" {
-		return set.RealHost
+	return DirectHost(set.RealHost, set.PanelURL)
+}
+
+// DirectHost is realHost for values that are not (yet) saved settings — the
+// Settings page's Check, which reads the probe material for what is typed
+// (decision #51 §4): the realHost when there is one, the panel URL's host
+// otherwise, "" when neither gives a host.
+func DirectHost(realHost, panelURL string) string {
+	if realHost != "" {
+		return realHost
 	}
-	u, err := url.Parse(set.PanelURL)
+	u, err := url.Parse(panelURL)
 	if err != nil {
 		return ""
 	}

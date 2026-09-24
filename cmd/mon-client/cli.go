@@ -259,7 +259,9 @@ func newLoop(ctx context.Context, cancel context.CancelFunc, dir *state.Dir, xra
 // over would reuse cycle seqs mon-server has already acknowledged), but
 // refusing to start a mon-client over a corrupt statistics buffer is the
 // worse trade: the operator is told, the file is moved out of the way, and
-// the box goes back to probing.
+// the box goes back to probing. The seq counter does not restart at 1:
+// app.NewLoop continues it after the last ackSeq kept in state.json
+// (decision #51 §1).
 func openBuffer(dir *state.Dir, logger *slog.Logger) (*heartbeat.Buffer, error) {
 	path := dir.Path("cycles.json")
 	buf, err := heartbeat.OpenBuffer(path)

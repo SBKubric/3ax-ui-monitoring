@@ -131,6 +131,24 @@ func (b *Buffer) Add(ts int64, results []proto.Result) (proto.Cycle, error) {
 	return c, b.save()
 }
 
+// ContinueAfter makes the next cycle's seq at least ackSeq + 1 (decision
+// #51 §1). It is how a buffer that starts empty — cycles.json lost, or
+// corrupt and discarded — picks up after the last ack mon-server gave
+// (state.File.LastAckSeq) instead of at 1, which mon-server would drop as
+// already seen. The counter never moves backwards. Nothing is persisted
+// here: the next Add saves the counter together with its cycle.
+func (b *Buffer) ContinueAfter(ackSeq int64) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.continueAfter(ackSeq)
+}
+
+func (b *Buffer) continueAfter(ackSeq int64) {
+	if ackSeq >= b.nextSeq {
+		b.nextSeq = ackSeq + 1
+	}
+}
+
 // Pending returns the cycles owed to mon-server, oldest first — exactly
 // the list that goes into the next heartbeat's cycles[] (protocol §5.3:
 // unacknowledged cycles are resent together with the new one). The slice
@@ -147,9 +165,15 @@ func (b *Buffer) Pending() []proto.Cycle {
 // heartbeat that was answered acknowledges everything it carried, so after
 // a successful send the buffer is normally empty — which is exactly why
 // nextSeq is persisted separately.
+//
+// An ackSeq at or above the counter means mon-server remembers seqs this box
+// has forgotten (both its files were lost): the counter jumps past it, so
+// the next cycle is not dropped as a duplicate as well (decision #51 §1).
 func (b *Buffer) Ack(ackSeq int64) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+
+	b.continueAfter(ackSeq)
 
 	kept := b.cycles[:0]
 	for _, c := range b.cycles {

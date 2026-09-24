@@ -22,6 +22,11 @@ import (
 type stubConfigs struct {
 	keys     []registry.TargetKey
 	revision string
+	excl     registry.Exclusions
+}
+
+func (s *stubConfigs) Exclusions(context.Context, string) (registry.Exclusions, error) {
+	return s.excl, nil
 }
 
 func (s *stubConfigs) TargetKeys(context.Context, string) ([]registry.TargetKey, error) {
@@ -936,5 +941,251 @@ func TestHeartbeat_FailedTelegramLeavesTheEventForThePanel(t *testing.T) {
 		if r.Notified {
 			t.Fatalf("outbox row %s = notified, want the column cleared too", r.Id)
 		}
+	}
+}
+
+// revokeVia wires a real registry over the fixture's store with the engine
+// as its Revoked hook — the production seam — and revokes the fixture's
+// mon-client through it.
+func (f *fixture) revokeVia() *registry.Registry {
+	f.t.Helper()
+	r := registry.New(f.st, f.clk)
+	r.SetHooks(registry.Hooks{Revoked: f.e.MonClientRevoked})
+	if err := r.Revoke(context.Background(), f.mc.Id); err != nil {
+		f.t.Fatalf("Revoke: %v", err)
+	}
+	return r
+}
+
+// TestRevoke_GoesThroughTheStateMachine is decision #51 §2: a revoke is an
+// OFFLINE like the timeout's — a mon_client event with reason
+// token_revoked, the targets to UNKNOWN with mon_client_revoked, Telegram
+// by the same PANEL_DOWN rule — not a silent flip of the registry row.
+func TestRevoke_GoesThroughTheStateMachine(t *testing.T) {
+	f := newFixture(t)
+	f.clk.Advance(time.Minute)
+	f.beat(f.cycle(1, result(keyProxy, true, "")))
+	f.panelDown = true
+
+	f.revokeVia()
+
+	if got := f.reload().State; got != store.MonClientOffline {
+		t.Fatalf("state = %s, want OFFLINE", got)
+	}
+	if got := f.targetState(keyProxy); got.State != store.TargetUnknown || got.Reason != ReasonMonClientRevoked {
+		t.Fatalf("target = %s/%s, want UNKNOWN/mon_client_revoked", got.State, got.Reason)
+	}
+	var monClientEv, targetEv *store.EventPayload
+	evs := f.events()
+	for i := range evs {
+		switch {
+		case evs[i].Kind == eventKindMonClient && evs[i].To == store.MonClientOffline:
+			monClientEv = &evs[i]
+		case evs[i].Kind == eventKindTarget && evs[i].Reason == ReasonMonClientRevoked:
+			targetEv = &evs[i]
+		}
+	}
+	if monClientEv == nil || monClientEv.From != store.MonClientOnline || monClientEv.Reason != ReasonTokenRevoked || !monClientEv.Notified {
+		t.Fatalf("events = %+v, want a notified mon_client ONLINE → OFFLINE with reason token_revoked", evs)
+	}
+	if targetEv == nil || targetEv.From != store.TargetUp || targetEv.To != store.TargetUnknown {
+		t.Fatalf("events = %+v, want a target UP → UNKNOWN with reason mon_client_revoked", evs)
+	}
+	want := tg.MsgMonClientTransition("ams-1", "NL", store.MonClientOnline, store.MonClientOffline)
+	if len(f.tgr.Sent) != 1 || f.tgr.Sent[0] != want {
+		t.Fatalf("telegram = %v, want %q", f.tgr.Sent, want)
+	}
+}
+
+// TestRevoke_NeverSeenGoesOutWithEmptyFrom: a mon-client revoked before its
+// first heartbeat still changes state (NEVER → OFFLINE), and NEVER stays
+// internal (decision #50 §1).
+func TestRevoke_NeverSeenGoesOutWithEmptyFrom(t *testing.T) {
+	f := newFixture(t)
+	f.revokeVia()
+
+	evs := f.events()
+	if len(evs) != 1 || evs[0].Kind != eventKindMonClient || evs[0].From != "" ||
+		evs[0].To != store.MonClientOffline || evs[0].Reason != ReasonTokenRevoked {
+		t.Fatalf("events = %+v, want one mon_client \"\" → OFFLINE token_revoked", evs)
+	}
+}
+
+// TestRevoke_AlreadyOfflineFilesNoTransition: the timeout already said
+// OFFLINE and moved the targets; a revoke on top is not a second transition.
+func TestRevoke_AlreadyOfflineFilesNoTransition(t *testing.T) {
+	f := newFixture(t)
+	f.clk.Advance(time.Minute)
+	f.beat(f.cycle(1, result(keyProxy, true, "")))
+	f.clk.Advance(time.Hour)
+	if err := f.e.MarkOffline(context.Background()); err != nil {
+		t.Fatalf("MarkOffline: %v", err)
+	}
+	before := len(f.events())
+
+	f.revokeVia()
+
+	if got := len(f.events()); got != before {
+		t.Fatalf("revoking an OFFLINE mon-client filed %d events, want none", got-before)
+	}
+}
+
+// TestHeartbeat_ReplacementAfterRevokeAcceptsSeqOne is the bug of decision
+// #51 §1: after Revoke and Approve as replacement the new box counts from
+// seq 1, and mon-server must take that cycle rather than drop it as a
+// duplicate of the old box's seqs.
+func TestHeartbeat_ReplacementAfterRevokeAcceptsSeqOne(t *testing.T) {
+	f := newFixture(t)
+	for seq := int64(1); seq <= 5; seq++ {
+		f.clk.Advance(time.Minute)
+		f.beat(f.cycle(seq, result(keyProxy, true, "")))
+	}
+	if got := f.reload().LastAckSeq; got != 5 {
+		t.Fatalf("last_ack_seq = %d, want 5", got)
+	}
+
+	r := f.revokeVia()
+	f.clk.Advance(time.Hour)
+	out, err := r.Register(context.Background(), registry.RegisterInput{PairingCode: "ABCDEF", Hostname: "ams-1", RemoteIP: "198.51.100.7"})
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if _, err := r.ApproveAsReplacement(context.Background(), out.RequestID, f.mc.Id); err != nil {
+		t.Fatalf("ApproveAsReplacement: %v", err)
+	}
+
+	f.clk.Advance(time.Minute)
+	resp := f.beat(f.cycle(1, result(keyProxy, true, "")))
+	if resp.AckSeq != 1 {
+		t.Fatalf("ackSeq = %d, want 1", resp.AckSeq)
+	}
+	if got := f.targetState(keyProxy); got.State != store.TargetUp {
+		t.Fatalf("target = %s, want UP: seq 1 of the new token must reach the state machine", got.State)
+	}
+}
+
+// excluding describes a panel where inbound xray:12 is enabled, with the
+// given override and mon-client paths.
+func excluding(override bool, paths ...string) registry.Exclusions {
+	x := registry.Exclusions{
+		Known:    true,
+		Paths:    map[string]bool{},
+		Override: override,
+		Inbounds: map[registry.TargetKey]bool{{InboundKind: store.InboundKindXray, InboundID: 12}: true},
+	}
+	for _, p := range paths {
+		x.Paths[p] = true
+	}
+	return x
+}
+
+// TestHeartbeat_TargetOutsideConfigIsPausedWithReason is decision #51 §3:
+// a target that falls out of the mon-client's config for a reason other
+// than its inbound goes PAUSED with that reason (the row is kept), and
+// coming back into the config releases it to UNKNOWN, after which the first
+// result decides.
+func TestHeartbeat_TargetOutsideConfigIsPausedWithReason(t *testing.T) {
+	cases := []struct {
+		name string
+		excl registry.Exclusions
+		want string
+	}{
+		{"override switched off", excluding(false, store.PathProxy, store.PathDirect), ReasonOverrideDisabled},
+		{"path removed", excluding(true, store.PathDirect), ReasonPathRemoved},
+		{"no probe link", excluding(true, store.PathProxy, store.PathDirect), ReasonNoProbeLink},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			f.saveInbound(store.InboundKindXray, 12, true)
+			f.clk.Advance(time.Minute)
+			f.beat(f.cycle(1, result(keyProxy, true, ""), result(keyDirect, true, "")))
+
+			f.cfg.keys = []registry.TargetKey{keyDirect}
+			f.cfg.excl = tc.excl
+			f.clk.Advance(time.Minute)
+			f.beat(f.cycle(2, result(keyProxy, true, ""), result(keyDirect, true, "")))
+
+			got := f.targetState(keyProxy)
+			if got.State != store.TargetPaused || got.Reason != tc.want {
+				t.Fatalf("target = %s/%s, want PAUSED/%s", got.State, got.Reason, tc.want)
+			}
+			evs := f.events()
+			last := evs[len(evs)-1]
+			if last.Kind != eventKindTarget || last.Path != store.PathProxy || last.From != store.TargetUp ||
+				last.To != store.TargetPaused || last.Reason != tc.want || last.Notified {
+				t.Fatalf("last event = %+v, want an un-notified UP → PAUSED %s", last, tc.want)
+			}
+			if got := f.targetState(keyDirect); got.State != store.TargetUp {
+				t.Fatalf("direct target = %s, want it untouched (UP)", got.State)
+			}
+
+			// Staying out of the config files nothing more.
+			before := len(evs)
+			f.clk.Advance(time.Minute)
+			f.beat(f.cycle(3))
+			if len(f.events()) != before {
+				t.Fatalf("a second heartbeat filed %d more events, want none", len(f.events())-before)
+			}
+
+			// Back in the config: UNKNOWN, then the first result.
+			f.cfg.keys = []registry.TargetKey{keyProxy, keyDirect}
+			f.cfg.excl = excluding(true, store.PathProxy, store.PathDirect)
+			f.clk.Advance(time.Minute)
+			f.beat(f.cycle(4))
+			if got := f.targetState(keyProxy); got.State != store.TargetUnknown || got.Reason != ReasonConfigEnabled {
+				t.Fatalf("target = %s/%s, want UNKNOWN/config_enabled once back in the config", got.State, got.Reason)
+			}
+			f.clk.Advance(time.Minute)
+			f.beat(f.cycle(5, result(keyProxy, true, "")))
+			if got := f.targetState(keyProxy); got.State != store.TargetUp {
+				t.Fatalf("target = %s, want UP after the first result", got.State)
+			}
+		})
+	}
+}
+
+// TestHeartbeat_InboundExclusionIsLeftToSyncInbounds: a target whose
+// inbound is disabled or gone is not a config pause — SyncInbounds pauses
+// it with config_disabled — so the heartbeat leaves it alone.
+func TestHeartbeat_InboundExclusionIsLeftToSyncInbounds(t *testing.T) {
+	f := newFixture(t)
+	f.clk.Advance(time.Minute)
+	f.beat(f.cycle(1, result(keyProxy, true, "")))
+
+	f.cfg.keys = []registry.TargetKey{keyDirect}
+	f.cfg.excl = excluding(true, store.PathProxy, store.PathDirect)
+	f.cfg.excl.Inbounds = map[registry.TargetKey]bool{{InboundKind: store.InboundKindXray, InboundID: 12}: false}
+	f.clk.Advance(time.Minute)
+	f.beat(f.cycle(2))
+
+	if got := f.targetState(keyProxy); got.State != store.TargetUp {
+		t.Fatalf("target = %s/%s, want it left UP for SyncInbounds", got.State, got.Reason)
+	}
+}
+
+// TestSyncInbounds_EnableDoesNotReleaseConfigPauses: an inbound coming back
+// releases what *it* paused (config_disabled), not a target paused because
+// its path was taken off the mon-client.
+func TestSyncInbounds_EnableDoesNotReleaseConfigPauses(t *testing.T) {
+	f := newFixture(t)
+	f.clk.Advance(time.Minute)
+	f.beat(f.cycle(1, result(keyProxy, true, "")))
+	f.saveInbound(store.InboundKindXray, 12, true)
+
+	f.cfg.keys = []registry.TargetKey{keyDirect}
+	f.cfg.excl = excluding(true, store.PathDirect)
+	f.clk.Advance(time.Minute)
+	f.beat(f.cycle(2))
+
+	ctx := context.Background()
+	if err := f.e.SyncInbounds(ctx, []panel.Inbound{{Kind: store.InboundKindXray, InboundId: 12, Enable: false}}); err != nil {
+		t.Fatalf("SyncInbounds: %v", err)
+	}
+	if err := f.e.SyncInbounds(ctx, []panel.Inbound{{Kind: store.InboundKindXray, InboundId: 12, Enable: true}}); err != nil {
+		t.Fatalf("SyncInbounds: %v", err)
+	}
+	if got := f.targetState(keyProxy); got.State != store.TargetPaused || got.Reason != ReasonPathRemoved {
+		t.Fatalf("target = %s/%s, want still PAUSED/path_removed", got.State, got.Reason)
 	}
 }

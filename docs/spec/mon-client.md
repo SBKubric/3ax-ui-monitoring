@@ -11,7 +11,7 @@ mon-client — коробка в целевом регионе: **один ко�
 ## 2. Запуск, параметры, state-файл
 
 - Единственный параметр — `serverUrl` (`https://<ip>:443`), через флаг `--server` или ENV `MON_SERVER_URL`. Опционально `--state-dir` (`/var/lib/mon-client`), `--xray-bin` (`/usr/local/bin/xray`), `--log-level`.
-- **State-файл** `state.json` (0600): `{monClientId, token, serverUrl, appliedRevision}`. Пока его нет — регистрация (§3). Пропал или `401` — стереть и регистрироваться заново.
+- **State-файл** `state.json` (0600): `{monClientId, token, serverUrl, appliedRevision, lastAckSeq}` (`lastAckSeq` — последний `ackSeq` из ответа heartbeat, §6). Пока его нет — регистрация (§3). Пропал или `401` — стереть и регистрироваться заново.
 - Рабочие файлы в state-dir: `xray.json` (сгенерированный конфиг), `xray.log` не ведётся (stderr читается в pipe), `cycles.json` — буфер неподтверждённых циклов (§6).
 - mon-client доверяет системным CA; пиннинга нет.
 
@@ -53,6 +53,7 @@ mon-client — коробка в целевом регионе: **один ко�
 
 - После цикла — один `POST /v1/heartbeat` (свой Transport без прокси, таймаут `heartbeatTimeoutMs`): `{monClientId, configRevision: appliedRevision, client: {version, xrayVersion, uptimeMs, configError}, cycles: [...]}`. Цикл: `{seq (монотонный, в state), ts (начало цикла, ms), unverified, results[]}`.
 - **Буфер** `cycles.json`: цикл добавляется до отправки; ответ `200 {ackSeq}` удаляет все `seq ≤ ackSeq`; не подтверждён (сеть, 5xx, таймаут) → цикл остаётся с `unverified: true` и досылается в следующем heartbeat вместе с новыми; ≤ 60 циклов, старые вытесняются. Пробы при этом **продолжаются**.
+- **Seq** (протокол §5.3, решение [#51](https://github.com/SBKubric/3ax-ui-monitoring/issues/51) п. 1): счётчик в `cycles.json`, начинается с 1 при каждой новой регистрации (после `401` `cycles.json` стирается вместе с `state.json`). После каждого подтверждённого heartbeat `ackSeq` сохраняется в `state.json` (`lastAckSeq`). `cycles.json` пропал или не разбирается (повреждённый откладывается в сторону) → следующий seq = `lastAckSeq + 1`, не 1: mon-server отбросил бы seq ≤ своего `last_ack_seq` как дубликаты. `ackSeq` выше счётчика → счётчик переходит на `ackSeq + 1`.
 - Ответ: `configRevision` ≠ `appliedRevision` → §4 после текущего цикла.
 - `401 token_revoked` → остановить пробы, стереть state-файл, §3. `403 disabled` → остановить пробы, heartbeat раз в 5 мин до `200`. `410` на регистрации — §3.
 

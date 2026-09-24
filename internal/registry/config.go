@@ -241,6 +241,97 @@ func (b *ConfigBuilder) TargetKeys(ctx context.Context, monClientID string) ([]T
 	return keys, nil
 }
 
+// Reasons a target is PAUSED when it falls out of its mon-client's config
+// for a reason that is not its inbound (decision #51 §3, contract §4.6). An
+// inbound that is disabled or gone pauses its targets with config_disabled
+// instead (spec §4 step 3, internal/state's SyncInbounds).
+const (
+	// PauseOverrideDisabled: a proxy-path target while the panel's host
+	// override is off — there is no proxy front to probe through.
+	PauseOverrideDisabled = "override_disabled"
+	// PausePathRemoved: an administrator took the path off this mon-client.
+	PausePathRemoved = "path_removed"
+	// PauseNoProbeLink: the inbound is live, but the panel handed out no
+	// probe link for it on this path.
+	PauseNoProbeLink = "no_probe_link"
+)
+
+// Exclusions is what a ConfigBuilder knows about why a target is *not* in
+// one mon-client's document: the mon-client's paths, whether the override
+// is on, and which inbounds the panel reports as enabled. It is a plain
+// value so the state engine can take it before opening a heartbeat's
+// transaction (the builder reads through its own handles) and ask it about
+// every target row inside it — and so the engine's tests can write one
+// down. The zero value knows nothing and names no reason.
+type Exclusions struct {
+	// Known is false until the panel's material has been read.
+	Known bool
+	// Paths are the mon-client's paths, spec §5's default applied.
+	Paths map[string]bool
+	// Override is whether the panel's host override is on.
+	Override bool
+	// Inbounds maps an inbound (a TargetKey with an empty Path, the same
+	// shape protocols uses) to its enable flag in panel_inbounds.
+	Inbounds map[TargetKey]bool
+}
+
+// Reason answers why key — a target that is not in the mon-client's
+// document — is out: one of the Pause* reasons, or "" when it is not a
+// config question at all (the inbound is disabled or gone, which
+// SyncInbounds handles as config_disabled, or nothing is known yet). It is
+// only meaningful for keys that are not in the document; for one that is,
+// the "default" answer below would be wrong.
+func (x Exclusions) Reason(key TargetKey) string {
+	if !x.Known {
+		return ""
+	}
+	if enabled := x.Inbounds[TargetKey{InboundKind: key.InboundKind, InboundID: key.InboundID}]; !enabled {
+		return ""
+	}
+	switch {
+	case !x.Paths[key.Path]:
+		return PausePathRemoved
+	case key.Path == store.PathProxy && !x.Override:
+		return PauseOverrideDisabled
+	default:
+		return PauseNoProbeLink
+	}
+}
+
+// Exclusions returns the facts Exclusions.Reason decides by, for one
+// mon-client, from the same inputs a rebuild uses: the current material's
+// override, the mon-client's paths (with spec §5's default) and the
+// enabled flags in panel_inbounds. With no material yet the answer is the
+// zero value, which names no reason: pausing targets on a mon-server that
+// has not heard from the panel since start-up would be a guess.
+func (b *ConfigBuilder) Exclusions(ctx context.Context, monClientID string) (Exclusions, error) {
+	mat, ok := b.material.Material()
+	if !ok {
+		return Exclusions{}, nil
+	}
+	mc, err := b.client(ctx, monClientID)
+	if err != nil {
+		return Exclusions{}, err
+	}
+	var rows []store.PanelInbound
+	if err := b.st.DB.WithContext(ctx).Find(&rows).Error; err != nil {
+		return Exclusions{}, fmt.Errorf("registry: read panel_inbounds: %w", err)
+	}
+	x := Exclusions{
+		Known:    true,
+		Paths:    map[string]bool{},
+		Override: mat.Override.Enabled,
+		Inbounds: make(map[TargetKey]bool, len(rows)),
+	}
+	for _, p := range pathsOf(mc) {
+		x.Paths[p] = true
+	}
+	for _, r := range rows {
+		x.Inbounds[TargetKey{InboundKind: r.InboundKind, InboundID: r.InboundId}] = r.Enable
+	}
+	return x, nil
+}
+
 // buildAndStore builds one document and upserts it into client_configs.
 // The whole document is stored, not just its parts, because GET /v1/config
 // must answer the exact bytes the revision was computed over even if the

@@ -29,9 +29,9 @@ import (
 	"github.com/SBKubric/3ax-ui-monitoring/web"
 )
 
-// PanelStatus is the little the admin UI needs to know about the panel poll
-// loop for the Settings page's status line (spec §9.4: "Panel reachable ·
-// revision · N inbounds · override → host"). *panel.Poller satisfies it; it
+// PanelStatus is the little the admin UI needs from the panel poll loop: the
+// Settings page's status line (spec §9.4: "Panel reachable · revision · N
+// inbounds · override → host") and the material refresh Save triggers. *panel.Poller satisfies it; it
 // is an interface rather than the concrete poller so a handler test can
 // describe a panel state in three lines instead of driving a real poll
 // cycle. A nil PanelStatus means "no poll loop wired yet", which the UI
@@ -47,6 +47,10 @@ type PanelStatus interface {
 	// on an untrusted certificate, which the status line names together
 	// with the panelCa setting that fixes it (decision #52 §1).
 	UnknownAuthority() bool
+	// RefreshMaterial drops the cached probe material, re-reads it from the
+	// panel with the saved settings and rebuilds every config — what Save
+	// does after realHost or panelUrl changed (decision #51 §4).
+	RefreshMaterial(ctx context.Context) error
 }
 
 // TelegramSender is the Telegram Bot API call behind the Settings page's

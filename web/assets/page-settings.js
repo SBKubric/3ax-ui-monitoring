@@ -1,16 +1,17 @@
 /* Settings page (spec §9.4): one Save at the top, the panel status line next
  * to it, and five tabs. Check and Send test use whatever is currently typed
  * into the form and save nothing; Save applies everything at once and, when
- * a probe parameter or realHost changed, rebuilds every mon-client's config
- * with a new revision. */
+ * a probe parameter changed, rebuilds every mon-client's config with a new
+ * revision — when realHost or the panel URL changed, after re-reading the
+ * probe configs from the panel. */
 (function () {
   'use strict';
 
   var strings = {
     panelUrl: 'The panel on the real server: where /mon/v1/* answers. Polled every minute for state and probe configs. Include the webBasePath.',
-    monToken: "The monToken from the panel's Monitoring settings tab. Check asks the panel for GET /state with what is typed here — nothing is saved.",
+    monToken: "The monToken from the panel's Monitoring settings tab. Check asks the panel for GET /state and the probe configs (for the typed realHost) with what is typed here — nothing is saved.",
     panelCa: "Optional. PEM certificate chain the panel's TLS certificate is checked against, replacing the system CAs for panel requests — paste the panel's own certificate if it is self-signed. Empty: system CAs. Check uses what is typed here.",
-    realHost: "Host substituted into direct targets: the real server as clients reach it without the override. Defaults to the panel URL's host. Only mon-clients with the direct path ever see it.",
+    realHost: "Host substituted into direct targets: the real server as clients reach it without the override. Defaults to the panel URL's host. Only mon-clients with the direct path ever see it. Saving a new realHost or panel URL re-reads the probe configs from the panel and rebuilds every mon-client config.",
     proxyFront: "Read-only, as the panel reports it in GET /state. mon-server has no setting of its own: the front lives in the panel's host override, and /probe/configs already carries it.",
     telegram: 'Used when the panel is unreachable (PANEL_DOWN) and for config errors reported by mon-clients.',
     probe: 'Sent to every mon-client in its config; changing any of these bumps every config revision.',
@@ -123,12 +124,16 @@
         this.checking = true;
         this.checkResult = '';
         var env = await mon.api('POST', '/admin/api/settings/check', {
-          panelUrl: this.form.panelUrl, monToken: this.form.monToken, panelCa: this.form.panelCa
+          panelUrl: this.form.panelUrl, monToken: this.form.monToken, panelCa: this.form.panelCa,
+          realHost: this.form.realHost
         });
         this.checking = false;
         if (!env.success) { this.checkResult = env.msg; mon.notifyErr(env.msg); return; }
         this.checkResult = 'revision ' + env.obj.revision + ' · ' + env.obj.inbounds + ' inbounds · override → ' +
-          (env.obj.override.enabled ? (env.obj.override.host || '(on)') : 'off') + ' · panel ' + (env.obj.panelVersion || '?');
+          (env.obj.override.enabled ? (env.obj.override.host || '(on)') : 'off') + ' · panel ' + (env.obj.panelVersion || '?') +
+          (env.obj.probeError
+            ? ' · probe configs: ' + env.obj.probeError
+            : ' · probe links for ' + env.obj.realHost + ': ' + env.obj.probeItems.direct + ' direct, ' + env.obj.probeItems.proxy + ' proxy');
         mon.notifyOk(env.msg);
       },
       sendTest: async function () {

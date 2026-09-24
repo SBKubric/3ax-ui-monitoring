@@ -255,6 +255,10 @@ func newApp(d Deps, readTimeout, writeTimeout time.Duration) (*App, error) {
 		PathsChanged: configs.Rebuild,
 		Approved:     configs.Rebuild,
 		Disabled:     engine.MonClientDisabled,
+		// Decision #51 §2: a revoke goes through the state machine — the
+		// mon_client OFFLINE event and the targets' move to UNKNOWN share
+		// the revoke's transaction.
+		Revoked: engine.MonClientRevoked,
 	})
 	api.ConfigRoutes(srv.V1, reg, configs)
 	api.HeartbeatRoutes(srv.V1, reg, engine)

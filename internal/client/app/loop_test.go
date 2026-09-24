@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log/slog"
 	mrand "math/rand/v2"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -890,5 +891,74 @@ func TestLoop_ResultsForUnknownTargetsAreFiltered(t *testing.T) {
 	}
 	if got := h.stub.Heartbeats()[0].Cycles[0].Results; len(got) != 0 {
 		t.Fatalf("results = %+v, want the foreign result dropped", got)
+	}
+}
+
+// TestLoop_AckIsPersistedInState is decision #51 §1: the last ackSeq
+// mon-server gave is kept in state.json, the file that survives a lost
+// cycles.json.
+func TestLoop_AckIsPersistedInState(t *testing.T) {
+	h := newHarness(t, map[proto.TargetKey]probe.Fn{targetKey(): okProbe})
+	h.stub.SetConfig(doc("rev1"))
+	h.stub.SetRevision("rev1")
+
+	for i := 0; i < 2; i++ {
+		if err := h.loop.Once(context.Background()); err != nil {
+			t.Fatalf("Once: %v", err)
+		}
+	}
+	f, err := h.dir.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if f.LastAckSeq != 2 {
+		t.Fatalf("state.json lastAckSeq = %d, want 2", f.LastAckSeq)
+	}
+}
+
+// TestLoop_LostBufferContinuesAfterLastAck is decision #51 §1: with
+// cycles.json gone (or corrupt and discarded) the next seq is the last
+// ackSeq + 1 from state.json, not 1 — mon-server would drop 1…ackSeq as
+// already seen, and no re-registration is needed.
+func TestLoop_LostBufferContinuesAfterLastAck(t *testing.T) {
+	h := newHarness(t, map[proto.TargetKey]probe.Fn{targetKey(): okProbe})
+	h.stub.SetConfig(doc("rev1"))
+	h.stub.SetRevision("rev1")
+	if err := h.loop.Once(context.Background()); err != nil {
+		t.Fatalf("Once: %v", err)
+	}
+
+	if err := os.Remove(h.dir.Path("cycles.json")); err != nil {
+		t.Fatalf("remove cycles.json: %v", err)
+	}
+	restarted := h.restart(t)
+	if err := restarted.Once(context.Background()); err != nil {
+		t.Fatalf("Once after restart: %v", err)
+	}
+
+	hbs := h.stub.Heartbeats()
+	last := hbs[len(hbs)-1]
+	if len(last.Cycles) != 1 || last.Cycles[0].Seq != 2 {
+		t.Fatalf("cycles after losing the buffer = %+v, want one with seq 2", last.Cycles)
+	}
+}
+
+// TestLoop_ServerAheadIsCaughtUpByTheAck: with both files lost the box
+// starts at 1; mon-server answers with its own, higher ackSeq, and the very
+// next cycle continues after it — one cycle lost, not a day of them.
+func TestLoop_ServerAheadIsCaughtUpByTheAck(t *testing.T) {
+	h := newHarness(t, map[proto.TargetKey]probe.Fn{targetKey(): okProbe})
+	h.stub.SetConfig(doc("rev1"))
+	h.stub.SetRevision("rev1")
+	h.stub.SetLastAckSeq("ams-1", 1440)
+
+	for i := 0; i < 2; i++ {
+		if err := h.loop.Once(context.Background()); err != nil {
+			t.Fatalf("Once: %v", err)
+		}
+	}
+	hbs := h.stub.Heartbeats()
+	if got := hbs[1].Cycles; len(got) != 1 || got[0].Seq != 1441 {
+		t.Fatalf("second heartbeat's cycles = %+v, want one with seq 1441", got)
 	}
 }

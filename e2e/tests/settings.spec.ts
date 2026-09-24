@@ -42,6 +42,25 @@ test.describe('settings', () => {
     await expect(fieldInput(adminPage, 'field-downAfter')).toHaveValue('4');
   });
 
+  test('realHost: a save with no panel configured is a plain save that survives a reload', async ({ adminPage }) => {
+    // Decision #51 §4: saving a new realHost re-reads the probe configs from
+    // the panel. With no panel configured there is nothing to re-read, and
+    // the save must neither fail nor claim that configs were rebuilt.
+    await adminPage.goto('/admin/settings');
+    await adminPage.getByTestId('tab-real').click();
+    await fieldInput(adminPage, 'field-realHost').fill('real.e2e.example');
+    await adminPage.getByTestId('settings-save').click();
+    await expect(adminPage.getByText('Saved.', { exact: true }).first()).toBeVisible();
+
+    await adminPage.reload();
+    await adminPage.getByTestId('tab-real').click();
+    await expect(fieldInput(adminPage, 'field-realHost')).toHaveValue('real.e2e.example');
+
+    await fieldInput(adminPage, 'field-realHost').fill('');
+    await adminPage.getByTestId('settings-save').click();
+    await expect(adminPage.getByText('Saved.', { exact: true }).first()).toBeVisible();
+  });
+
   test('check with an unreachable panel URL shows an error and saves nothing', async ({ adminPage }) => {
     await adminPage.goto('/admin/settings');
     await adminPage.getByTestId('tab-real').click();
