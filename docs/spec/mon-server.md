@@ -17,13 +17,20 @@ mon-server — один Go-процесс на отдельном сервере
 ## 2. Процесс, bootstrap и CLI
 
 - Один бинарник `mon-server`, Go, без внешних сервисов. Команды: `mon-server run` (сервис), `mon-server admin set <user>` (запрашивает пароль, пишет bcrypt-хэш в БД; повторный вызов меняет логин и пароль), `mon-server version`.
-- **Bootstrap-конфиг** (файл `/etc/mon-server/config.json` или ENV `MON_*`) минимален: `listen` (`:443`), `publicIp` (для ACME), `dataDir` (`/var/lib/mon-server`), `tls.mode` (`acme-ip` | `files`, для `files` — `tls.cert`, `tls.key`). Всё остальное — в настройках БД через admin UI (§9.4).
+- **Bootstrap-конфиг** (файл `/etc/mon-server/config.json` или ENV `MON_*`) минимален: `listen` (`:443`), `publicIp` (обязателен в обоих режимах TLS, IP-литерал: из него строится `probeUrl` = `https://<publicIp>:<port>/v1/probe`, параметра `publicHost` нет — AWG-проба в netstack не резолвит имена), `dataDir` (`/var/lib/mon-server`), `tls.mode` (`acme-ip` | `files`, для `files` — `tls.cert`, `tls.key`), `tls.acmeCa` / `MON_TLS_ACME_CA` (`production` по умолчанию | `staging` | URL ACME directory, §2.1). Всё остальное — в настройках БД через admin UI (§9.4).
+- **Права на `dataDir`.** В БД лежат `monToken` и `tgToken`, поэтому на каждом старте (и в `admin set`) mon-server создаёт `dataDir` с `0700` и выставляет `chmod` `dataDir` → `0700`, `mon-server.db` → `0600` — идемпотентно, чинит и существующую установку с более широкими правами. `dataDir/certs` certmagic сам держит в `0700`/`0600`. В systemd-юните дополнительно `StateDirectoryMode=0700` и `UMask=0077` (README).
 - **Один листенер** HTTPS на `listen`: `/v1/*` для mon-clients (протокол), `/admin/*` для admin UI, `/healthz` без auth (только `200`). Heartbeat, регистрация и конфиг идут мимо туннелей, tunnel probe — через туннель target'а; различаются путями, не портами.
 - Graceful shutdown: дождаться текущих обработчиков, буферы в SQLite (§3) уже durable.
 
 ### 2.1 TLS
 
-`tls.mode = acme-ip` (default): встроенный certmagic — сертификат Let's Encrypt для IP-адреса, профиль `shortlived` (160 ч), challenge `tls-alpn-01` на том же `:443`, `DisableHTTPChallenge: true` (`:80` не нужен), `RenewalWindowRatio ≈ 0.5` (продление каждые ~3 дня), `FileStorage` в `dataDir/certs`. Требования к коробке: `:443` открыт всему интернету (валидаторы LE), NTP. `tls.mode = files` — свой cert/key (домен или тесты), без ACME. mon-client проверяет сертификат системными CA, пиннинга нет.
+`tls.mode = acme-ip` (default): встроенный certmagic — сертификат Let's Encrypt для IP-адреса, профиль `shortlived` (160 ч), challenge `tls-alpn-01` на том же `:443`, `DisableHTTPChallenge: true` (`:80` не нужен), `RenewalWindowRatio ≈ 0.5` (продление каждые ~3 дня), `FileStorage` в `dataDir/certs`. Требования к коробке: `:443` открыт всему интернету (валидаторы LE), NTP.
+
+CA задаёт `tls.acmeCa` / `MON_TLS_ACME_CA`: `production` (default) — боевой Let's Encrypt; `staging` — staging Let's Encrypt (стенды, которые пересобираются чаще, чем позволяют лимиты боевого LE на один IP: 5 сертификатов на набор идентификаторов за 7 дней); любое другое значение — URL ACME directory (Pebble в e2e/CI). Профиль `shortlived`, IP-SAN и `tls-alpn-01` со staging совместимы. Storage certmagic разделён по host CA, staging и production не пересекаются. С `production` certmagic повторные попытки сначала валидирует на staging (неявный `TestCA`) — в логах ретраев виден staging-host. Admin UI показывает CA на табе «TLS & admin» (§9.4).
+
+`tls.mode = files` — свой cert/key (домен или тесты), без ACME. Лист сертификата обязан содержать IP-SAN, равный `publicIp` (mon-clients ходят на `probeUrl` по IP); иначе старт падает с ошибкой `cert has no IP SAN for publicIp`.
+
+mon-client проверяет сертификат системными CA, пиннинга нет и CA-флага нет. Сертификат от staging-CA mon-client доверяет только через окружение: `SSL_CERT_FILE` с корнями staging LE (Go при этом продолжает читать `/etc/ssl/certs`) — см. README.
 
 ## 3. Хранилище
 
@@ -141,15 +148,15 @@ SQLite одним файлом `dataDir/mon-server.db` (GORM, как у пане
 
 ### 9.4 Settings (`/admin/settings`)
 
-Одна кнопка **Save** сверху, строка статуса «Panel reachable · revision · N inbounds · override → host · checked N ago» (или последняя ошибка). Табы:
+Одна кнопка **Save** сверху, строка статуса «Panel reachable · revision · N inbounds · override → host · checked N ago» (или последняя ошибка; если последний запрос упал на `x509: unknown authority` — отдельный текст с подсказкой про `panelCa`). Табы:
 
 | таб | поля (ключ `settings`) |
 |---|---|
-| **Real server** | `panelUrl` (base URL панели с `webBasePath`), `monToken`, кнопка **Check** (`GET /state` по введённым значениям, без Save), `realHost` — адрес для path `direct`, по умолчанию host из `panelUrl`; **read-only блок Proxy front**: override вкл/выкл и host из последнего `GET /state` — своего поля proxy front у mon-server нет |
+| **Real server** | `panelUrl` (base URL панели с `webBasePath`), `monToken`, `panelCa` (textarea, PEM-цепочка; задана → запросы к панели доверяют **только** этому пулу вместо системного, самоподписанный лист панели годится как trust anchor; пусто → системный пул; невалидный PEM отклоняется при Save и Check), кнопка **Check** (`GET /state` по введённым значениям, включая `panelCa`, без Save; `x509: unknown authority` — отдельный текст с подсказкой про `panelCa`), `realHost` — адрес для path `direct`, по умолчанию host из `panelUrl`; **read-only блок Proxy front**: override вкл/выкл и host из последнего `GET /state` — своего поля proxy front у mon-server нет |
 | **Telegram** | `tgToken`, `tgChatId`, кнопка **Send test** (без Save) |
 | **Thresholds** | `downAfter 3`, `upAfter 2`, `flapN 4`, `flapMin 30`, `flapHoldMin 15`, `clientOfflineAfter 3`, `panelDownAfter 3` |
 | **Probe** | `intervalMs 60000`, `budgetMs 20000`, `connectMs 5000`, `tlsMs 10000`, `headersMs 10000`, `startJitterMs 5000`, `heartbeatTimeoutMs 10000` |
-| **TLS & admin** | read-only из bootstrap: `tls.mode`, срок сертификата и следующее продление, `dataDir`, `listen`; подсказка `mon-server admin set <user>` |
+| **TLS & admin** | read-only из bootstrap: `tls.mode`, в `acme-ip` — CA (`tls.acmeCa` и URL directory), срок сертификата и следующее продление, `dataDir`, `listen`; подсказка `mon-server admin set <user>` |
 
 Save применяет всё разом; смена `probe`-параметров или `realHost` пересобирает `client_configs` всем mon-clients (новая config revision).
 
