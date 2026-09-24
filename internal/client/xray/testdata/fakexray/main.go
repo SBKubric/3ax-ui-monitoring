@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -58,6 +59,7 @@ func main() {
 	case "-test":
 		banner()
 		path := flagValue(args, "-c")
+		requireJSON(path)
 		fmt.Printf("%s [Info] infra/conf/serial: Reading config: &{Name:%s Format:json}\n", stamp(), path)
 		cfg := load(path)
 		if cfg.Fake.TestFail != "" {
@@ -69,11 +71,25 @@ func main() {
 	case "run":
 		banner()
 		path := flagValue(args, "-c")
+		requireJSON(path)
 		fmt.Printf("%s [Info] infra/conf/serial: Reading config: &{Name:%s Format:json}\n", stamp(), path)
 		run(load(path))
 	default:
 		fail("fakexray: unknown command " + args[0])
 	}
+}
+
+// requireJSON reproduces how the real xray picks a config's format: from the
+// file extension, before reading a byte. A path without a known extension
+// fails like this, on stdout, with exit 23 (verified against
+// ghcr.io/xtls/xray-core:26.3.27) — the reason mon-client's candidate
+// config must end in .json.
+func requireJSON(path string) {
+	if strings.HasSuffix(strings.ToLower(path), ".json") {
+		return
+	}
+	fmt.Printf("Failed to start: main: failed to load config files: [%s] > core: Failed to get format of %s\n", path, path)
+	os.Exit(23)
 }
 
 // banner reproduces the two lines the real xray prints before anything else

@@ -229,7 +229,10 @@ func (a *RevisionApplier) installConfig(ctx context.Context, cfgJSON []byte, por
 	}
 	path := a.d.Dir.Path(xrayConfigName)
 
-	tmp, err := os.CreateTemp(a.d.Dir.Path(""), xrayConfigName+".tmp-*")
+	// The candidate keeps a .json suffix: xray picks the config format from
+	// the file extension, and `-test` on "xray.json.tmp-123" fails with
+	// "Failed to get format" before it reads a byte (found on the stand).
+	tmp, err := os.CreateTemp(a.d.Dir.Path(""), "xray.tmp-*.json")
 	if err != nil {
 		return fmt.Errorf("create temp xray.json: %w", err)
 	}
