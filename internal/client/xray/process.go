@@ -87,11 +87,11 @@ func New(bin string, logger *slog.Logger) *Process {
 // Snapshot of it and pass it to Diagnose.
 func (p *Process) Log() *Ring { return p.ring }
 
-// Diagnose explains a probe to addr:port from this Process's stderr window.
+// Diagnose explains a probe to target from this Process's stderr window.
 // It is the adapter the probe package's Diagnoser interface expects; the
 // matching itself is the pure Diagnose function.
-func (p *Process) Diagnose(addr string, port int, since, until time.Time) (Match, bool) {
-	return Diagnose(p.ring.Snapshot(), addr, port, since, until)
+func (p *Process) Diagnose(target Target, since, until time.Time) (Match, bool) {
+	return Diagnose(p.ring.Snapshot(), target, since, until)
 }
 
 // Test runs `xray -test -c <cfgPath>`: the gate a generated config must pass

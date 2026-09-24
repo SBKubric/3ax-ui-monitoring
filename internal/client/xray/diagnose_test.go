@@ -160,7 +160,7 @@ func TestDiagnose(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, ok := Diagnose(tc.lines, tc.addr, tc.port, tc.since, tc.until)
+			got, ok := Diagnose(tc.lines, Target{OutboundTag: "out-xray-12-proxy", Addr: tc.addr, Port: tc.port}, tc.since, tc.until)
 			if ok != tc.wantOK {
 				t.Fatalf("ok = %v, want %v (match %+v)", ok, tc.wantOK, got)
 			}
@@ -189,11 +189,89 @@ func TestDiagnoseMatchesIPv6AndBareForm(t *testing.T) {
 		{At: base, Text: `2026/09/12 15:44:06.500000 [Info] [42] transport/internet/tcp: dialing TCP to [::1]:443`},
 		{At: base.Add(time.Second), Text: `2026/09/12 15:44:07.500000 [Error] [42] transport/internet/reality: REALITY: received real certificate (potential MITM or redirection)`},
 	}
-	got, ok := Diagnose(lines, "::1", 443, base, base.Add(5*time.Second))
+	got, ok := Diagnose(lines, Target{Addr: "::1", Port: 443}, base, base.Add(5*time.Second))
 	if !ok {
 		t.Fatalf("no match for ::1")
 	}
 	if got.Reason != ReasonRealityRealCert {
 		t.Errorf("reason = %q, want %q", got.Reason, ReasonRealityRealCert)
+	}
+}
+
+// Lines of two targets whose outbounds dial the same real server
+// (10.255.255.1:443) — the shape decision #53 п. 6 allows. The detour and
+// dial lines are in the exact format Xray 26.3.27 writes at loglevel info,
+// checked on 2026-09-24 against ghcr.io/xtls/xray-core:26.3.27 with two
+// socks inbounds routed to two vless outbounds on one address: the
+// dispatcher names the outbound tag under the session id before the
+// transport dials, e.g.
+//
+//	[Info] [3391315677] app/dispatcher: taking detour [out-xray-12-proxy] for [tcp:mon.example:443]
+//	[Info] [3391315677] transport/internet/tcp: dialing TCP to tcp:10.255.255.1:443
+const (
+	detourA  = `2026/09/24 02:16:20.053614 [Info] [3391315677] app/dispatcher: taking detour [out-xray-12-proxy] for [tcp:mon.example:443]`
+	detourB  = `2026/09/24 02:16:20.053621 [Info] [1425586641] app/dispatcher: taking detour [out-xray-13-proxy] for [tcp:mon.example:443]`
+	dialA    = `2026/09/24 02:16:20.053627 [Info] [3391315677] transport/internet/tcp: dialing TCP to tcp:10.255.255.1:443`
+	dialB    = `2026/09/24 02:16:20.053624 [Info] [1425586641] transport/internet/tcp: dialing TCP to tcp:10.255.255.1:443`
+	realityA = `2026/09/24 02:16:20.300000 [Error] [3391315677] transport/internet/reality: REALITY: received real certificate (potential MITM or redirection)`
+	failedA  = `2026/09/24 02:16:21.000000 [Info] [3391315677] app/proxyman/outbound: app/proxyman/outbound: failed to process outbound traffic > common/retry: [transport/internet/reality: REALITY: processed invalid connection] > common/retry: all retry attempts failed`
+	failedB  = `2026/09/24 02:16:22.000000 [Info] [1425586641] app/proxyman/outbound: app/proxyman/outbound: failed to process outbound traffic > common/retry: [dial tcp 10.255.255.1:443: i/o timeout] > common/retry: all retry attempts failed`
+)
+
+// TestDiagnoseByOutboundTag is decision #53 п. 6: two targets may share a
+// real server's addr:port, so a session is attributed to a target by the
+// outbound tag the dispatcher's "taking detour" line names, and addr:port
+// is only the fallback. Matching on addr:port alone gives both targets the
+// Reality certificate that only one of them received.
+func TestDiagnoseByOutboundTag(t *testing.T) {
+	base := time.Date(2026, 9, 24, 2, 16, 20, 0, time.UTC)
+	lines := make([]Line, 0, 7)
+	for i, tx := range []string{detourA, detourB, dialB, dialA, realityA, failedA, failedB} {
+		lines = append(lines, Line{At: base.Add(time.Duration(i) * 100 * time.Millisecond), Text: tx})
+	}
+	since, until := base, base.Add(5*time.Second)
+
+	a, ok := Diagnose(lines, Target{OutboundTag: "out-xray-12-proxy", Addr: "10.255.255.1", Port: 443}, since, until)
+	if !ok {
+		t.Fatal("target A: no match")
+	}
+	if a.Reason != ReasonRealityRealCert {
+		t.Errorf("target A reason = %q, want %q", a.Reason, ReasonRealityRealCert)
+	}
+	if !strings.Contains(a.Detail, "REALITY: processed invalid connection") {
+		t.Errorf("target A detail = %q, want its own failed-outbound line", a.Detail)
+	}
+
+	b, ok := Diagnose(lines, Target{OutboundTag: "out-xray-13-proxy", Addr: "10.255.255.1", Port: 443}, since, until)
+	if !ok {
+		t.Fatal("target B: no match")
+	}
+	if b.Reason != "" {
+		t.Errorf("target B reason = %q, want none: the real certificate was A's", b.Reason)
+	}
+	if !strings.Contains(b.Detail, "i/o timeout") {
+		t.Errorf("target B detail = %q, want its own failed-outbound line", b.Detail)
+	}
+
+	// A third target on the same server that xray never routed anything to
+	// in the window has nothing to explain: the fallback must not hand it
+	// sessions the detour lines already gave to A and B.
+	if m, ok := Diagnose(lines, Target{OutboundTag: "out-xray-14-proxy", Addr: "10.255.255.1", Port: 443}, since, until); ok {
+		t.Errorf("target C matched %+v, want nothing", m)
+	}
+}
+
+// TestDiagnoseFallsBackToAddrPort: when the window holds no detour line for
+// the target's tag (a log format change, a lower loglevel), the session is
+// still found by its dial line, as before decision #53.
+func TestDiagnoseFallsBackToAddrPort(t *testing.T) {
+	base := time.Date(2026, 9, 24, 2, 16, 20, 0, time.UTC)
+	lines := []Line{
+		{At: base, Text: dialA},
+		{At: base.Add(100 * time.Millisecond), Text: realityA},
+	}
+	m, ok := Diagnose(lines, Target{OutboundTag: "out-xray-12-proxy", Addr: "10.255.255.1", Port: 443}, base, base.Add(time.Second))
+	if !ok || m.Reason != ReasonRealityRealCert {
+		t.Fatalf("Diagnose = %+v, %v; want the Reality line through the addr:port fallback", m, ok)
 	}
 }

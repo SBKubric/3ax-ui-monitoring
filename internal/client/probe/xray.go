@@ -21,7 +21,7 @@ import (
 // nil is allowed — a mon-client whose xray never started still probes, it just
 // cannot explain the failures any better than Classify does.
 type Diagnoser interface {
-	Diagnose(addr string, port int, since, until time.Time) (xray.Match, bool)
+	Diagnose(target xray.Target, since, until time.Time) (xray.Match, bool)
 }
 
 // Prober runs single probes. It exists only to carry the collaborators a
@@ -90,7 +90,8 @@ func (p *Prober) Xray(ctx context.Context, probeURL, token string, key proto.Tar
 
 	reason, detail := Classify(err, ph, b)
 	if diag != nil {
-		if m, ok := diag.Diagnose(plan.ServerAddr, plan.ServerPort, start, end); ok {
+		target := xray.Target{OutboundTag: plan.OutboundTag, Addr: plan.ServerAddr, Port: plan.ServerPort}
+		if m, ok := diag.Diagnose(target, start, end); ok {
 			if m.Reason == xray.ReasonRealityRealCert {
 				reason = proto.ReasonRealityRealCert
 			}

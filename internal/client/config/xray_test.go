@@ -33,18 +33,20 @@ func TestBuildXrayGolden(t *testing.T) {
 
 	want := []XrayPlan{
 		{
-			Key:        proto.TargetKey{InboundKind: "xray", InboundID: 12, Path: "proxy"},
-			SocksPort:  10801,
-			InboundTag: "in-xray-12-proxy",
-			ServerAddr: "198.51.100.10",
-			ServerPort: 443,
+			Key:         proto.TargetKey{InboundKind: "xray", InboundID: 12, Path: "proxy"},
+			SocksPort:   10801,
+			InboundTag:  "in-xray-12-proxy",
+			OutboundTag: "out-xray-12-proxy",
+			ServerAddr:  "198.51.100.10",
+			ServerPort:  443,
 		},
 		{
-			Key:        proto.TargetKey{InboundKind: "xray", InboundID: 12, Path: "direct"},
-			SocksPort:  10802,
-			InboundTag: "in-xray-12-direct",
-			ServerAddr: "198.51.100.20",
-			ServerPort: 443,
+			Key:         proto.TargetKey{InboundKind: "xray", InboundID: 12, Path: "direct"},
+			SocksPort:   10802,
+			InboundTag:  "in-xray-12-direct",
+			OutboundTag: "out-xray-12-direct",
+			ServerAddr:  "198.51.100.20",
+			ServerPort:  443,
 		},
 	}
 	if len(plans) != len(want) {
