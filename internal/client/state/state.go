@@ -40,11 +40,19 @@ var ErrNoState = errors.New("state: no state file")
 // AppliedRevision is here rather than only ever recomputed, because it is
 // what makes "config unchanged, nothing to do" a fact recoverable
 // across a restart instead of forcing a GET /v1/config every single boot.
+//
+// LastAckSeq is the last ackSeq mon-server answered a heartbeat with
+// (decision #51 §1). cycles.json keeps the seq counter, but when that file
+// is lost or corrupt the counter would restart at 1 and mon-server would
+// drop every cycle up to its last ack as a duplicate; this copy lets the
+// box continue at LastAckSeq + 1 instead. It belongs to the token: a new
+// registration starts a new state.json, and mon-server resets its side too.
 type File struct {
 	MonClientID     string `json:"monClientId"`
 	Token           string `json:"token"`
 	ServerURL       string `json:"serverUrl"`
 	AppliedRevision string `json:"appliedRevision"`
+	LastAckSeq      int64  `json:"lastAckSeq,omitempty"`
 }
 
 // Dir is an opened state directory: the one handle every other package in
