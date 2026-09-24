@@ -21,7 +21,6 @@ import (
 
 	"github.com/amnezia-vpn/amneziawg-go/v3/conn"
 	"github.com/amnezia-vpn/amneziawg-go/v3/device"
-	"github.com/amnezia-vpn/amneziawg-go/v3/tun/netstack"
 
 	"github.com/SBKubric/3ax-ui-monitoring/internal/client/config"
 )
@@ -51,16 +50,17 @@ const logRingSize = 8
 // measurement every cycle (research §3.6, spec §5).
 type Device struct {
 	dev  *device.Device
-	tnet *netstack.Net
+	tun  *netTUN
 	ring *logRing
 }
 
-// Open brings up a fresh netstack device for cfg: CreateNetTUN with the
-// `.conf`'s addresses and MTU, NewDevice on the default UDP bind, IpcSet
-// with the UAPI blob internal/client/config already rendered in IpcSet
-// order, then Up (research §3.4).
+// Open brings up a fresh netstack device for cfg: a netTUN with the
+// `.conf`'s addresses and MTU (our copy of amneziawg-go's CreateNetTUN —
+// see netTUN for why), NewDevice on the default UDP bind, IpcSet with the
+// UAPI blob internal/client/config already rendered in IpcSet order, then
+// Up (research §3.4).
 //
-// DNS servers are deliberately nil: mon-client always dials mon-server by
+// The stack has no DNS resolver: mon-client always dials mon-server by
 // address, never by name (spec §4), so a resolver inside the tunnel would
 // only add a failure mode.
 func Open(cfg *config.AWGConfig) (*Device, error) {
@@ -68,7 +68,7 @@ func Open(cfg *config.AWGConfig) (*Device, error) {
 		return nil, fmt.Errorf("awg: no config")
 	}
 	ring := &logRing{}
-	tun, tnet, err := netstack.CreateNetTUN(cfg.LocalAddresses, nil, cfg.MTU)
+	tun, err := newNetTUN(cfg.LocalAddresses, cfg.MTU)
 	if err != nil {
 		return nil, fmt.Errorf("awg: create netstack tun: %w", err)
 	}
@@ -81,7 +81,7 @@ func Open(cfg *config.AWGConfig) (*Device, error) {
 		dev.Close()
 		return nil, fmt.Errorf("awg: bring device up: %w", err)
 	}
-	return &Device{dev: dev, tnet: tnet, ring: ring}, nil
+	return &Device{dev: dev, tun: tun, ring: ring}, nil
 }
 
 // DialContext opens a TCP connection through the tunnel. It is the
@@ -90,7 +90,7 @@ func Open(cfg *config.AWGConfig) (*Device, error) {
 // because net.Dialer is what reads the trace out of the context and gVisor
 // does not (research §6.2).
 func (d *Device) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
-	return d.tnet.DialContext(ctx, network, address)
+	return d.tun.DialContext(ctx, network, address)
 }
 
 // LastHandshake reports the newest peer handshake the device knows about,

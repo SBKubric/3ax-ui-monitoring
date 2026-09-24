@@ -23,6 +23,7 @@ import (
 	"github.com/SBKubric/3ax-ui-monitoring/internal/client/config"
 	"github.com/SBKubric/3ax-ui-monitoring/internal/client/probe"
 	"github.com/SBKubric/3ax-ui-monitoring/internal/client/proto"
+	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
 )
 
 // serverPort is the port the in-tunnel stub of mon-server listens on. Any
@@ -171,7 +172,8 @@ AllowedIPs = %s/32
 	port := listenPort(t, server)
 
 	cert, pool := selfSigned(t, serverTunnelIP)
-	ln, err := server.tnet.ListenTCP(&net.TCPAddr{IP: net.ParseIP(serverTunnelIP), Port: serverPort})
+	fa, pn := fullAddr(netip.AddrPortFrom(netip.MustParseAddr(serverTunnelIP), serverPort))
+	ln, err := gonet.ListenTCP(server.tun.stack, fa, pn)
 	if err != nil {
 		t.Fatalf("listen inside the tunnel: %v", err)
 	}
