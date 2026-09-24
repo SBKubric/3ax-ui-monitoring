@@ -9,9 +9,14 @@
 // normative: the bearer check answers a bare 404 exactly as the panel's
 // checkMonAuth does, every success carries X-Mon-Contract, the revision is
 // computed with the real formula (§4.2) rather than being a string a test
-// hands out, and the batch limits are enforced. It is deliberately lax about
-// everything else — it does not create probe accounts, it does not validate
-// event fields — because those are the panel's job, not the contract's.
+// hands out, the batch limits are enforced, and every event and stat row is
+// checked against the contract's dictionary — from/to per kind, the path
+// grammar — and answered element by element (decision #50), so a value
+// mon-server must never send (a mon_client transition from NEVER) fails a
+// test instead of a production panel. It is deliberately lax about
+// everything else — it does not create probe accounts, it does not check
+// reasons, ids or timestamps — because those are the panel's job, not what
+// mon-server's tests need to pin.
 package paneltest
 
 import (
@@ -24,6 +29,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -61,6 +67,23 @@ const (
 	// block (contract §5: monStaleMinutes defaults to 15). mon-server does
 	// not act on it in v1; it is here so the field is not zero.
 	staleThresholdMinutes = 15
+)
+
+// The contract's dictionary for events and stats (§4.6, §4.7, decision
+// #50). An empty from is legal for every kind — it is how a first
+// transition is spelled — and NEVER is deliberately absent from the
+// mon_client states: it is mon-server's internal registry state and never
+// leaves it.
+var (
+	eventStates = map[string]map[string]bool{
+		"target":     {"UP": true, "DOWN": true, "FLAPPING": true, "UNKNOWN": true, "PAUSED": true},
+		"mon_client": {"ONLINE": true, "OFFLINE": true},
+		"panel":      {"PANEL_UP": true, "PANEL_DOWN": true},
+	}
+
+	// pathRe is the path grammar: direct, proxy, or a chain hop by name
+	// (proxy-chain §6, hop names [a-z0-9-]{1,32}).
+	pathRe = regexp.MustCompile(`^(direct|proxy|(edge|inner):[a-z0-9-]{1,32})$`)
 )
 
 // RecordedRequest is one request the stub received, kept whether or not it
@@ -113,6 +136,10 @@ type Stub struct {
 	eventIDs   map[string]struct{}
 	stats      map[string]panel.StatPayload
 	statsOrder []string
+
+	rejectedEvents []panel.Rejected
+	rejectedStats  []panel.Rejected
+	legacy         bool
 
 	failN      int
 	failStatus int
@@ -289,6 +316,33 @@ func (s *Stub) BadBodyNext(n int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.badBodyN += n
+}
+
+// SetLegacyAnswers switches POST /events and /stats to the answers of a
+// panel from before per-element validation (decision #50): a valid batch
+// gets a bare 200 with no body, and a batch with any invalid element is
+// refused whole with 400 invalid_body.
+func (s *Stub) SetLegacyAnswers(on bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.legacy = on
+}
+
+// RejectedEvents returns every rejection POST /events answered with, in
+// arrival order across all batches, so a test can assert both that
+// mon-server sent nothing outside the dictionary and that a rejected event
+// was not offered again.
+func (s *Stub) RejectedEvents() []panel.Rejected {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]panel.Rejected(nil), s.rejectedEvents...)
+}
+
+// RejectedStats is RejectedEvents for POST /stats.
+func (s *Stub) RejectedStats() []panel.Rejected {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]panel.Rejected(nil), s.rejectedStats...)
 }
 
 // Requests returns every request the stub saw, in arrival order.
@@ -601,8 +655,24 @@ func (s *Stub) handleEvents(w http.ResponseWriter, body []byte) {
 	}
 
 	s.mu.Lock()
-	res := panel.EventsResult{Ignored: []panel.Ignored{}}
-	for _, ev := range in.Events {
+	defer s.mu.Unlock()
+	res := panel.EventsResult{Ignored: []panel.Ignored{}, Rejected: []panel.Rejected{}}
+	for i, ev := range in.Events {
+		if msg := validateEvent(ev); msg != "" {
+			res.Rejected = append(res.Rejected, panel.Rejected{Index: i, Id: ev.ID, Error: msg})
+		}
+	}
+	if s.legacy && len(res.Rejected) > 0 {
+		r := res.Rejected[0]
+		writeErr(w, http.StatusBadRequest, "invalid_body", fmt.Sprintf("events[%d].%s", r.Index, r.Error))
+		return
+	}
+	s.rejectedEvents = append(s.rejectedEvents, res.Rejected...)
+	rejected := indexSet(res.Rejected)
+	for i, ev := range in.Events {
+		if rejected[i] {
+			continue
+		}
 		if _, seen := s.eventIDs[ev.ID]; seen {
 			res.Duplicates++
 			continue
@@ -611,9 +681,8 @@ func (s *Stub) handleEvents(w http.ResponseWriter, body []byte) {
 		s.events = append(s.events, ev)
 		res.Accepted++
 	}
-	s.mu.Unlock()
 
-	writeJSON(w, http.StatusOK, res)
+	s.writeBatchResult(w, res)
 }
 
 func (s *Stub) handleStats(w http.ResponseWriter, body []byte) {
@@ -631,8 +700,24 @@ func (s *Stub) handleStats(w http.ResponseWriter, body []byte) {
 	}
 
 	s.mu.Lock()
-	res := panel.StatsResult{Ignored: []panel.Ignored{}}
-	for _, st := range in.Stats {
+	defer s.mu.Unlock()
+	res := panel.StatsResult{Ignored: []panel.Ignored{}, Rejected: []panel.Rejected{}}
+	for i, st := range in.Stats {
+		if msg := validatePath(st.Path); msg != "" {
+			res.Rejected = append(res.Rejected, panel.Rejected{Index: i, Error: msg})
+		}
+	}
+	if s.legacy && len(res.Rejected) > 0 {
+		r := res.Rejected[0]
+		writeErr(w, http.StatusBadRequest, "invalid_body", fmt.Sprintf("stats[%d].%s", r.Index, r.Error))
+		return
+	}
+	s.rejectedStats = append(s.rejectedStats, res.Rejected...)
+	rejected := indexSet(res.Rejected)
+	for i, st := range in.Stats {
+		if rejected[i] {
+			continue
+		}
 		key := fmt.Sprintf("%s|%s|%d|%s|%d", st.MonClientId, st.InboundKind, st.InboundId, st.Path, st.BucketStart)
 		if _, seen := s.stats[key]; !seen {
 			s.statsOrder = append(s.statsOrder, key)
@@ -640,9 +725,57 @@ func (s *Stub) handleStats(w http.ResponseWriter, body []byte) {
 		s.stats[key] = st
 		res.Accepted++
 	}
-	s.mu.Unlock()
 
+	s.writeBatchResult(w, res)
+}
+
+// writeBatchResult answers a POST /events or /stats that got past
+// validation: the per-element result, or — in legacy mode — the bare 200
+// with no body an older panel sends. Called with s.mu held; it only reads
+// s.legacy.
+func (s *Stub) writeBatchResult(w http.ResponseWriter, res any) {
+	if s.legacy {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
 	writeJSON(w, http.StatusOK, res)
+}
+
+// validateEvent checks one event against the contract's dictionary,
+// returning "" for a valid one and a "field: reason" message otherwise —
+// the shape the panel puts in rejected[].error.
+func validateEvent(ev store.EventPayload) string {
+	states, ok := eventStates[ev.Kind]
+	if !ok {
+		return fmt.Sprintf("kind: unknown value %q", ev.Kind)
+	}
+	if !states[ev.To] {
+		return fmt.Sprintf("to: unknown value %q for kind %s", ev.To, ev.Kind)
+	}
+	if ev.From != "" && !states[ev.From] {
+		return fmt.Sprintf("from: unknown value %q for kind %s", ev.From, ev.Kind)
+	}
+	if ev.Kind == "target" {
+		return validatePath(ev.Path)
+	}
+	return ""
+}
+
+// validatePath checks a target's path against the grammar.
+func validatePath(path string) string {
+	if !pathRe.MatchString(path) {
+		return fmt.Sprintf("path: unknown value %q", path)
+	}
+	return ""
+}
+
+// indexSet turns a rejection list into the set of rejected batch indices.
+func indexSet(rej []panel.Rejected) map[int]bool {
+	out := make(map[int]bool, len(rej))
+	for _, r := range rej {
+		out[r.Index] = true
+	}
+	return out
 }
 
 // readBody reads at most the contract's 1 MiB (§3), reporting separately

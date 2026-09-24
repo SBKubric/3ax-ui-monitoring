@@ -414,6 +414,14 @@ func (c *HTTPClient) attempt(ctx context.Context, method, u string, payload []by
 		// the panel can add optional ones without a version bump.
 		dec := json.NewDecoder(io.LimitReader(resp.Body, maxResponseBytes))
 		if err := dec.Decode(out); err != nil {
+			if _, ok := out.(emptyMeansAccepted); ok && errors.Is(err, io.EOF) {
+				// A bare 200 with no body at all (Decode's plain io.EOF,
+				// not ErrUnexpectedEOF) from a panel that predates
+				// per-element answers: the batch went in whole
+				// (decision #50). out stays the zero value — nothing
+				// rejected.
+				return nil
+			}
 			var syn *json.SyntaxError
 			var ute *json.UnmarshalTypeError
 			if errors.As(err, &syn) || errors.As(err, &ute) {
@@ -453,6 +461,56 @@ func (c *HTTPClient) attempt(ctx context.Context, method, u string, payload []by
 			Message: fmt.Sprintf("%s answered %s with no contract error body", u, resp.Status),
 		}
 	}
+}
+
+// emptyMeansAccepted marks the answer types a panel from before per-element
+// validation may send as a bare 200 with no body, which reads as "the whole
+// batch accepted" (decision #50). Only POST /events and /stats have such an
+// answer: an empty GET /state or /probe/configs is still a bad response,
+// never a zero-value snapshot.
+type emptyMeansAccepted interface{ emptyMeansAccepted() }
+
+func (*EventsResult) emptyMeansAccepted() {}
+func (*StatsResult) emptyMeansAccepted()  {}
+
+// Rejections maps a batch answer's rejected list onto the batch that was
+// sent: batch index → the rejection. n is the batch length; ids, when not
+// nil, are the batch's event ids by index, and an entry whose id is in the
+// batch is placed by id even if its index disagrees — the id is the stronger
+// identity of the two. An entry that matches no element (index out of range
+// and no known id) is logged and ignored, which leaves that element counted
+// as accepted: a panel that cannot say what it refused has not refused it.
+func Rejections(n int, rejected []Rejected, ids []string) map[int]Rejected {
+	if len(rejected) == 0 {
+		return nil
+	}
+	var byID map[string]int
+	out := make(map[int]Rejected, len(rejected))
+	for _, r := range rejected {
+		idx := -1
+		switch {
+		case r.Id != "" && r.Index >= 0 && r.Index < len(ids) && ids[r.Index] == r.Id:
+			idx = r.Index
+		case r.Id != "" && ids != nil:
+			if byID == nil {
+				byID = make(map[string]int, len(ids))
+				for i, id := range ids {
+					byID[id] = i
+				}
+			}
+			if i, ok := byID[r.Id]; ok {
+				idx = i
+			}
+		case r.Index >= 0 && r.Index < n:
+			idx = r.Index
+		}
+		if idx < 0 {
+			slog.Warn("panel: rejection matches nothing in the batch", "index", r.Index, "id", r.Id, "error", r.Error, "batch", n)
+			continue
+		}
+		out[idx] = r
+	}
+	return out
 }
 
 // checkContract warns once per client if the panel is announcing a contract

@@ -151,12 +151,14 @@ func (b *Buckets) Record(ctx context.Context, tx *gorm.DB, monClientID string, c
 // The batch rules mirror the poller's own outbox drain, because the failure
 // modes are the same (contract §3): at most maxStatsPerBatch rows per call,
 // oldest window first, sent_at stamped only on a 200 and only for the rows
-// that 200 covered. A non-retryable answer (4xx) is the panel rejecting
-// this batch's content — resending it would fail identically every minute
-// forever — so it is dropped, marked sent so the queue cannot wedge behind
-// it, and logged. A retryable failure (5xx, transport, timeout) leaves
-// every row untouched and is returned: the poller logs it and the next
-// cycle tries again.
+// that 200 accepted. The panel answers each row on its own (decision #50):
+// a rejected row would be rejected again on every resend, so it is logged
+// with the panel's reason and dropped — sent_at stamped, dropped set —
+// while the rest of the batch counts as delivered; an empty answer (an
+// older panel) rejects nothing. A non-retryable answer to the whole batch
+// (4xx) drops the whole batch the same way. A retryable failure (5xx,
+// transport, timeout) leaves every row untouched and is returned: the
+// poller logs it and the next cycle tries again.
 //
 // The returned error deliberately does not feed the PANEL_DOWN accounting
 // of spec §4.1 — that lives in the poller's observe, around the call that
@@ -202,12 +204,27 @@ func (b *Buckets) Flush(ctx context.Context, c panel.Client) error {
 				slog.Warn("state: dropping stats batch the panel would never accept",
 					"err", err, "count", len(ids))
 			}
-			if err := b.markSent(ctx, ids); err != nil {
+			if err := b.markDropped(ctx, ids); err != nil {
 				return err
 			}
 			continue
 		}
 
+		rejected := panel.Rejections(len(ids), res.Rejected, nil)
+		sent := make([]int, 0, len(ids))
+		var refused []int
+		for i, id := range ids {
+			r, ok := rejected[i]
+			if !ok {
+				sent = append(sent, id)
+				continue
+			}
+			p := payloads[i]
+			slog.Warn("state: dropping stats bucket the panel rejected",
+				"monClientId", p.MonClientId, "inboundKind", p.InboundKind, "inboundId", p.InboundId,
+				"path", p.Path, "bucketStart", p.BucketStart, "error", r.Error)
+			refused = append(refused, id)
+		}
 		if len(res.Ignored) > 0 {
 			// Contract §3: a bucket for an inbound the panel has since
 			// deleted is skipped, not retried. It is worth a log line and
@@ -215,15 +232,18 @@ func (b *Buckets) Flush(ctx context.Context, c panel.Client) error {
 			slog.Info("state: stats accepted with ignored rows",
 				"accepted", res.Accepted, "ignored", len(res.Ignored))
 		}
-		if err := b.markSent(ctx, ids); err != nil {
+		if err := b.markSent(ctx, sent); err != nil {
+			return err
+		}
+		if err := b.markDropped(ctx, refused); err != nil {
 			return err
 		}
 	}
 }
 
-// markSent stamps sent_at on the rows one POST /stats covered, which is
-// what takes them out of every later flush. It runs only after a 200 (or
-// after a deliberate drop), never on a batch the panel may yet accept.
+// markSent stamps sent_at on the rows one POST /stats accepted, which is
+// what takes them out of every later flush. It runs only after a 200, never
+// on a batch the panel may yet accept.
 func (b *Buckets) markSent(ctx context.Context, ids []int) error {
 	if len(ids) == 0 {
 		return nil
@@ -234,6 +254,23 @@ func (b *Buckets) markSent(ctx context.Context, ids []int) error {
 		Where("id IN ?", ids).
 		Update("sent_at", now).Error; err != nil {
 		return fmt.Errorf("state: marking stats buckets sent: %w", err)
+	}
+	return nil
+}
+
+// markDropped takes rows the panel rejected out of the flush: sent_at is
+// stamped like markSent's, and dropped records that they were given up on
+// rather than delivered. New data for the window clears both (applyDelta).
+func (b *Buckets) markDropped(ctx context.Context, ids []int) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	now := clock.Ms(b.clk.Now())
+	if err := b.st.DB.WithContext(ctx).
+		Model(&store.StatsBucket{}).
+		Where("id IN ?", ids).
+		Updates(map[string]any{"sent_at": now, "dropped": true}).Error; err != nil {
+		return fmt.Errorf("state: marking stats buckets dropped: %w", err)
 	}
 	return nil
 }
@@ -348,8 +385,10 @@ func applyDelta(tx *gorm.DB, k bucketKey, d *bucketDelta) error {
 
 	// New data invalidates whatever the panel was told about this window:
 	// clearing sent_at is what puts it back in the next Flush (spec §7.4,
-	// "досланные циклы … отправляют его повторно").
+	// "досланные циклы … отправляют его повторно"). A dropped window is
+	// reopened the same way — the rejection was of the old content.
 	row.SentAt = nil
+	row.Dropped = false
 
 	if err := tx.Save(&row).Error; err != nil {
 		return fmt.Errorf("state: saving stats bucket: %w", err)

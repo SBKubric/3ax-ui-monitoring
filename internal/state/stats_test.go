@@ -429,6 +429,9 @@ func TestFlush_DropsBatchThePanelRejected(t *testing.T) {
 		if row.SentAt == nil {
 			t.Fatal("the rejected batch is still unsent, so every later flush would re-send it forever")
 		}
+		if !row.Dropped {
+			t.Fatal("the rejected batch is marked sent but not dropped, so it reads as delivered")
+		}
 	}
 }
 
@@ -467,6 +470,64 @@ func TestFlush_NothingToSend(t *testing.T) {
 	for _, r := range f.stub.Requests() {
 		if strings.HasSuffix(r.Path, "/stats") {
 			t.Fatal("POST /stats was called with no closed bucket to send")
+		}
+	}
+}
+
+// TestFlush_RejectedBucketIsDroppedAndTheRestSent pins decision #50 for POST
+// /stats: the panel answers each bucket on its own, the accepted ones are
+// marked sent, and a rejected one is logged and marked dropped — sent_at
+// stamped so no later flush offers it again — while its neighbours in the
+// same batch still arrive.
+func TestFlush_RejectedBucketIsDroppedAndTheRestSent(t *testing.T) {
+	f := newStatsFixture(t)
+	bad := statOK(40)
+	bad.Path = "nowhere" // outside the contract's path grammar
+	f.record(Cycle{Seq: 1, Ts: atMs(baseTime), Results: []Result{statOK(40), bad}})
+	f.clk.Advance(6 * time.Minute)
+
+	f.mustFlush()
+
+	if got := f.stub.Stats(); len(got) != 1 || got[0].Path != store.PathProxy {
+		t.Fatalf("panel holds %+v, want only the valid proxy bucket", got)
+	}
+	for _, row := range f.rows() {
+		if row.SentAt == nil {
+			t.Fatalf("bucket %s is still unsent after the panel answered for it", row.Path)
+		}
+		if want := row.Path == "nowhere"; row.Dropped != want {
+			t.Fatalf("bucket %s dropped = %v, want %v", row.Path, row.Dropped, want)
+		}
+	}
+
+	f.mustFlush()
+	if n := len(f.stub.RejectedStats()); n != 1 {
+		t.Fatalf("panel saw %d rejections, want exactly 1: a dropped bucket is never retried", n)
+	}
+
+	// New data for the window reopens it like any other sent bucket
+	// (spec §7.4): the drop was about the old content, not the key.
+	f.record(Cycle{Seq: 2, Ts: atMs(baseTime), Results: []Result{bad}})
+	for _, row := range f.rows() {
+		if row.Path == "nowhere" && (row.SentAt != nil || row.Dropped) {
+			t.Fatalf("bucket with new data: sent_at=%v dropped=%v, want it queued again", row.SentAt, row.Dropped)
+		}
+	}
+}
+
+// TestFlush_EmptyAnswerMarksTheBatchSent covers the old panel for POST
+// /stats: a bare 200 with no body is "all accepted".
+func TestFlush_EmptyAnswerMarksTheBatchSent(t *testing.T) {
+	f := newStatsFixture(t)
+	f.stub.SetLegacyAnswers(true)
+	f.record(Cycle{Seq: 1, Ts: atMs(baseTime), Results: []Result{statOK(40)}})
+	f.clk.Advance(6 * time.Minute)
+
+	f.mustFlush()
+
+	for _, row := range f.rows() {
+		if row.SentAt == nil || row.Dropped {
+			t.Fatalf("bucket sent_at=%v dropped=%v, want sent and not dropped", row.SentAt, row.Dropped)
 		}
 	}
 }

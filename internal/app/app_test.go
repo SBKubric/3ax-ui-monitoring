@@ -659,6 +659,76 @@ func TestState_WiredIntoServer(t *testing.T) {
 	}
 }
 
+// TestEvents_FirstHeartbeatReachesThePanel is decision #50's end-to-end
+// regression check: a freshly approved mon-client's first heartbeat files a
+// mon_client ONLINE transition, and the next poll cycle delivers it to a
+// panel stub that validates events against the contract's dictionary. While
+// mon-server sent that transition "from NEVER" the panel rejected it, so the
+// panel never learned the box had come up.
+func TestEvents_FirstHeartbeatReachesThePanel(t *testing.T) {
+	a, clientTLS := newTestApp(t)
+	stub := paneltest.NewStub(t)
+	set := store.DefaultSettings()
+	set.PanelURL = stub.URL()
+	set.MonToken = stub.Token()
+	if err := a.deps.Store.SaveSettings(set); err != nil {
+		t.Fatalf("SaveSettings: %v", err)
+	}
+
+	ctx := context.Background()
+	reg := a.Registry()
+	out, err := reg.Register(ctx, registry.RegisterInput{PairingCode: "ABCDEF", Hostname: "h", RemoteIP: "198.51.100.10"})
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if _, err := reg.Approve(ctx, out.RequestID, registry.ApproveInput{Name: "ams-1"}); err != nil {
+		t.Fatalf("Approve: %v", err)
+	}
+	poll, err := reg.Poll(ctx, out.RequestID)
+	if err != nil {
+		t.Fatalf("Poll: %v", err)
+	}
+	addr, err := a.Start()
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	body := `{"monClientId":"ams-1","configRevision":"","client":{"version":"0.1.0"},` +
+		`"cycles":[{"seq":1,"ts":0,"unverified":false,"results":[]}]}`
+	req, err := http.NewRequest(http.MethodPost, "https://"+addr+"/v1/heartbeat", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+poll.Token)
+	req.Header.Set("Content-Type", "application/json")
+	client := &http.Client{Transport: &http.Transport{TLSClientConfig: clientTLS}}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("POST /v1/heartbeat: %v", err)
+	}
+	respBody, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", resp.StatusCode, respBody)
+	}
+
+	if err := a.Poller().Poll(ctx); err != nil {
+		t.Fatalf("Poll: %v", err)
+	}
+	if rej := stub.RejectedEvents(); len(rej) != 0 {
+		t.Fatalf("panel rejected %+v, want every event mon-server sends inside the contract's dictionary", rej)
+	}
+	var online bool
+	for _, ev := range stub.Events() {
+		if ev.Kind == "mon_client" && ev.MonClientID == "ams-1" && ev.To == store.MonClientOnline {
+			online = ev.From == ""
+		}
+	}
+	if !online {
+		t.Fatalf("panel events = %+v, want mon_client ams-1 \"\" → ONLINE", stub.Events())
+	}
+}
+
 // TestStats_WiredIntoServer checks step 7's wiring end to end, on the App's
 // own listener and against a real panel stub: a heartbeat's probe results
 // become a 5-minute bucket (spec §7.4), and once the bucket has closed —

@@ -299,6 +299,13 @@ type EventOutbox struct {
 	Payload  string `json:"payload" gorm:"column:payload;not null"`
 	Notified bool   `json:"notified" gorm:"column:notified;not null;default:false"`
 	SentAt   *int64 `json:"sentAt" gorm:"column:sent_at;index:idx_ms_events_outbox_sent_at"`
+
+	// Dropped marks a row that left the queue without reaching the panel:
+	// the panel rejected it (per element, or the whole batch with a 4xx),
+	// and resending would be refused the same way. SentAt is stamped too,
+	// so the row is out of every later flush and ages out with the
+	// retention sweep; Dropped is what tells it apart from a delivered one.
+	Dropped bool `json:"dropped" gorm:"column:dropped;not null;default:false"`
 }
 
 func (EventOutbox) TableName() string { return "events_outbox" }
@@ -339,6 +346,11 @@ type StatsBucket struct {
 	LatN   int   `json:"-" gorm:"column:lat_n;not null;default:0"`
 
 	SentAt *int64 `json:"sentAt" gorm:"column:sent_at;index:idx_ms_stats_buckets_sent_at"`
+
+	// Dropped is EventOutbox.Dropped for a bucket: the panel rejected it,
+	// sent_at is stamped so it is not offered again, and new data for the
+	// window clears both, the same as for a delivered bucket (spec §7.4).
+	Dropped bool `json:"dropped" gorm:"column:dropped;not null;default:false"`
 }
 
 func (StatsBucket) TableName() string { return "stats_buckets" }

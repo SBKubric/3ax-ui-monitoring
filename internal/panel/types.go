@@ -149,19 +149,39 @@ type Ignored struct {
 	Error string `json:"error"`
 }
 
+// Rejected is one batch element the panel refused on its own (decision
+// #50, contract §4.6/§4.7): the element failed validation, its neighbours
+// in the batch did not, and the panel answered 200 for the rest. Index is
+// the element's position in the batch as sent; Id is the event id and is
+// only present on POST /events. A rejected element would be refused the
+// same way on every resend, so the sender drops it rather than retrying.
+type Rejected struct {
+	Index int    `json:"index"`
+	Id    string `json:"id,omitempty"`
+	Error string `json:"error"`
+}
+
 // EventsResult is the POST /events body (contract §4.6). Duplicates is not
 // an error: the outbox may legitimately resend a batch whose confirmation
-// was lost, and the panel deduplicates by event id.
+// was lost, and the panel deduplicates by event id. Rejected lists the
+// elements the panel refused; everything else in the batch is accepted.
+//
+// A panel from before per-element answers replies with a bare 200 and no
+// body, which the client decodes as the zero value — nothing rejected, so
+// the whole batch counts as accepted (decision #50).
 type EventsResult struct {
-	Accepted   int       `json:"accepted"`
-	Duplicates int       `json:"duplicates"`
-	Ignored    []Ignored `json:"ignored"`
+	Accepted   int        `json:"accepted"`
+	Duplicates int        `json:"duplicates"`
+	Ignored    []Ignored  `json:"ignored"`
+	Rejected   []Rejected `json:"rejected"`
 }
 
 // StatsResult is the POST /stats body (contract §4.7). There is no
 // Duplicates counter because stats are upserted by key, so a resend
-// overwrites rather than collides.
+// overwrites rather than collides. Rejected and the empty-body rule are the
+// same as EventsResult's.
 type StatsResult struct {
-	Accepted int       `json:"accepted"`
-	Ignored  []Ignored `json:"ignored"`
+	Accepted int        `json:"accepted"`
+	Ignored  []Ignored  `json:"ignored"`
+	Rejected []Rejected `json:"rejected"`
 }

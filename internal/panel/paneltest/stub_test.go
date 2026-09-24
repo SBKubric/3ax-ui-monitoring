@@ -342,3 +342,103 @@ func TestStub_RequestsAreRecorded(t *testing.T) {
 		t.Fatalf("Authorization = %q", got)
 	}
 }
+
+// TestStub_EventsRejectedPerElement pins the stub to the contract's event
+// dictionary (§4.6, decision #50): each invalid element is answered in
+// rejected by its index and id while the valid ones around it are accepted.
+// A mon_client transition from NEVER is the regression this exists for —
+// NEVER is mon-server's internal registry state, and the panel only knows
+// ONLINE/OFFLINE (with an empty from for a client's first transition).
+func TestStub_EventsRejectedPerElement(t *testing.T) {
+	s := paneltest.NewStub(t)
+	inbound := 12
+	target := func(id, path, from, to string) store.EventPayload {
+		return store.EventPayload{ID: id, Ts: 1757721540000, Kind: "target", MonClientID: "ams-1",
+			InboundKind: "xray", InboundID: &inbound, Path: path, From: from, To: to, Reason: "tcp_timeout"}
+	}
+	mc := func(id, from, to string) store.EventPayload {
+		return store.EventPayload{ID: id, Ts: 1757721540000, Kind: "mon_client", MonClientID: "ams-1", From: from, To: to}
+	}
+	events := []store.EventPayload{
+		mc("e0", "", "ONLINE"),      // first transition: empty from is legal
+		mc("e1", "NEVER", "ONLINE"), // NEVER never leaves mon-server
+		target("e2", "edge:ams-1", "UP", "DOWN"),
+		target("e3", "inner:core-1", "", "UNKNOWN"),
+		target("e4", "sideways", "UP", "DOWN"), // not in the path grammar
+		target("e5", "edge:Bad_Name", "UP", "DOWN"),
+		target("e6", "direct", "UP", "SIDEWAYS"),
+		{ID: "e7", Ts: 1757721540000, Kind: "panel", From: "PANEL_UP", To: "PANEL_DOWN", Notified: true},
+		{ID: "e8", Ts: 1757721540000, Kind: "bogus", To: "UP"},
+	}
+
+	resp, body := do(t, s, http.MethodPost, "/events", s.Token(), map[string]any{"events": events})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 with per-element rejections, body=%s", resp.StatusCode, body)
+	}
+	var res panel.EventsResult
+	if err := json.Unmarshal(body, &res); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if res.Accepted != 4 {
+		t.Fatalf("accepted = %d, want 4 (e0, e2, e3, e7), body=%s", res.Accepted, body)
+	}
+	wantRejected := map[int]string{1: "e1", 4: "e4", 5: "e5", 6: "e6", 8: "e8"}
+	if len(res.Rejected) != len(wantRejected) {
+		t.Fatalf("rejected = %+v, want indices 1, 4, 5, 6, 8", res.Rejected)
+	}
+	for _, r := range res.Rejected {
+		if wantRejected[r.Index] != r.Id || r.Error == "" {
+			t.Fatalf("rejected entry %+v does not name a rejected element with a reason", r)
+		}
+	}
+	if got := s.Events(); len(got) != 4 {
+		t.Fatalf("Events() = %d rows, want only the 4 accepted", len(got))
+	}
+	if got := s.RejectedEvents(); len(got) != len(wantRejected) {
+		t.Fatalf("RejectedEvents() = %+v, want the same %d rejections", got, len(wantRejected))
+	}
+}
+
+// TestStub_StatsRejectedPerElement is the /stats half of the same rule
+// (contract §4.7): a row whose path is outside the grammar is rejected by
+// index, the rest are upserted.
+func TestStub_StatsRejectedPerElement(t *testing.T) {
+	s := paneltest.NewStub(t)
+	stat := func(path string) panel.StatPayload {
+		return panel.StatPayload{MonClientId: "ams-1", InboundKind: "xray", InboundId: 12,
+			Path: path, BucketStart: 1757721300000, NOk: 1}
+	}
+
+	_, body := do(t, s, http.MethodPost, "/stats", s.Token(),
+		map[string]any{"stats": []any{stat("direct"), stat("nowhere"), stat("inner:core-1")}})
+	var res panel.StatsResult
+	if err := json.Unmarshal(body, &res); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if res.Accepted != 2 || len(res.Rejected) != 1 || res.Rejected[0].Index != 1 || res.Rejected[0].Error == "" {
+		t.Fatalf("result = %+v, want 2 accepted and index 1 rejected with a reason", res)
+	}
+	if got := s.Stats(); len(got) != 2 {
+		t.Fatalf("Stats() = %d rows, want the 2 accepted", len(got))
+	}
+	if got := s.RejectedStats(); len(got) != 1 {
+		t.Fatalf("RejectedStats() = %+v, want the one rejection", got)
+	}
+}
+
+// TestStub_LegacyAnswersAreEmpty covers the stub's "old panel" mode: POST
+// /events and /stats answer 200 with no body at all, which mon-server must
+// read as "everything accepted".
+func TestStub_LegacyAnswersAreEmpty(t *testing.T) {
+	s := paneltest.NewStub(t)
+	s.SetLegacyAnswers(true)
+	ev := store.EventPayload{ID: "e0", Ts: 1757721540000, Kind: "panel", From: "PANEL_UP", To: "PANEL_DOWN"}
+
+	resp, body := do(t, s, http.MethodPost, "/events", s.Token(), map[string]any{"events": []any{ev}})
+	if resp.StatusCode != http.StatusOK || len(bytes.TrimSpace(body)) != 0 {
+		t.Fatalf("status = %d body = %q, want 200 with an empty body", resp.StatusCode, body)
+	}
+	if got := s.Events(); len(got) != 1 {
+		t.Fatalf("Events() = %d rows, want the event stored", len(got))
+	}
+}
