@@ -40,22 +40,22 @@ SQLite одним файлом `dataDir/mon-server.db` (GORM, как у пане
 | `targets` | unique `(mon_client_id, inbound_kind, inbound_id, path)` | `state` (`UP`/`DOWN`/`FLAPPING`/`UNKNOWN`/`PAUSED`), `since`, `reason`, `consecutive_fail`, `consecutive_ok`, `transitions` (JSON последних времён переходов для FLAPPING), `flapping_until`, `last_result_at` | state machine §7 |
 | `panel_inbounds` | `(inbound_kind, inbound_id)` | `protocol`, `port`, `remark`, `enable`, `seen_revision` | последний `GET /state` |
 | `client_configs` | `mon_client_id` PK | `revision`, `document` (JSON §5), `built_at` | собранный конфиг per-client |
-| `events_outbox` | `id` UUID v7 PK | `ts`, `payload` (JSON события контракта §4.6), `notified`, `sent_at` (NULL пока не подтверждено панелью) | очередь событий, в `PANEL_DOWN` — буфер до 24 ч |
-| `stats_buckets` | unique `(mon_client_id, inbound_kind, inbound_id, path, bucket_start)` | `n_ok`, `n_fail`, `lat_min`, `lat_avg`, `lat_max`, `handshake_ms`, `sent_at` | 5-мин агрегаты до отправки и на случай повтора |
+| `events_outbox` | `id` UUID v7 PK | `ts`, `payload` (JSON события контракта §4.6), `notified`, `sent_at` (NULL пока не подтверждено панелью), `dropped` (панель отвергла, см. §4 шаг 4) | очередь событий, в `PANEL_DOWN` — буфер до 24 ч |
+| `stats_buckets` | unique `(mon_client_id, inbound_kind, inbound_id, path, bucket_start)` | `n_ok`, `n_fail`, `lat_min`, `lat_avg`, `lat_max`, `handshake_ms`, `sent_at`, `dropped` | 5-мин агрегаты до отправки и на случай повтора |
 | `probe_seen` | `id` autoinc | `mon_client_id`, `inbound_kind`, `inbound_id`, `path`, `egress_ip`, `seen_at` | лог приходов tunnel probe (диагностика), ретеншн 24 ч |
 
 Ретеншн (job раз в час): `events_outbox` с `sent_at` старше 7 дней, `stats_buckets` с `sent_at` старше 7 дней, `probe_seen` старше 24 ч, `registration_requests` не-pending старше 7 дней, `admin_sessions` истёкшие.
 
 ## 4. Цикл с панелью
 
-Клиент панели: base URL из настроек (§9.4), `Authorization: Bearer <monToken>`, таймаут 10 с, ретраи только на сеть/5xx/таймаут с экспоненциальной задержкой (1 → 2 → 4 с, не дольше минуты цикла); `4xx` — лог и дроп батча. Голый `404` на `GET /state` = «неверный токен, путь или мониторинг выключен» → Telegram от mon-server (§10), состояние `PANEL_DOWN` не объявляется (панель отвечает).
+Клиент панели: base URL из настроек (§9.4), `Authorization: Bearer <monToken>`, таймаут 10 с, ретраи только на сеть/5xx/таймаут с экспоненциальной задержкой (1 → 2 → 4 с, не дольше минуты цикла); `4xx` на батч целиком — лог и дроп батча (`dropped`). Голый `404` на `GET /state` = «неверный токен, путь или мониторинг выключен» → Telegram от mon-server (§10), состояние `PANEL_DOWN` не объявляется (панель отвечает).
 
 Раз в минуту (`panel poll`):
 
 1. `GET /state` → сохранить `panel_inbounds`, override, `probe.subId`, `revision`. Ревизия отличается от последней виденной → шаг 3.
 2. `POST /probe/ensure` с полным снимком реестра: `{id, name, region, state, lastHeartbeat}` по всем mon-clients с `enabled=true` (выключенные и `NEVER` тоже входят: панель показывает их как есть). Ответ несёт `subId` и `revision`; `503 xray_unavailable` — повторить в следующем цикле.
 3. При смене ревизии: `GET /probe/configs?host=<realHost>` (path `direct`) и, если `override.enabled`, `GET /probe/configs` (path `proxy`); ответ с `revision` ≠ текущей отбросить и повторить в следующем цикле. Пересобрать `client_configs` всех mon-clients (§5). Inbound'ы, исчезнувшие из `/state`, — снять их targets (`PAUSED` → удалить строки после подтверждения следующим heartbeat без этих targets); inbound'ы с `enable=false` есть в `/state`, но не в `items` → их targets `PAUSED` с событием `config_disabled`.
-4. Отправка очереди: `POST /events` батчами ≤ 1000 из `events_outbox` с `sent_at IS NULL` (по `ts`), `POST /stats` для закрытых бакетов с `sent_at IS NULL` (≤ 2000). Успех → `sent_at = now`. Дубликаты и `ignored` панели — лог, не ошибка.
+4. Отправка очереди: `POST /events` батчами ≤ 1000 из `events_outbox` с `sent_at IS NULL` (по `ts`), `POST /stats` для закрытых бакетов с `sent_at IS NULL` (≤ 2000). Панель отвечает поэлементно: `200 {accepted, rejected: [{index, id?, error}]}` (`id` — только у событий; решение [#50](https://github.com/SBKubric/3ax-ui-monitoring/issues/50)). Принятые → `sent_at = now`; отвергнутые → лог `WARN` с `error` панели, `sent_at = now` и `dropped = true`, без повторов (повтор был бы отвергнут так же). Пустое тело `200` (панель до поэлементной валидации) = «все приняты». Дубликаты и `ignored` панели — лог, не ошибка. `400 invalid_body` на батч целиком остаётся для нечитаемого тела — дроп батча, как любой `4xx`.
 
 ### 4.1 `PANEL_DOWN`
 
@@ -88,7 +88,7 @@ SQLite одним файлом `dataDir/mon-server.db` (GORM, как у пане
 ### 7.1 Приём heartbeat
 
 1. `received_at = now` (время mon-server — авторитет для состояния); `ts` циклов клампится к `received_at` при расхождении > 5 мин и используется только для раскладки по бакетам.
-2. mon-client: `last_heartbeat = now`, `state=ONLINE` (из `OFFLINE`/`NEVER` — событие `mon_client ONLINE`), `version`, `xrayVersion`, `configError` (появился → событие в лог реестра + Telegram от mon-server §10; исчез → очистить). `configRevision` в heartbeat ≠ актуальной → `applied_revision` в реестре помечается как отстающая (видно в admin UI).
+2. mon-client: `last_heartbeat = now`, `state=ONLINE` (из `OFFLINE`/`NEVER` — событие `mon_client ONLINE`; первый переход, из `NEVER`, уходит панели с пустым `from` — `NEVER` внутреннее состояние реестра и наружу не отдаётся, словарь панели для `mon_client` — `ONLINE`/`OFFLINE`), `version`, `xrayVersion`, `configError` (появился → событие в лог реестра + Telegram от mon-server §10; исчез → очистить). `configRevision` в heartbeat ≠ актуальной → `applied_revision` в реестре помечается как отстающая (видно в admin UI).
 3. Циклы с `seq ≤ ackSeq` предыдущего ответа игнорируются. Из новых: **живой цикл** (последний, пришедший своим heartbeat, `unverified=false`) применяется к state machine; **досланные** (`seq` ниже последнего) и **unverified** идут только в статистику; из unverified берутся только успехи, провалы — пропуск. Результаты по targets, которых нет в текущем конфиге mon-client, отбрасываются.
 4. Ответ `{configRevision, serverTs, ackSeq: max seq}`.
 
@@ -96,10 +96,10 @@ SQLite одним файлом `dataDir/mon-server.db` (GORM, как у пане
 
 | состояние | вход | выход | событие панели / Telegram |
 |---|---|---|---|
-| `UNKNOWN` | новый target; mon-client `OFFLINE`/disabled | первый результат живого цикла | событие; Telegram нет |
-| `UP` | `upAfter` (2) успехов подряд из `DOWN`/`UNKNOWN`; стартовое — первый успех | — | «UP» с длительностью простоя (только из `DOWN`) |
-| `DOWN` | `downAfter` (3) провала подряд при живом heartbeat | — | «DOWN» с `reason` из результата |
-| `FLAPPING` | ≥ `flapN` (4) переходов UP↔DOWN за `flapMin` (30 мин) | `flapHoldMin` (15) без переходов → фактическое состояние | одно сообщение при входе и выходе; переходы внутри — только события |
+| `UNKNOWN` | новый target; mon-client `OFFLINE`/disabled | в `UP` — с первого успеха живого цикла; в `DOWN` — только после `downAfter` провалов подряд (провалы до порога оставляют `UNKNOWN`) | событие; Telegram нет |
+| `UP` | `upAfter` (2) успехов подряд из `DOWN`; из `UNKNOWN` — первый успех | — | «UP» с длительностью простоя (только из `DOWN`) |
+| `DOWN` | `downAfter` (3) провала подряд при живом heartbeat — из `UP` и из `UNKNOWN` одинаково | — | «DOWN» с `reason` из результата |
+| `FLAPPING` | ≥ `flapN` (4) переходов UP↔DOWN за `flapMin` (30 мин) | `flapHoldMin` (15) без переходов → фактическое состояние; выход проверяется только при приходе результата живого цикла (таймера нет: без результатов target остаётся `FLAPPING`, первый результат после истечения выводит его и применяется уже к фактическому состоянию) | одно сообщение при входе и выходе; переходы внутри — только события |
 | `PAUSED` | inbound `enable=false` или пропал из `/probe/configs` | конфиг снова активен → `UNKNOWN` | событие `config_disabled`/`config_enabled`; Telegram нет |
 
 Пороги глобальные в настройках (§9.4). Каждый переход → событие контракта §4.6 в outbox: `{id: UUID v7, ts: received_at, kind: target, monClientId, inboundKind, inboundId, path, from, to, reason, notified}`; `reason` из словаря (`tcp_refused` `tcp_timeout` `tls_timeout` `reality_real_cert` `awg_no_handshake` `http_error` `recovered` `flapping` `config_disabled` `config_enabled` `mon_client_offline` `mon_client_disabled`).
