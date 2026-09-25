@@ -1065,11 +1065,13 @@ func TestHeartbeat_ReplacementAfterRevokeAcceptsSeqOne(t *testing.T) {
 	}
 }
 
-// excluding describes a panel where inbound xray:12 is enabled, with the
-// given override and mon-client paths.
+// excluding describes a panel without a chain (it serves direct and
+// proxy) where inbound xray:12 is enabled, with the given override and the
+// paths the mon-client probes.
 func excluding(override bool, paths ...string) registry.Exclusions {
 	x := registry.Exclusions{
 		Known:    true,
+		Served:   map[string]bool{store.PathDirect: true, store.PathProxy: true},
 		Paths:    map[string]bool{},
 		Override: override,
 		Inbounds: map[registry.TargetKey]bool{{InboundKind: store.InboundKindXray, InboundID: 12}: true},

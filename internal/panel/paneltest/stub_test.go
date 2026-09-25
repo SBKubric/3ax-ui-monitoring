@@ -632,8 +632,9 @@ func TestStub_HopConfigs(t *testing.T) {
 }
 
 // TestStub_EnsureRecordsPaths checks contract 3 §4.3: the snapshot carries
-// each mon-client's paths vocabulary, and the stub keeps it for a test to
-// assert on.
+// each mon-client's paths vocabulary, the stub keeps it for a test to
+// assert on, and a value outside the vocabulary (a stale "proxy") is
+// refused whole.
 func TestStub_EnsureRecordsPaths(t *testing.T) {
 	s := paneltest.NewStub(t)
 	snapshot := []panel.MonClientSnapshot{
@@ -646,5 +647,11 @@ func TestStub_EnsureRecordsPaths(t *testing.T) {
 	ensured := s.Ensured()
 	if len(ensured) != 1 || strings.Join(ensured[0][1].Paths, ",") != "edge:edge-a,inner:core-1" {
 		t.Fatalf("Ensured() = %+v, want the paths as sent", ensured)
+	}
+
+	bad := []panel.MonClientSnapshot{{Id: "ams-1", State: "ONLINE", Paths: []string{"proxy"}}}
+	resp, body := do(t, s, http.MethodPost, "/probe/ensure", s.Token(), map[string]any{"monClients": bad})
+	if resp.StatusCode != http.StatusBadRequest || !strings.Contains(string(body), "invalid_body") {
+		t.Fatalf("paths [proxy]: status = %d body = %s, want 400 invalid_body", resp.StatusCode, body)
 	}
 }

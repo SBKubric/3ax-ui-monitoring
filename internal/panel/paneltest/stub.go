@@ -20,8 +20,9 @@
 // not, the revision covers the probe material and the chain as well as the
 // state, GET /state carries the chain registry's probed hops (SetChain),
 // ?hop= renders one hop's path and answers the contract's 409s for a hop
-// that is unknown or not joined, and ensure may name the pairs left without
-// a peer with their reasons (unallocated). SetContract turns it into an older
+// that is unknown or not joined, the ensure snapshot's paths are checked
+// against the vocabulary, and ensure may name the pairs left without a
+// peer with their reasons (unallocated). SetContract turns it into an older
 // or newer panel for the refusal tests. It is deliberately lax about
 // everything else — it does not create probe accounts, it does not expand
 // paths or enforce monProbePeerLimit, it does not check reasons, ids or
@@ -100,6 +101,11 @@ var (
 	// pathRe is the path grammar: direct, proxy, or a chain hop by name
 	// (proxy-chain §6, hop names [a-z0-9-]{1,32}).
 	pathRe = regexp.MustCompile(`^(direct|proxy|(edge|inner):[a-z0-9-]{1,32})$`)
+
+	// vocabularyRe is the ensure snapshot's paths vocabulary (contract 3
+	// §4.3): direct, hops, or one hop by name — never proxy, which left the
+	// vocabulary for hops.
+	vocabularyRe = regexp.MustCompile(`^(direct|hops|(edge|inner):[a-z0-9-]{1,32})$`)
 )
 
 // Hop is one hop of the stub's chain registry — the panel's whole
@@ -744,6 +750,15 @@ func (s *Stub) handleEnsure(w http.ResponseWriter, body []byte) {
 		writeErr(w, http.StatusRequestEntityTooLarge, "batch_too_large",
 			fmt.Sprintf("monClients has %d elements, limit %d", len(in.MonClients), maxMonClients))
 		return
+	}
+	for i, mc := range in.MonClients {
+		for _, p := range mc.Paths {
+			if !vocabularyRe.MatchString(p) {
+				writeErr(w, http.StatusBadRequest, "invalid_body",
+					fmt.Sprintf("monClients[%d].paths: unknown value %q", i, p))
+				return
+			}
+		}
 	}
 
 	s.mu.Lock()

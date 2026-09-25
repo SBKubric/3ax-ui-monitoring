@@ -43,7 +43,7 @@ func TestClients_List(t *testing.T) {
 	h := newHarness(t)
 	h.login()
 	h.withMaterial()
-	id := h.approveOne("7K3F9Q", "vps-ams-2", "203.0.113.5", "Amsterdam #2", "NL", []string{"proxy", "direct"})
+	id := h.approveOne("7K3F9Q", "vps-ams-2", "203.0.113.5", "Amsterdam #2", "NL", []string{"hops", "direct"})
 
 	w := h.do(http.MethodGet, "/admin/api/clients", nil)
 	if w.Code != http.StatusOK {
@@ -77,7 +77,7 @@ func TestClients_UpdateChangesPathsAndRevision(t *testing.T) {
 	h := newHarness(t)
 	h.login()
 	h.withMaterial()
-	id := h.approveOne("7K3F9Q", "vps-ams-2", "203.0.113.5", "Amsterdam #2", "NL", []string{"proxy", "direct"})
+	id := h.approveOne("7K3F9Q", "vps-ams-2", "203.0.113.5", "Amsterdam #2", "NL", []string{"hops", "direct"})
 
 	before, err := h.configs.CurrentRevision(context.Background(), id)
 	if err != nil {
@@ -85,7 +85,7 @@ func TestClients_UpdateChangesPathsAndRevision(t *testing.T) {
 	}
 
 	w := h.do(http.MethodPost, "/admin/api/clients/"+id, map[string]any{
-		"name": "Amsterdam #2 (moved)", "region": "NL", "paths": []string{"proxy"},
+		"name": "Amsterdam #2 (moved)", "region": "NL", "paths": []string{"hops"},
 	})
 	if w.Code != http.StatusOK {
 		t.Fatalf("status %d, body %s", w.Code, w.Body.String())
@@ -184,7 +184,7 @@ func TestClients_Delete(t *testing.T) {
 func TestClients_ListShowsRejectedTargets(t *testing.T) {
 	h := newHarness(t)
 	h.login()
-	id := h.approveOne("7K3F9Q", "vps-ams-2", "203.0.113.5", "Amsterdam #2", "NL", []string{"proxy"})
+	id := h.approveOne("7K3F9Q", "vps-ams-2", "203.0.113.5", "Amsterdam #2", "NL", []string{"hops"})
 
 	rows := func() map[string]any {
 		t.Helper()

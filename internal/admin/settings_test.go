@@ -99,9 +99,9 @@ func TestSettings_SaveProbeRebuildsEveryConfig(t *testing.T) {
 	h.login()
 	h.withMaterial()
 
-	one := h.approveOne("7K3F9Q", "vps-ams-2", "203.0.113.5", "Amsterdam #2", "NL", []string{"proxy", "direct"})
+	one := h.approveOne("7K3F9Q", "vps-ams-2", "203.0.113.5", "Amsterdam #2", "NL", []string{"hops", "direct"})
 	h.clk.Advance(2 * 60 * 1e9)
-	two := h.approveOne("Q2V8NM", "vps-fra-1", "198.51.100.23", "Frankfurt #1", "DE", []string{"proxy"})
+	two := h.approveOne("Q2V8NM", "vps-fra-1", "198.51.100.23", "Frankfurt #1", "DE", []string{"hops"})
 
 	ctx := context.Background()
 	before := map[string]string{}
