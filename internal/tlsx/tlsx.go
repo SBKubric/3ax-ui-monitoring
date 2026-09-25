@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"net"
 	"path/filepath"
+	"sync"
 
 	"github.com/caddyserver/certmagic"
 
@@ -146,6 +147,19 @@ func buildACMEIP(dataDir, publicIP, caDir string) (*tls.Config, *Manager, error)
 		cache:      cache,
 		publicIP:   publicIP,
 		manageFunc: defaultManageFunc,
+		ready:      make(chan struct{}),
+	}
+	// certmagic emits cached_managed_cert both when ManageAsync loads a
+	// certificate from storage and when it caches one it has just
+	// obtained; either way that is the first moment a handshake can
+	// succeed. The hook is set before Manage can run, and it never
+	// returns an error, since for some events an error aborts the
+	// operation that emitted it.
+	magic.OnEvent = func(_ context.Context, event string, _ map[string]any) error {
+		if event == "cached_managed_cert" {
+			mgr.readyOnce.Do(func() { close(mgr.ready) })
+		}
+		return nil
 	}
 	return tlsCfg, mgr, nil
 }
@@ -226,6 +240,32 @@ type Manager struct {
 	cache      *certmagic.Cache
 	publicIP   string
 	manageFunc func(ctx context.Context, magic *certmagic.Config, names []string) error
+
+	// ready is closed, once, when certmagic first caches a managed
+	// certificate (see Ready).
+	ready     chan struct{}
+	readyOnce sync.Once
+}
+
+// closedReady is what a nil Manager's Ready returns: "files" mode loaded its
+// certificate in Build, so there is nothing to wait for.
+var closedReady = func() chan struct{} {
+	c := make(chan struct{})
+	close(c)
+	return c
+}()
+
+// Ready is closed once the listener can complete a TLS handshake: in
+// "acme-ip" mode, when certmagic has the first certificate for publicIP in
+// its cache (loaded from dataDir/certs or freshly obtained); for a nil
+// Manager ("files" mode), at once. internal/app takes this moment as
+// mon-server's serverReadyAt (decision #84 §2): until then no mon-client
+// could reach it, so their silence is not theirs.
+func (m *Manager) Ready() <-chan struct{} {
+	if m == nil {
+		return closedReady
+	}
+	return m.ready
 }
 
 // defaultManageFunc is production's manageFunc: certmagic's asynchronous
