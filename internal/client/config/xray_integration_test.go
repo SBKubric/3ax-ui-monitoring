@@ -33,10 +33,12 @@ func TestIntegrationXrayAcceptsGeneratedConfig(t *testing.T) {
 		{"two targets", twoTargets(t)},
 		// One target per supported protocol, so every branch of ParseLink
 		// is validated by the core and not only by a golden.
+		// Two of them are on hop paths (decision #61): their tags carry
+		// the path's own ':' and must be ones the core accepts.
 		{"every protocol", []proto.Target{
 			{TargetKey: proto.TargetKey{InboundKind: "xray", InboundID: 1, Path: "proxy"}, Protocol: "vless", Link: vlessRealityLink},
-			{TargetKey: proto.TargetKey{InboundKind: "xray", InboundID: 2, Path: "proxy"}, Protocol: "vless", Link: vlessTLSWSLink},
-			{TargetKey: proto.TargetKey{InboundKind: "xray", InboundID: 3, Path: "proxy"}, Protocol: "trojan", Link: trojanGRPCLink},
+			{TargetKey: proto.TargetKey{InboundKind: "xray", InboundID: 2, Path: "edge:ams-1"}, Protocol: "vless", Link: vlessTLSWSLink},
+			{TargetKey: proto.TargetKey{InboundKind: "xray", InboundID: 3, Path: "inner:core-1"}, Protocol: "trojan", Link: trojanGRPCLink},
 			{TargetKey: proto.TargetKey{InboundKind: "xray", InboundID: 4, Path: "proxy"}, Protocol: "shadowsocks", Link: ssLink},
 			{TargetKey: proto.TargetKey{InboundKind: "xray", InboundID: 5, Path: "proxy"}, Protocol: "vmess", Link: vmessLink()},
 		}},

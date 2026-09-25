@@ -1411,3 +1411,144 @@ func TestHeartbeat_MissingAwgRowOnlyWhereAPeerIsOwed(t *testing.T) {
 		})
 	}
 }
+
+// --- Paths by chain (spec §5.1, decision #61) ---
+
+var (
+	keyEdgeA = registry.TargetKey{InboundKind: store.InboundKindXray, InboundID: 12, Path: "edge:edge-a"}
+	keyEdgeB = registry.TargetKey{InboundKind: store.InboundKindXray, InboundID: 12, Path: "edge:edge-b"}
+	keyInner = registry.TargetKey{InboundKind: store.InboundKindXray, InboundID: 12, Path: "inner:core-1"}
+)
+
+// chained describes a chained panel serving direct and the given hop
+// paths, where inbounds xray:12 and awg:0 are enabled and the mon-client
+// probes probed (spec §5.1).
+func chained(served []string, probed ...string) registry.Exclusions {
+	x := awgExclusions(true, probed...)
+	x.Served = map[string]bool{store.PathDirect: true}
+	for _, p := range served {
+		x.Served[p] = true
+	}
+	return x
+}
+
+// targetGone fails unless key has no row.
+func (f *fixture) targetGone(key registry.TargetKey) {
+	f.t.Helper()
+	var n int64
+	f.st.DB.Model(&store.Target{}).Where("mon_client_id = ? AND inbound_kind = ? AND inbound_id = ? AND path = ?",
+		f.mc.Id, key.InboundKind, key.InboundID, key.Path).Count(&n)
+	if n != 0 {
+		f.t.Fatalf("target %+v still has a row, want it removed", key)
+	}
+}
+
+// TestSyncPaths_RemovesTargetsSilently is decision #61 п. 6, 9: the
+// targets of a path the panel no longer serves — a hop that was removed,
+// renamed or left joined/legacy, or proxy once a hop is probed — are
+// deleted for every mon-client, whatever their state, without an event;
+// served paths are untouched.
+func TestSyncPaths_RemovesTargetsSilently(t *testing.T) {
+	f := newFixture(t)
+	f.cfg.keys = []registry.TargetKey{keyProxy, keyDirect, keyEdgeA, keyEdgeB}
+	f.clk.Advance(time.Minute)
+	f.beat(f.cycle(1, result(keyProxy, true, ""), result(keyDirect, true, ""), result(keyEdgeA, true, ""), result(keyEdgeB, false, "tcp_timeout")))
+	other := store.Target{MonClientId: "fra-1", InboundKind: store.InboundKindXray, InboundId: 12, Path: "edge:edge-b", State: store.TargetPaused}
+	if err := f.st.DB.Create(&other).Error; err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	before := len(f.events())
+
+	if err := f.e.SyncPaths(context.Background(), []string{store.PathDirect, "edge:edge-a"}); err != nil {
+		t.Fatalf("SyncPaths: %v", err)
+	}
+	f.targetGone(keyProxy)
+	f.targetGone(keyEdgeB)
+	var n int64
+	f.st.DB.Model(&store.Target{}).Where("mon_client_id = ?", "fra-1").Count(&n)
+	if n != 0 {
+		t.Fatal("another mon-client's target of the retired hop survived")
+	}
+	if got := f.targetState(keyEdgeA); got.State != store.TargetUp {
+		t.Fatalf("served hop target = %s, want UP untouched", got.State)
+	}
+	if got := f.targetState(keyDirect); got.State != store.TargetUp {
+		t.Fatalf("direct target = %s, want UP untouched", got.State)
+	}
+	if evs := f.events(); len(evs) != before {
+		t.Fatalf("SyncPaths filed events: %+v", evs[before:])
+	}
+
+	// An empty set is no answer, not "the panel serves nothing".
+	if err := f.e.SyncPaths(context.Background(), nil); err != nil {
+		t.Fatalf("SyncPaths(nil): %v", err)
+	}
+	f.targetState(keyDirect)
+}
+
+// TestHeartbeat_RetiredPathIsRemovedAndRejoinStartsUnknown covers the
+// heartbeat side of spec §5.1: a row whose path the panel stopped serving
+// (here a hop that went pending, and proxy after the chain appeared) is
+// removed on the next heartbeat without an event — never PAUSED — and the
+// hop coming back starts over from a fresh UNKNOWN row.
+func TestHeartbeat_RetiredPathIsRemovedAndRejoinStartsUnknown(t *testing.T) {
+	f := newFixture(t)
+	f.saveInbound(store.InboundKindXray, 12, true)
+	f.cfg.keys = []registry.TargetKey{keyProxy, keyDirect, keyEdgeA}
+	f.cfg.excl = chained([]string{store.PathProxy, "edge:edge-a"}, store.PathProxy, store.PathDirect, "edge:edge-a")
+	f.clk.Advance(time.Minute)
+	f.beat(f.cycle(1, result(keyProxy, true, ""), result(keyDirect, true, ""), result(keyEdgeA, true, "")))
+	before := len(f.events())
+
+	// edge-a goes pending, and the chain has a probed hop: proxy is gone.
+	f.cfg.keys = []registry.TargetKey{keyDirect, keyInner}
+	f.cfg.excl = chained([]string{"inner:core-1"}, store.PathDirect, "inner:core-1")
+	f.clk.Advance(time.Minute)
+	f.beat(f.cycle(2, result(keyDirect, true, ""), result(keyEdgeA, true, "")))
+	f.targetGone(keyProxy)
+	f.targetGone(keyEdgeA)
+	for _, ev := range f.events()[before:] {
+		if ev.Path == store.PathProxy || ev.Path == keyEdgeA.Path {
+			t.Fatalf("an event was filed for a retired path: %+v", ev)
+		}
+	}
+
+	// edge-a joins again: a new row, from UNKNOWN.
+	f.cfg.keys = []registry.TargetKey{keyDirect, keyInner, keyEdgeA}
+	f.cfg.excl = chained([]string{"inner:core-1", "edge:edge-a"}, store.PathDirect, "inner:core-1", "edge:edge-a")
+	f.clk.Advance(time.Minute)
+	f.beat(f.cycle(3, result(keyEdgeA, false, "tcp_timeout")))
+	if got := f.targetState(keyEdgeA); got.State != store.TargetUnknown || got.ConsecutiveFail != 1 {
+		t.Fatalf("rejoined hop target = %s (fails %d), want a fresh UNKNOWN with one failure", got.State, got.ConsecutiveFail)
+	}
+}
+
+// TestHeartbeat_HopPathsPauseLikeAnyPath checks that a served hop behaves
+// as any other path for the config pauses of decision #51 §3: taken off the
+// mon-client it is path_removed, and an AWG target on a hop the panel gave
+// this mon-client no peer for (monProbePeerLimit, decision #61 п. 4) is
+// PAUSED no_probe_link from the first heartbeat.
+func TestHeartbeat_HopPathsPauseLikeAnyPath(t *testing.T) {
+	awgInner := registry.TargetKey{InboundKind: store.InboundKindAwg, InboundID: 0, Path: "inner:core-1"}
+	f := newFixture(t)
+	f.saveInbound(store.InboundKindXray, 12, true)
+	f.saveInbound(store.InboundKindAwg, 0, true)
+	served := []string{"edge:edge-a", "inner:core-1"}
+	f.cfg.keys = []registry.TargetKey{keyDirect, keyEdgeA, keyInner}
+	f.cfg.excl = chained(served, store.PathDirect, "edge:edge-a", "inner:core-1")
+	f.clk.Advance(time.Minute)
+	f.beat(f.cycle(1, result(keyDirect, true, ""), result(keyEdgeA, true, ""), result(keyInner, true, "")))
+
+	if got := f.targetState(awgInner); got.State != store.TargetPaused || got.Reason != ReasonNoProbeLink {
+		t.Fatalf("awg inner target = %s/%s, want PAUSED/no_probe_link (no peer, limit)", got.State, got.Reason)
+	}
+
+	// The administrator narrows the box to edge-a.
+	f.cfg.keys = []registry.TargetKey{keyDirect, keyEdgeA}
+	f.cfg.excl = chained(served, store.PathDirect, "edge:edge-a")
+	f.clk.Advance(time.Minute)
+	f.beat(f.cycle(2))
+	if got := f.targetState(keyInner); got.State != store.TargetPaused || got.Reason != ReasonPathRemoved {
+		t.Fatalf("inner target = %s/%s, want PAUSED/path_removed", got.State, got.Reason)
+	}
+}

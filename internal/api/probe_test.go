@@ -185,6 +185,10 @@ func TestProbe_BadRequests(t *testing.T) {
 		{"malformed target: bad path", "xray:12:sideways", "n"},
 		{"malformed target: non-numeric inbound id", "xray:abc:proxy", "n"},
 		{"malformed target: negative inbound id", "xray:-1:proxy", "n"},
+		{"malformed target: hops is not a path", "xray:12:hops", "n"},
+		{"malformed target: hop without a name", "xray:12:edge:", "n"},
+		{"malformed target: unknown hop role", "xray:12:middle:ams-1", "n"},
+		{"malformed target: hop name out of grammar", "xray:12:edge:AMS_1", "n"},
 		{"missing nonce", "xray:12:proxy", ""},
 		{"oversized nonce", "xray:12:proxy", strings.Repeat("a", maxNonceLen+1)},
 	}
@@ -254,3 +258,27 @@ var errTargetKeysBoom = &boomError{"boom"}
 type boomError struct{ s string }
 
 func (e *boomError) Error() string { return e.s }
+
+// TestProbe_HopPathTarget is protocol §5.2 with a per-hop path: the key is
+// split into at most three parts, so edge:<name> and inner:<name> survive
+// whole — the ':' inside them is not a fourth part — and are matched
+// against the config's targets like any other path.
+func TestProbe_HopPathTarget(t *testing.T) {
+	for _, path := range []string{"edge:ams-1", "inner:core-1"} {
+		mc := &store.MonClient{Id: "ams-1"}
+		keys := stubTargetKeys{keys: []registry.TargetKey{{InboundKind: "awg", InboundID: 0, Path: path}}}
+		s, st := newProbeTestServer(t, stubAuthenticator{client: mc}, keys)
+
+		rec := getProbe(s, "tok", "awg:0:"+path, "n1")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s: status = %d, body=%s", path, rec.Code, rec.Body.String())
+		}
+		var rows []store.ProbeSeen
+		if err := st.DB.Find(&rows).Error; err != nil {
+			t.Fatalf("read probe_seen: %v", err)
+		}
+		if len(rows) != 1 || rows[0].Path != path || rows[0].UnknownTarget {
+			t.Fatalf("%s: probe_seen = %+v, want one known row with the whole hop path", path, rows)
+		}
+	}
+}
