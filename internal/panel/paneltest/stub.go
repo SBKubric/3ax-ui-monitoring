@@ -15,15 +15,20 @@
 // mon-server must never send (a mon_client transition from NEVER) fails a
 // test instead of a production panel.
 //
-// It speaks contract 2 by default (decision #80): AWG items carry the
+// It speaks contract 3 by default (decisions #80, #61): AWG items carry the
 // monClientId of the mon-client whose probe peer they are, xray items do
-// not, the revision covers the probe material as well as the state, and
-// ensure may name the mon-clients left without a peer (unallocated).
-// SetContract(1) turns it into an older panel for the refusal tests. It is
-// deliberately lax about
-// everything else — it does not create probe accounts, it does not check
-// reasons, ids or timestamps — because those are the panel's job, not what
-// mon-server's tests need to pin.
+// not, the revision covers the probe material and the chain as well as the
+// state, GET /state carries the chain registry's probed hops (SetChain),
+// ?hop= renders one hop's path and answers the contract's 409s for a hop
+// that is unknown or not joined, the ensure snapshot's paths are checked
+// against the vocabulary, and ensure may name the pairs left without a
+// peer with their reasons (unallocated). SetContract turns it into an older
+// or newer panel for the refusal tests. It is deliberately lax about
+// everything else — it does not create probe accounts, it does not expand
+// paths or enforce monProbePeerLimit, it does not check reasons, ids or
+// timestamps — because those are the panel's job, not what mon-server's
+// tests need to pin: a test programs the items and the unallocated list it
+// wants.
 package paneltest
 
 import (
@@ -96,7 +101,22 @@ var (
 	// pathRe is the path grammar: direct, proxy, or a chain hop by name
 	// (proxy-chain §6, hop names [a-z0-9-]{1,32}).
 	pathRe = regexp.MustCompile(`^(direct|proxy|(edge|inner):[a-z0-9-]{1,32})$`)
+
+	// vocabularyRe is the ensure snapshot's paths vocabulary (contract 3
+	// §4.3): direct, hops, or one hop by name — never proxy, which left the
+	// vocabulary for hops.
+	vocabularyRe = regexp.MustCompile(`^(direct|hops|(edge|inner):[a-z0-9-]{1,32})$`)
 )
+
+// Hop is one hop of the stub's chain registry — the panel's whole
+// registry, pending and draining hops included, of which GET /state reports
+// only the joined and legacy ones (contract 3 §4.1).
+type Hop struct {
+	Name  string
+	Role  string
+	Host  string
+	State string
+}
 
 // RecordedRequest is one request the stub received, kept whether or not it
 // was answered successfully — a test asserting "only the direct path was
@@ -123,6 +143,8 @@ type routeFailure struct {
 	skip   int
 	n      int
 	status int
+	// code is the error code to answer with; "" is injectedCode's.
+	code string
 }
 
 // Stub is a programmable panel. Every knob is mutex-protected because the
@@ -139,9 +161,13 @@ type Stub struct {
 	override   panel.Override
 	probeSubID *string
 
+	chain         []Hop
+	activeEdge    string
+	chainRevision int64
+
 	lastEnsured int64
 	items       map[string][]panel.ProbeItem
-	unallocated []string
+	unallocated []panel.Unallocated
 	configsRev  string // forced revision for /probe/configs; "" = the real one
 
 	requests   []RecordedRequest
@@ -252,8 +278,8 @@ func (s *Stub) SetProbeSubID(id *string) {
 	s.probeSubID = &v
 }
 
-// SetItems programs what GET /probe/configs returns for one path, "proxy" or
-// "direct".
+// SetItems programs what GET /probe/configs returns for one path: "proxy",
+// "direct", or a hop's "edge:<name>"/"inner:<name>".
 func (s *Stub) SetItems(path string, items []panel.ProbeItem) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -269,14 +295,28 @@ func (s *Stub) SetContract(v int) {
 	s.contract = v
 }
 
-// SetUnallocated programs the mon-clients POST /probe/ensure reports as
-// left without an AWG probe peer (decision #80 п. 10: the panel's address
-// pool is exhausted). The stub does not drop their items itself: a test
-// programs the items it wants with SetItems, as for every other answer.
-func (s *Stub) SetUnallocated(ids []string) {
+// SetUnallocated programs the pairs POST /probe/ensure reports as left
+// without an AWG probe peer (decisions #80 п. 10, #61 п. 12: the address
+// pool is exhausted, or monProbePeerLimit is reached). The stub does not
+// drop their items itself: a test programs the items it wants with
+// SetItems, as for every other answer.
+func (s *Stub) SetUnallocated(list []panel.Unallocated) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.unallocated = append([]string(nil), ids...)
+	s.unallocated = append([]panel.Unallocated(nil), list...)
+}
+
+// SetChain replaces the chain registry and the active edge ("" for none),
+// which bumps chain.revision and — through the active edge and the probed
+// hops — the contract revision (contract 3 §4.2). hops is the registry in
+// chain order; an empty one is a panel without a chain, whose /state has no
+// chain field.
+func (s *Stub) SetChain(activeEdge string, hops []Hop) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.chain = append([]Hop(nil), hops...)
+	s.activeEdge = activeEdge
+	s.chainRevision++
 }
 
 // AwgItem is one path's AWG item for one mon-client, the contract-2 shape
@@ -357,6 +397,15 @@ func (s *Stub) FailNextOnAfter(route string, skip, n, status int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.failRoutes[route] = routeFailure{skip: skip, n: n, status: status}
+}
+
+// FailNextOnWith is FailNextOnAfter answering with the panel's own error
+// code instead of the generic one for the status — a 409 unknown_hop from
+// ?hop=, say, which a caller tells apart from any other 409 by its code.
+func (s *Stub) FailNextOnWith(route string, skip, n, status int, code string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.failRoutes[route] = routeFailure{skip: skip, n: n, status: status, code: code}
 }
 
 // DropNext hijacks and closes the connection for the next n requests,
@@ -491,17 +540,51 @@ func (s *Stub) revisionLocked() string {
 		subID = *s.probeSubID
 	}
 
-	raw, err := json.Marshal(map[string]any{
+	doc := map[string]any{
 		"override":   map[string]any{"enabled": s.override.Enabled, "host": s.override.Host},
 		"inbounds":   ins,
 		"probeSubId": subID,
 		"items":      s.items,
-	})
+	}
+	if chain := s.chainLocked(); chain != nil {
+		// Contract 3 §4.2: the active edge and the hops, not the registry's
+		// own revision counter.
+		doc["chain"] = map[string]any{"activeEdge": chain.ActiveEdge, "hops": chain.Hops}
+	}
+	raw, err := json.Marshal(doc)
 	if err != nil {
 		panic("paneltest: canonical revision document is not marshallable: " + err.Error())
 	}
 	sum := sha256.Sum256(raw)
 	return hex.EncodeToString(sum[:])[:revisionHexLen]
+}
+
+// chainLocked is the chain as GET /state reports it (contract 3 §4.1), nil
+// while the registry is empty: the joined and legacy hops, inner ones first
+// in registry order, then the edges by name.
+func (s *Stub) chainLocked() *panel.Chain {
+	if len(s.chain) == 0 {
+		return nil
+	}
+	var inner, edge []panel.Hop
+	for _, h := range s.chain {
+		if h.State != panel.HopJoined && h.State != panel.HopLegacy {
+			continue
+		}
+		ph := panel.Hop{Name: h.Name, Role: h.Role, Host: h.Host, State: h.State}
+		if h.Role == store.HopRoleInner {
+			inner = append(inner, ph)
+		} else {
+			edge = append(edge, ph)
+		}
+	}
+	sort.SliceStable(edge, func(i, j int) bool { return edge[i].Name < edge[j].Name })
+	c := &panel.Chain{Revision: s.chainRevision, Hops: append(append([]panel.Hop{}, inner...), edge...)}
+	if s.activeEdge != "" {
+		active := s.activeEdge
+		c.ActiveEdge = &active
+	}
+	return c
 }
 
 // serve is the whole stub: record, injected failures, auth, route. The order
@@ -529,7 +612,7 @@ func (s *Stub) serve(w http.ResponseWriter, r *http.Request) {
 	if drop {
 		s.dropN--
 	}
-	failStatus := 0
+	failStatus, failCode := 0, ""
 	if !drop && s.failN > 0 {
 		s.failN--
 		failStatus = s.failStatus
@@ -544,7 +627,7 @@ func (s *Stub) serve(w http.ResponseWriter, r *http.Request) {
 				case rf.n > 0:
 					rf.n--
 					s.failRoutes[route] = rf
-					failStatus = rf.status
+					failStatus, failCode = rf.status, rf.code
 				}
 			}
 		}
@@ -581,7 +664,10 @@ func (s *Stub) serve(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
-		writeErr(w, failStatus, injectedCode(failStatus), "injected failure")
+		if failCode == "" {
+			failCode = injectedCode(failStatus)
+		}
+		writeErr(w, failStatus, failCode, "injected failure")
 		return
 	}
 	if badBody {
@@ -615,7 +701,7 @@ func (s *Stub) serve(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodPost && route == "/probe/ensure":
 		s.handleEnsure(w, body)
 	case r.Method == http.MethodGet && route == "/probe/configs":
-		s.handleConfigs(w, r.URL.Query().Get("host"))
+		s.handleConfigs(w, r.URL.Query())
 	case r.Method == http.MethodDelete && route == "/probe":
 		s.handleProbeDelete(w)
 	case r.Method == http.MethodPost && route == "/events":
@@ -642,6 +728,7 @@ func (s *Stub) handleState(w http.ResponseWriter) {
 		ServerTime:   nowMs(),
 		Revision:     s.revisionLocked(),
 		Override:     s.override,
+		Chain:        s.chainLocked(),
 		Probe:        panel.Probe{SubId: s.probeSubID, LastEnsured: s.lastEnsured},
 		Inbounds:     append([]panel.Inbound(nil), s.inbounds...),
 	}
@@ -664,6 +751,15 @@ func (s *Stub) handleEnsure(w http.ResponseWriter, body []byte) {
 			fmt.Sprintf("monClients has %d elements, limit %d", len(in.MonClients), maxMonClients))
 		return
 	}
+	for i, mc := range in.MonClients {
+		for _, p := range mc.Paths {
+			if !vocabularyRe.MatchString(p) {
+				writeErr(w, http.StatusBadRequest, "invalid_body",
+					fmt.Sprintf("monClients[%d].paths: unknown value %q", i, p))
+				return
+			}
+		}
+	}
 
 	s.mu.Lock()
 	if s.probeSubID == nil {
@@ -679,14 +775,14 @@ func (s *Stub) handleEnsure(w http.ResponseWriter, body []byte) {
 		LastEnsured: s.lastEnsured,
 		Created:     []panel.InboundRef{},
 		Present:     len(s.inbounds),
-		Unallocated: append([]string(nil), s.unallocated...),
+		Unallocated: append([]panel.Unallocated(nil), s.unallocated...),
 	}
 	s.mu.Unlock()
 
 	writeJSON(w, http.StatusOK, res)
 }
 
-func (s *Stub) handleConfigs(w http.ResponseWriter, host string) {
+func (s *Stub) handleConfigs(w http.ResponseWriter, q url.Values) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -695,10 +791,33 @@ func (s *Stub) handleConfigs(w http.ResponseWriter, host string) {
 		return
 	}
 
+	hop, edge := q.Get("hop"), q.Get("edge")
 	path := "proxy"
-	if host != "" {
+	switch {
+	case hop != "" || edge != "":
+		// Contract 3 §4.4: ?edge= is a synonym of ?hop=, and naming two
+		// different hops is as unknown as naming none that exists.
+		name := hop
+		if name == "" {
+			name = edge
+		}
+		if hop != "" && edge != "" && hop != edge {
+			writeErr(w, http.StatusConflict, "unknown_hop", "hop and edge name different hops")
+			return
+		}
+		h, ok := s.hopLocked(name)
+		if !ok {
+			writeErr(w, http.StatusConflict, "unknown_hop", "no hop "+name+" in the chain registry")
+			return
+		}
+		if h.State != panel.HopJoined && h.State != panel.HopLegacy {
+			writeErr(w, http.StatusConflict, "hop_not_joined", "hop "+name+" is "+h.State)
+			return
+		}
+		path = store.HopPath(h.Role, h.Name)
+	case q.Get("host") != "":
 		path = "direct"
-	} else if !s.override.Enabled {
+	case !s.override.Enabled:
 		// Contract §4.4: without the override there is no proxy front to
 		// render configs for, so the proxy path simply does not exist.
 		writeErr(w, http.StatusConflict, "override_disabled", "host override is off")
@@ -715,6 +834,16 @@ func (s *Stub) handleConfigs(w http.ResponseWriter, host string) {
 	}
 
 	writeJSON(w, http.StatusOK, panel.ProbeConfigs{Revision: rev, Path: path, Items: items})
+}
+
+// hopLocked finds a hop of the registry by name, whatever its state.
+func (s *Stub) hopLocked(name string) (Hop, bool) {
+	for _, h := range s.chain {
+		if h.Name == name {
+			return h, true
+		}
+	}
+	return Hop{}, false
 }
 
 func (s *Stub) handleProbeDelete(w http.ResponseWriter) {

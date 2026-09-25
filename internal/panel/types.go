@@ -15,14 +15,18 @@
 // is ignored, never rejected.
 package panel
 
-// RequiredContract is the lowest monitoring contract version mon-server can
-// work with (decision #80 п. 9). Contract 2 is the per-peer probe set: an
-// AWG probe peer per mon-client × path, handed out by GET /probe/configs as
-// one item per mon-client carrying its monClientId. A contract-1 panel
-// hands out one shared AWG peer that the paths and mon-clients steal from
-// each other, so mon-server refuses to build targets from it rather than
-// monitor with a probe that is guaranteed to fail on one side.
-const RequiredContract = 2
+import "github.com/SBKubric/3ax-ui-monitoring/internal/store"
+
+// RequiredContract is the monitoring contract version mon-server speaks,
+// matched exactly (decisions #80 п. 9, #61 п. 5): the panel and mon-server
+// are updated together, and a panel on any other version builds no targets.
+// Contract 2 is the per-peer probe set (an AWG probe peer per mon-client ×
+// path); contract 3 adds the proxy chain — chain in GET /state and its
+// revision, ?hop= on GET /probe/configs, paths in the ensure snapshot and
+// unallocated reasons — without which the per-hop targets of spec §5.1
+// cannot be built. An older panel would be probed without its hops, a
+// newer one by rules this build does not know.
+const RequiredContract = 3
 
 // Inbound is one sanitised inbound from GET /state (contract §4.1): the
 // panel never sends settings, stream settings or keys here, only what
@@ -65,16 +69,79 @@ type Probe struct {
 	LastEnsured int64   `json:"lastEnsured"`
 }
 
+// Hop is one hop of the proxy chain in GET /state (contract 3 §4.1,
+// CONTEXT.md: Hop): its name in the chain registry, its role — "edge" or
+// "inner" — the address the panel renders its probe links with, and its
+// registry state. The panel lists only joined and legacy hops, the ones
+// that are probed.
+type Hop struct {
+	Name  string `json:"name"`
+	Role  string `json:"role"`
+	Host  string `json:"host"`
+	State string `json:"state"`
+}
+
+// Path is the hop's path, edge:<name> or inner:<name> (spec §5.1).
+func (h Hop) Path() string { return store.HopPath(h.Role, h.Name) }
+
+// Hop registry states the panel probes (contract 3 §4.1); pending and
+// draining hops are not in GET /state at all.
+const (
+	HopJoined = "joined"
+	HopLegacy = "legacy"
+)
+
+// Chain is the panel's chain registry as GET /state reports it (contract 3
+// §4.1). Revision is the registry's own counter, separate from the
+// contract revision; mon-server does not track it, because the contract
+// revision covers the active edge and the hops already (spec §4 step 3).
+// ActiveEdge is nil when no edge is active, and may name an edge that is
+// not among Hops (an active edge pending after reissueToken — the known gap
+// of spec §5.1).
+type Chain struct {
+	Revision   int64   `json:"revision"`
+	ActiveEdge *string `json:"activeEdge"`
+	Hops       []Hop   `json:"hops"`
+}
+
+// ProbedHops is the hops mon-server probes, in the panel's order (inner
+// ones from the panel outwards, then the edges by name): the joined and
+// legacy ones whose role and name are by the grammar. The panel sends no
+// others; anything else is skipped rather than turned into a path the
+// admin UI and the panel would disagree on. A nil chain has none.
+func (c *Chain) ProbedHops() []Hop {
+	if c == nil {
+		return nil
+	}
+	out := make([]Hop, 0, len(c.Hops))
+	for _, h := range c.Hops {
+		if (h.State != HopJoined && h.State != HopLegacy) || !store.IsHopPath(h.Path()) {
+			continue
+		}
+		out = append(out, h)
+	}
+	return out
+}
+
+// Active is the active edge's name, "" when there is none.
+func (c *Chain) Active() string {
+	if c == nil || c.ActiveEdge == nil {
+		return ""
+	}
+	return *c.ActiveEdge
+}
+
 // State is the GET /state body (contract §4.1): the panel's whole
 // configuration as far as monitoring is concerned, plus the Revision that
 // tells mon-server whether anything it cares about has changed since the
-// last poll.
+// last poll. Chain is nil while the panel's chain registry is empty.
 type State struct {
 	Contract     int       `json:"contract"`
 	PanelVersion string    `json:"panelVersion"`
 	ServerTime   int64     `json:"serverTime"`
 	Revision     string    `json:"revision"`
 	Override     Override  `json:"override"`
+	Chain        *Chain    `json:"chain,omitempty"`
 	Probe        Probe     `json:"probe"`
 	Inbounds     []Inbound `json:"inbounds"`
 	Stale        struct {
@@ -86,12 +153,27 @@ type State struct {
 // (contract §4.3, the panel's MonClient). The panel treats State as opaque:
 // it never recomputes it, so this is purely mon-server reporting what it
 // believes, and a full snapshot replaces the panel's cache on every ensure.
+//
+// Paths is the mon-client's paths vocabulary as stored (contract 3, spec
+// §5.1: direct, hops, explicit hops): the panel expands it by its probed
+// path set and keeps an AWG probe peer only for the pairs the mon-client
+// really probes.
 type MonClientSnapshot struct {
-	Id            string `json:"id"`
-	Name          string `json:"name"`
-	Region        string `json:"region"`
-	State         string `json:"state"`
-	LastHeartbeat int64  `json:"lastHeartbeat"`
+	Id            string   `json:"id"`
+	Name          string   `json:"name"`
+	Region        string   `json:"region"`
+	State         string   `json:"state"`
+	LastHeartbeat int64    `json:"lastHeartbeat"`
+	Paths         []string `json:"paths"`
+}
+
+// Unallocated is one pair POST /probe/ensure left without an AWG probe peer
+// (contract 3 §4.3): the mon-client, the path and the panel's reason —
+// store.UnallocatedPoolExhausted or store.UnallocatedLimit.
+type Unallocated struct {
+	MonClientId string `json:"monClientId"`
+	Path        string `json:"path"`
+	Reason      string `json:"reason"`
 }
 
 // EnsureResult is the POST /probe/ensure body (contract §4.3). Created is
@@ -99,18 +181,19 @@ type MonClientSnapshot struct {
 // an inbound appears — and Present is the size of the probe set afterwards,
 // which an operator can compare against the inbound count.
 //
-// Unallocated (contract 2, decision #80 п. 10) lists the mon-clients the
-// panel could not give an AWG probe peer because its address pool is
-// exhausted. The ensure still succeeds; those mon-clients simply get no AWG
-// item from GET /probe/configs, and their AWG targets go PAUSED
+// Unallocated (contract 3, decisions #80 п. 10, #61 п. 12) lists the
+// mon-client × path pairs the panel gave no AWG probe peer, with the
+// reason: its address pool is exhausted, or the pair is past its
+// monProbePeerLimit. The ensure still succeeds; those pairs simply get no
+// AWG item from GET /probe/configs, and their AWG targets go PAUSED
 // no_probe_link. The field may be absent, which means none.
 type EnsureResult struct {
-	SubId       string       `json:"subId"`
-	Revision    string       `json:"revision"`
-	LastEnsured int64        `json:"lastEnsured"`
-	Created     []InboundRef `json:"created"`
-	Present     int          `json:"present"`
-	Unallocated []string     `json:"unallocated,omitempty"`
+	SubId       string        `json:"subId"`
+	Revision    string        `json:"revision"`
+	LastEnsured int64         `json:"lastEnsured"`
+	Created     []InboundRef  `json:"created"`
+	Present     int           `json:"present"`
+	Unallocated []Unallocated `json:"unallocated,omitempty"`
 }
 
 // ProbeItem is the material for one inbound on one path (contract §4.4):

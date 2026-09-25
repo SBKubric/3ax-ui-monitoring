@@ -76,8 +76,15 @@
       <div class="fi">
         <label>Paths this mon-client probes</label>
         <div>
-          <a-checkbox v-model:checked="modal.proxy" data-testid="approve-path-proxy">proxy</a-checkbox>
-          <a-checkbox v-model:checked="modal.direct" data-testid="approve-path-direct">direct</a-checkbox>
+          <a-checkbox v-model:checked="modal.paths.direct" data-testid="approve-path-direct">direct</a-checkbox>
+          <a-checkbox v-model:checked="modal.paths.hops" data-testid="approve-path-hops">hops</a-checkbox>
+        </div>
+        <div v-if="!modal.paths.hops" data-testid="approve-path-hop-list">
+          <a-checkbox-group v-model:value="modal.paths.named">
+            <a-checkbox v-for="o in hopOptions(modal.paths.named)" :key="o.value" :value="o.value"
+                        :data-path="o.value"><span data-testid="approve-path-hop">[[ o.label ]]</span></a-checkbox>
+          </a-checkbox-group>
+          <div class="muted tiny" v-if="!hopOptions(modal.paths.named).length">[[ strings.noHops ]]</div>
         </div>
         <div class="muted tiny">[[ strings.pathsHint ]]</div>
       </div>

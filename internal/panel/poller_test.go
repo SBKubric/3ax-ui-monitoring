@@ -43,14 +43,49 @@ func (f *fakeConfigs) calls() int {
 
 // fakeSnapshot stands in for internal/registry (step 4).
 type fakeSnapshot struct {
-	mu    sync.Mutex
-	items []panel.MonClientSnapshot
+	mu          sync.Mutex
+	items       []panel.MonClientSnapshot
+	unallocated [][]panel.Unallocated
 }
 
 func (f *fakeSnapshot) Snapshot(context.Context) ([]panel.MonClientSnapshot, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]panel.MonClientSnapshot(nil), f.items...), nil
+}
+
+func (f *fakeSnapshot) SaveUnallocated(_ context.Context, list []panel.Unallocated) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.unallocated = append(f.unallocated, append([]panel.Unallocated(nil), list...))
+	return nil
+}
+
+// saved is every list SaveUnallocated was handed, one per successful ensure.
+func (f *fakeSnapshot) saved() [][]panel.Unallocated {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([][]panel.Unallocated(nil), f.unallocated...)
+}
+
+// fakePaths stands in for internal/state's removal of the targets of
+// paths the panel stopped serving (spec §5.1).
+type fakePaths struct {
+	mu   sync.Mutex
+	seen [][]string
+}
+
+func (f *fakePaths) SyncPaths(_ context.Context, served []string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.seen = append(f.seen, append([]string(nil), served...))
+	return nil
+}
+
+func (f *fakePaths) calls() [][]string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([][]string(nil), f.seen...)
 }
 
 // fakeInbounds stands in for internal/state's inbound sync (step 6).
@@ -103,6 +138,7 @@ type harness struct {
 	configs  *fakeConfigs
 	inbounds *fakeInbounds
 	snapshot *fakeSnapshot
+	paths    *fakePaths
 	stats    *fakeStats
 }
 
@@ -127,6 +163,7 @@ func newHarnessOn(t *testing.T, stub *paneltest.Stub, opts ...panel.Option) *har
 		configs:  &fakeConfigs{},
 		inbounds: &fakeInbounds{},
 		snapshot: &fakeSnapshot{},
+		paths:    &fakePaths{},
 		stats:    &fakeStats{},
 	}
 
@@ -157,6 +194,7 @@ func newHarnessOn(t *testing.T, stub *paneltest.Stub, opts ...panel.Option) *har
 		Snapshot: h.snapshot,
 		Configs:  h.configs,
 		Inbounds: h.inbounds,
+		Paths:    h.paths,
 		Stats:    h.stats,
 		NewClient: func(baseURL, token string, rootCAs *x509.CertPool) panel.Client {
 			all := append([]panel.Option{panel.WithSleeper(func(context.Context, time.Duration) error { return nil }), panel.WithRootCAs(rootCAs)}, opts...)
@@ -508,6 +546,7 @@ func TestPoll_TelegramSendFailureDoesNotBreakCycle(t *testing.T) {
 		Snapshot: h.snapshot,
 		Configs:  h.configs,
 		Inbounds: h.inbounds,
+		Paths:    h.paths,
 		Stats:    h.stats,
 		NewClient: func(baseURL, token string, _ *x509.CertPool) panel.Client {
 			return panel.NewHTTPClient(baseURL, token, h.clk, panel.WithSleeper(func(context.Context, time.Duration) error { return nil }))
@@ -1396,16 +1435,24 @@ func TestRefreshMaterial_UnconfiguredPanelSaysSo(t *testing.T) {
 	}
 }
 
-// TestPoll_ContractOneIsRefused is decision #80 п. 9: a panel on contract 1
+// TestPoll_ContractMismatchIsRefused is decision #80 п. 9: a panel on contract 1
 // (or one whose /state has no contract at all) hands out one shared AWG
 // probe peer, so mon-server builds nothing from it — no ensure, no inbound
 // sync, no probe configs, no rebuild — and says why, in the cycle's error
 // and in ContractError for the Settings page. The outbox is still drained,
 // the panel is not declared down, and a panel that is updated is picked up
 // on the next cycle.
-func TestPoll_ContractOneIsRefused(t *testing.T) {
-	const want = "panel speaks monitoring contract 1, mon-server needs 2 — update the panel"
-	for _, contract := range []int{1, 0} {
+func TestPoll_ContractMismatchIsRefused(t *testing.T) {
+	for _, tc := range []struct {
+		contract int
+		want     string
+	}{
+		{0, "panel speaks monitoring contract 1, mon-server needs 3 — update the panel"},
+		{1, "panel speaks monitoring contract 1, mon-server needs 3 — update the panel"},
+		{2, "panel speaks monitoring contract 2, mon-server needs 3 — update the panel"},
+		{4, "panel speaks monitoring contract 4, mon-server needs 3 — update mon-server"},
+	} {
+		contract, want := tc.contract, tc.want
 		t.Run(fmt.Sprintf("contract %d", contract), func(t *testing.T) {
 			h := newHarness(t)
 			h.stub.SetContract(contract)
@@ -1413,8 +1460,8 @@ func TestPoll_ContractOneIsRefused(t *testing.T) {
 			ctx := context.Background()
 
 			err := h.poller.Poll(ctx)
-			if !errors.Is(err, panel.ErrContractTooOld) || err.Error() != want {
-				t.Fatalf("Poll = %v, want ErrContractTooOld %q", err, want)
+			if !errors.Is(err, panel.ErrContractMismatch) || err.Error() != want {
+				t.Fatalf("Poll = %v, want ErrContractMismatch %q", err, want)
 			}
 			if got := h.poller.ContractError(); got != want {
 				t.Fatalf("ContractError() = %q, want %q", got, want)
@@ -1425,7 +1472,7 @@ func TestPoll_ContractOneIsRefused(t *testing.T) {
 				}
 			}
 			if _, ok := h.poller.Material(); ok {
-				t.Fatal("material accepted from a contract-1 panel")
+				t.Fatal("material accepted from a panel on another contract")
 			}
 			if h.configs.calls() != 0 || len(h.inbounds.calls()) != 0 {
 				t.Fatalf("rebuilds=%d inbound syncs=%d, want none", h.configs.calls(), len(h.inbounds.calls()))
@@ -1438,8 +1485,8 @@ func TestPoll_ContractOneIsRefused(t *testing.T) {
 			}
 
 			// RefreshMaterial (Settings Save) refuses the same way.
-			if err := h.poller.RefreshMaterial(ctx); !errors.Is(err, panel.ErrContractTooOld) {
-				t.Fatalf("RefreshMaterial = %v, want ErrContractTooOld", err)
+			if err := h.poller.RefreshMaterial(ctx); !errors.Is(err, panel.ErrContractMismatch) {
+				t.Fatalf("RefreshMaterial = %v, want ErrContractMismatch", err)
 			}
 
 			// The panel is updated: the next cycle builds as usual.
@@ -1457,10 +1504,12 @@ func TestPoll_ContractOneIsRefused(t *testing.T) {
 	}
 }
 
-// TestPoll_ContractTwoPerClientAwgItems runs a contract-2 panel through the
-// cycle: the AWG items of several mon-clients come back each with its
+// TestPoll_ContractTwoPerClientAwgItems runs the per-peer probe set through
+// the cycle: the AWG items of several mon-clients come back each with its
 // monClientId, a peer set change moves the revision and is re-read, and an
-// ensure that lists unallocated mon-clients is an ordinary success.
+// ensure that lists unallocated pairs is an ordinary success whose list is
+// handed to the registry with the panel's reasons — and cleared by the next
+// ensure that has none.
 func TestPoll_ContractTwoPerClientAwgItems(t *testing.T) {
 	h := newHarness(t)
 	h.stub.SetInbounds([]panel.Inbound{
@@ -1471,11 +1520,15 @@ func TestPoll_ContractTwoPerClientAwgItems(t *testing.T) {
 		{Kind: "xray", InboundId: 12, Link: "vless://direct"},
 		paneltest.AwgItem("ams-1", "conf ams-1"),
 	})
-	h.stub.SetUnallocated([]string{"fra-1"})
+	unallocated := []panel.Unallocated{{MonClientId: "fra-1", Path: "direct", Reason: "limit"}}
+	h.stub.SetUnallocated(unallocated)
 	ctx := context.Background()
 
 	if err := h.poller.Poll(ctx); err != nil {
 		t.Fatalf("Poll: %v", err)
+	}
+	if saved := h.snapshot.saved(); len(saved) != 1 || len(saved[0]) != 1 || saved[0][0] != unallocated[0] {
+		t.Fatalf("SaveUnallocated got %+v, want the ensure's one pair", saved)
 	}
 	mat, _ := h.poller.Material()
 	if len(mat.Direct) != 2 || mat.Direct[1].MonClientId != "ams-1" || mat.Direct[1].Conf != "conf ams-1" || mat.Direct[0].MonClientId != "" {
@@ -1499,5 +1552,179 @@ func TestPoll_ContractTwoPerClientAwgItems(t *testing.T) {
 	}
 	if h.configs.calls() != 2 {
 		t.Fatalf("RebuildAll called %d times, want 2", h.configs.calls())
+	}
+	if saved := h.snapshot.saved(); len(saved) != 2 || len(saved[1]) != 0 {
+		t.Fatalf("SaveUnallocated got %+v, want the second ensure to clear the list", saved)
+	}
+}
+
+// chainOf is a chain registry of one inner and two joined edges plus a
+// pending one, with each probed hop's material programmed on its path.
+func chainOf(h *harness, active string) {
+	h.stub.SetChain(active, []paneltest.Hop{
+		{Name: "core-1", Role: "inner", Host: "10.0.0.7", State: "joined"},
+		{Name: "edge-a", Role: "edge", Host: "a.example.net", State: "joined"},
+		{Name: "edge-b", Role: "edge", Host: "b.example.net", State: "legacy"},
+		{Name: "edge-new", Role: "edge", Host: "n.example.net", State: "pending"},
+	})
+	h.stub.SetItems("inner:core-1", []panel.ProbeItem{{Kind: "xray", InboundId: 12, Link: "vless://core-1"}})
+	h.stub.SetItems("edge:edge-a", []panel.ProbeItem{{Kind: "xray", InboundId: 12, Link: "vless://edge-a"}})
+	h.stub.SetItems("edge:edge-b", []panel.ProbeItem{{Kind: "xray", InboundId: 12, Link: "vless://edge-b"}})
+}
+
+// hopFetches lists the ?hop= names GET /probe/configs was asked for, in
+// order.
+func (h *harness) hopFetches() []string {
+	var out []string
+	for _, r := range h.stub.Requests() {
+		if strings.HasSuffix(r.Path, "/probe/configs") && r.Query.Get("hop") != "" {
+			out = append(out, r.Query.Get("hop"))
+		}
+	}
+	return out
+}
+
+// TestPoll_ChainReadsEveryProbedHop is spec §4 step 3 on a chained panel
+// (decision #61 п. 1–2): besides direct, every joined or legacy hop is read
+// by ?hop= and kept under its own path, a pending hop is not, proxy is not
+// asked for at all even with the override on, and the probed path set the
+// state machine is told is direct plus the hops.
+func TestPoll_ChainReadsEveryProbedHop(t *testing.T) {
+	h := newHarness(t)
+	h.stub.SetOverride(true, "a.example.net")
+	chainOf(h, "edge-a")
+
+	if err := h.poller.Poll(context.Background()); err != nil {
+		t.Fatalf("Poll: %v", err)
+	}
+	if got := strings.Join(h.hopFetches(), ","); got != "core-1,edge-a,edge-b" {
+		t.Fatalf("hops fetched = %s, want core-1,edge-a,edge-b", got)
+	}
+	if direct, proxy := h.configFetches(); direct != 1 || proxy != 3 {
+		// configFetches counts every request without ?host= as proxy; the
+		// three are the ?hop= ones.
+		t.Fatalf("fetched direct=%d other=%d, want 1 and the 3 hops", direct, proxy)
+	}
+	mat, ok := h.poller.Material()
+	if !ok {
+		t.Fatal("no material")
+	}
+	if !mat.Chained() || mat.Chain.Active() != "edge-a" {
+		t.Fatalf("material chain = %+v, want chained with edge-a active", mat.Chain)
+	}
+	for path, link := range map[string]string{"inner:core-1": "vless://core-1", "edge:edge-a": "vless://edge-a", "edge:edge-b": "vless://edge-b"} {
+		if items := mat.Items(path); len(items) != 1 || items[0].Link != link {
+			t.Errorf("Items(%s) = %+v, want %s", path, items, link)
+		}
+	}
+	if items := mat.Items(store.PathProxy); items != nil {
+		t.Errorf("Items(proxy) = %+v on a chained panel, want none", items)
+	}
+	if got := strings.Join(mat.Served(), ","); got != "direct,inner:core-1,edge:edge-a,edge:edge-b" {
+		t.Fatalf("Served() = %s", got)
+	}
+	if calls := h.paths.calls(); len(calls) != 1 || strings.Join(calls[0], ",") != "direct,inner:core-1,edge:edge-a,edge:edge-b" {
+		t.Fatalf("SyncPaths got %v, want the served set once", calls)
+	}
+}
+
+// TestPoll_ActiveEdgeSwitchRereadsTheSameLinks is decision #61 п. 1: the
+// active edge is part of the panel's revision, so switching it re-reads the
+// material — but every edge is probed either way, the links are the ones
+// already held, and the served path set is unchanged.
+func TestPoll_ActiveEdgeSwitchRereadsTheSameLinks(t *testing.T) {
+	h := newHarness(t)
+	chainOf(h, "edge-a")
+	ctx := context.Background()
+	if err := h.poller.Poll(ctx); err != nil {
+		t.Fatalf("Poll: %v", err)
+	}
+	before, _ := h.poller.Material()
+
+	chainOf(h, "edge-b")
+	if err := h.poller.Poll(ctx); err != nil {
+		t.Fatalf("Poll after the switch: %v", err)
+	}
+	after, _ := h.poller.Material()
+	if after.Revision == before.Revision || after.Chain.Active() != "edge-b" {
+		t.Fatalf("material revision %s → %s, active %s: want a new revision with edge-b active", before.Revision, after.Revision, after.Chain.Active())
+	}
+	for _, path := range before.Served() {
+		if fmt.Sprint(before.Items(path)) != fmt.Sprint(after.Items(path)) {
+			t.Errorf("items of %s changed on an active edge switch: %v → %v", path, before.Items(path), after.Items(path))
+		}
+	}
+	calls := h.paths.calls()
+	if len(calls) != 2 || strings.Join(calls[0], ",") != strings.Join(calls[1], ",") {
+		t.Fatalf("SyncPaths got %v, want the same served set twice", calls)
+	}
+}
+
+// TestPoll_HopConflictDiscardsTheMaterial is spec §4 step 3's guard for a
+// chain that changed between GET /state and ?hop=: a 409 unknown_hop or
+// hop_not_joined drops every answer of the cycle — no material, no rebuild,
+// no path sync, no PANEL_DOWN — and the next cycle reads the chain again.
+func TestPoll_HopConflictDiscardsTheMaterial(t *testing.T) {
+	for _, code := range []string{"unknown_hop", "hop_not_joined"} {
+		t.Run(code, func(t *testing.T) {
+			h := newHarness(t)
+			chainOf(h, "edge-a")
+			ctx := context.Background()
+
+			// The first hop's answer is a 409 with the panel's code: the
+			// stub is told the hop left the registry between the two calls.
+			h.stub.FailNextOnWith("/probe/configs", 1, 1, http.StatusConflict, code)
+			if err := h.poller.Poll(ctx); err != nil {
+				t.Fatalf("Poll: %v", err)
+			}
+			if _, ok := h.poller.Material(); ok {
+				t.Fatal("material accepted although a hop answered 409")
+			}
+			if h.configs.calls() != 0 || len(h.paths.calls()) != 0 || h.poller.PanelDown() {
+				t.Fatalf("rebuilds=%d path syncs=%d down=%v, want none", h.configs.calls(), len(h.paths.calls()), h.poller.PanelDown())
+			}
+
+			if err := h.poller.Poll(ctx); err != nil {
+				t.Fatalf("second Poll: %v", err)
+			}
+			if _, ok := h.poller.Material(); !ok || h.configs.calls() != 1 {
+				t.Fatal("the next cycle did not pick the material up")
+			}
+		})
+	}
+}
+
+// TestPoll_ChainAppearsAndGoes checks the proxy ↔ chain switch (decision
+// #61 п. 1, 9): without probed hops the paths are direct and proxy; once a
+// hop is probed proxy leaves the served set; when the last probed hop goes
+// (here: the only one turns pending), proxy is back.
+func TestPoll_ChainAppearsAndGoes(t *testing.T) {
+	h := newHarness(t)
+	h.stub.SetOverride(true, "front.example.net")
+	ctx := context.Background()
+
+	if err := h.poller.Poll(ctx); err != nil {
+		t.Fatalf("Poll: %v", err)
+	}
+	chainOf(h, "edge-a")
+	if err := h.poller.Poll(ctx); err != nil {
+		t.Fatalf("Poll with a chain: %v", err)
+	}
+	h.stub.SetChain("edge-a", []paneltest.Hop{{Name: "edge-a", Role: "edge", Host: "a.example.net", State: "pending"}})
+	if err := h.poller.Poll(ctx); err != nil {
+		t.Fatalf("Poll without probed hops: %v", err)
+	}
+
+	var got []string
+	for _, c := range h.paths.calls() {
+		got = append(got, strings.Join(c, ","))
+	}
+	want := []string{"direct,proxy", "direct,inner:core-1,edge:edge-a,edge:edge-b", "direct,proxy"}
+	if strings.Join(got, " | ") != strings.Join(want, " | ") {
+		t.Fatalf("served sets = %v, want %v", got, want)
+	}
+	mat, _ := h.poller.Material()
+	if mat.Chained() || len(mat.Items(store.PathProxy)) != 1 {
+		t.Fatalf("material after the chain went: chained=%v proxy=%v, want proxy items back", mat.Chained(), mat.Items(store.PathProxy))
 	}
 }

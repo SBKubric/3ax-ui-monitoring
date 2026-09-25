@@ -29,9 +29,11 @@ func TestTargetKey_StringAndParseRoundTrip(t *testing.T) {
 }
 
 // TestParseTargetKey_Malformed checks the shapes ParseTargetKey must reject:
-// wrong part count and a non-numeric or negative inboundId.
+// too few parts, a non-numeric or negative inboundId, and a path outside
+// the grammar (protocol §4.2) — which is also what a fourth part is.
 func TestParseTargetKey_Malformed(t *testing.T) {
-	for _, s := range []string{"", "xray:12", "xray:12:proxy:extra", "xray:notanumber:proxy", "xray:-1:proxy"} {
+	for _, s := range []string{"", "xray:12", "xray:12:proxy:extra", "xray:notanumber:proxy", "xray:-1:proxy",
+		"xray:12:hops", "xray:12:edge:", "xray:12:middle:x", "xray:12:edge:AMS", "xray:12:edge:a:b"} {
 		if _, err := ParseTargetKey(s); err == nil {
 			t.Errorf("ParseTargetKey(%q) = nil error, want error", s)
 		}
@@ -198,5 +200,20 @@ func TestClientInfo_RejectedTargetsShape(t *testing.T) {
 	}
 	if strings.Contains(string(raw), "rejectedTargets") {
 		t.Errorf("client block = %s, want no rejectedTargets when nothing was rejected", raw)
+	}
+}
+
+// TestParseTargetKey_HopPaths checks protocol §5.2's split into at most
+// three parts: a hop path keeps its own ':' and round-trips through String.
+func TestParseTargetKey_HopPaths(t *testing.T) {
+	for _, path := range []string{"direct", "proxy", "edge:ams-1", "inner:core-1"} {
+		k := TargetKey{InboundKind: "awg", InboundID: 0, Path: path}
+		got, err := ParseTargetKey(k.String())
+		if err != nil {
+			t.Fatalf("ParseTargetKey(%q): %v", k.String(), err)
+		}
+		if got != k {
+			t.Fatalf("ParseTargetKey(%q) = %+v, want %+v", k.String(), got, k)
+		}
 	}
 }

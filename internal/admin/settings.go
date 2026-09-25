@@ -185,6 +185,7 @@ func (h *Handler) panelStatus(c *gin.Context, set *store.Settings) gin.H {
 		"revision":         "",
 		"inbounds":         0,
 		"override":         gin.H{"enabled": false, "host": ""},
+		"chain":            chainView(panel.Material{}, false),
 	}
 	if h.deps.Poller == nil {
 		return status
@@ -206,6 +207,7 @@ func (h *Handler) panelStatus(c *gin.Context, set *store.Settings) gin.H {
 	status["polled"] = true
 	status["revision"] = material.Revision
 	status["override"] = gin.H{"enabled": material.Override.Enabled, "host": material.Override.Host}
+	status["chain"] = chainView(material, true)
 
 	var n int64
 	if err := h.deps.Store.DB.WithContext(c.Request.Context()).
@@ -409,7 +411,7 @@ func (h *Handler) checkPanel(c *gin.Context) {
 		subID = *st.Probe.SubId
 	}
 	host := panel.DirectHost(strings.TrimSpace(body.RealHost), url)
-	items, probeErr := checkProbeConfigs(c.Request.Context(), cl, host, st.Override.Enabled)
+	items, probeErr := checkProbeConfigs(c.Request.Context(), cl, host, st)
 	msg := "Panel reachable."
 	if probeErr != "" {
 		msg = "Panel reachable, but the probe configs could not be read: " + probeErr
@@ -424,19 +426,25 @@ func (h *Handler) checkPanel(c *gin.Context) {
 		"realHost":     host,
 		"probeItems":   items,
 		"probeError":   probeErr,
+		"chain":        chainView(panel.Material{Override: st.Override, Chain: st.Chain}, true),
 	})
 }
 
 // checkProbeConfigs is Check's dry run of the material read (decision #51
 // §4, "Check делает то же на лету без сохранения"): GET /probe/configs for
-// the direct path at host and, with the override on, for the proxy path,
-// counting the links that came back. Nothing is kept — the poller's
-// material and the config documents are untouched. A refusal is reported
-// as text, not as a failed Check: the panel did answer, and the usual
-// cause — a probe set the poller has not ensured yet — is not the typed
-// values' fault.
-func checkProbeConfigs(ctx context.Context, cl panel.Client, host string, override bool) (gin.H, string) {
-	items := gin.H{"direct": 0, "proxy": 0}
+// the direct path at host and for every other path the panel serves (spec
+// §5.1) — each probed hop by ?hop=, or without a chain the proxy path when
+// the override is on — counting the links that came back per path. Nothing
+// is kept — the poller's material and the config documents are untouched. A
+// refusal is reported as text, not as a failed Check: the panel did answer,
+// and the usual cause — a probe set the poller has not ensured yet — is not
+// the typed values' fault.
+func checkProbeConfigs(ctx context.Context, cl panel.Client, host string, st *panel.State) (gin.H, string) {
+	items := gin.H{store.PathDirect: 0}
+	hops := st.Chain.ProbedHops()
+	if len(hops) == 0 {
+		items[store.PathProxy] = 0
+	}
 	if host == "" {
 		return items, "no realHost and no host in the panel URL"
 	}
@@ -444,15 +452,22 @@ func checkProbeConfigs(ctx context.Context, cl panel.Client, host string, overri
 	if err != nil {
 		return items, err.Error()
 	}
-	items["direct"] = len(direct.Items)
-	if !override {
+	items[store.PathDirect] = len(direct.Items)
+	for _, hop := range hops {
+		pc, err := cl.HopConfigs(ctx, hop.Name)
+		if err != nil {
+			return items, hop.Path() + ": " + err.Error()
+		}
+		items[hop.Path()] = len(pc.Items)
+	}
+	if len(hops) > 0 || !st.Override.Enabled {
 		return items, ""
 	}
 	proxy, err := cl.ProbeConfigs(ctx, "")
 	if err != nil {
 		return items, err.Error()
 	}
-	items["proxy"] = len(proxy.Items)
+	items[store.PathProxy] = len(proxy.Items)
 	return items, ""
 }
 

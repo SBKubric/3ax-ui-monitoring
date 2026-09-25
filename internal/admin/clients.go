@@ -15,10 +15,14 @@ import (
 // Monitoring page owns that, and spec §9.3 is explicit that "состояние
 // targets не показывается".
 type clientView struct {
-	Id     string   `json:"id"`
-	Name   string   `json:"name"`
-	Region string   `json:"region"`
+	Id     string `json:"id"`
+	Name   string `json:"name"`
+	Region string `json:"region"`
+	// Paths is the paths vocabulary as stored (direct, hops, hops by
+	// name); Probes is what it expands into on the last material (spec
+	// §5.1) — what the path filter matches — and null without one.
 	Paths  []string `json:"paths"`
+	Probes []string `json:"probes"`
 
 	Enabled       bool   `json:"enabled"`
 	State         string `json:"state"`
@@ -45,6 +49,10 @@ type clientView struct {
 	// not target state: the PAUSED config_error they cause is the panel's to
 	// show.
 	RejectedTargets []store.RejectedTarget `json:"rejectedTargets"`
+	// Unallocated are this mon-client's paths the panel's last ensure gave
+	// no AWG probe peer, with the panel's reason (spec §9.3: pool_exhausted
+	// or limit) — why its AWG targets there are PAUSED no_probe_link.
+	Unallocated []store.UnallocatedPeer `json:"unallocated"`
 
 	RemoteIp string `json:"remoteIp"`
 	// TokenRevoked marks a row whose token was revoked and that is waiting
@@ -54,9 +62,12 @@ type clientView struct {
 }
 
 // listClients answers the mon-clients page (spec §9.3) with every registry
-// row plus the config revision mon-server currently holds for it.
+// row plus the config revision mon-server currently holds for it and the
+// paths it probes, and the chain the paths picker and the path filter
+// offer.
 func (h *Handler) listClients(c *gin.Context) {
 	ctx := c.Request.Context()
+	mat, have := h.material()
 
 	clients, err := h.deps.Registry.List(ctx)
 	if err != nil {
@@ -73,6 +84,7 @@ func (h *Handler) listClients(c *gin.Context) {
 			Name:            mc.Name,
 			Region:          mc.Region,
 			Paths:           pathsOrDefault(mc),
+			Probes:          probesOf(mc, mat, have),
 			Enabled:         mc.Enabled,
 			State:           mc.State,
 			LastHeartbeat:   mc.LastHeartbeat,
@@ -83,11 +95,15 @@ func (h *Handler) listClients(c *gin.Context) {
 			ConfigError:     mc.ConfigError,
 			ConfigErrorAt:   mc.ConfigErrorAt,
 			RejectedTargets: mc.RejectedList(),
+			Unallocated:     mc.UnallocatedList(),
 			RemoteIp:        mc.RemoteIp,
 			TokenRevoked:    mc.TokenHash == "",
 		}
 		if v.RejectedTargets == nil {
 			v.RejectedTargets = []store.RejectedTarget{}
+		}
+		if v.Unallocated == nil {
+			v.Unallocated = []store.UnallocatedPeer{}
 		}
 		if h.deps.Configs != nil {
 			rev, err := h.deps.Configs.CurrentRevision(ctx, mc.Id)
@@ -102,7 +118,7 @@ func (h *Handler) listClients(c *gin.Context) {
 		views = append(views, v)
 	}
 
-	ok(c, gin.H{"clients": views, "now": clock.Ms(h.deps.Clock.Now())})
+	ok(c, gin.H{"clients": views, "chain": chainView(mat, have), "now": clock.Ms(h.deps.Clock.Now())})
 }
 
 // updateBody is the Edit modal's submission (spec §9.3): name, region and

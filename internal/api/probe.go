@@ -122,14 +122,15 @@ func isUnknownTarget(ctx context.Context, keys TargetKeySource, monClientID stri
 }
 
 // parseTarget decodes the `target` query parameter's `<kind>:<inboundId>:<path>`
-// form (protocol §5.2, e.g. "xray:12:proxy") into a registry.TargetKey, or
-// reports ok=false for anything that is not exactly that shape: an unknown
-// inbound kind, a negative or non-numeric id, or a path other than the two
-// spec §3 defines. There is no reasonable "probe" for a target mon-server
-// could never have configured, so this is a 400, not a lenient best-effort
-// parse.
+// form (protocol §5.2, e.g. "xray:12:edge:ams-1") into a registry.TargetKey,
+// or reports ok=false for anything that is not exactly that shape: an
+// unknown inbound kind, a negative or non-numeric id, or a path outside the
+// grammar of spec §5.1 (direct, proxy, edge:<name>, inner:<name>). The key
+// is split into at most three parts, because a hop's path has a ':' of its
+// own. There is no reasonable "probe" for a target mon-server could never
+// have configured, so this is a 400, not a lenient best-effort parse.
 func parseTarget(target string) (key registry.TargetKey, ok bool) {
-	parts := strings.Split(target, ":")
+	parts := strings.SplitN(target, ":", 3)
 	if len(parts) != 3 {
 		return registry.TargetKey{}, false
 	}
@@ -140,9 +141,7 @@ func parseTarget(target string) (key registry.TargetKey, ok bool) {
 	default:
 		return registry.TargetKey{}, false
 	}
-	switch path {
-	case store.PathProxy, store.PathDirect:
-	default:
+	if !store.ValidPath(path) {
 		return registry.TargetKey{}, false
 	}
 

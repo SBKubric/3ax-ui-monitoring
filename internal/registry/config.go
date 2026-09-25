@@ -244,12 +244,15 @@ func (b *ConfigBuilder) TargetKeys(ctx context.Context, monClientID string) ([]T
 // Reasons a target is PAUSED when it falls out of its mon-client's config
 // for a reason that is not its inbound (decision #51 §3, contract §4.6). An
 // inbound that is disabled or gone pauses its targets with config_disabled
-// instead (spec §4 step 3, internal/state's SyncInbounds).
+// instead (spec §4 step 3, internal/state's SyncInbounds). A target whose
+// path the panel no longer serves is not paused at all but removed
+// (Exclusions.Retired, spec §5.1).
 const (
 	// PauseOverrideDisabled: a proxy-path target while the panel's host
 	// override is off — there is no proxy front to probe through.
 	PauseOverrideDisabled = "override_disabled"
-	// PausePathRemoved: an administrator took the path off this mon-client.
+	// PausePathRemoved: an administrator took the path off this mon-client,
+	// while the panel still serves it.
 	PausePathRemoved = "path_removed"
 	// PauseNoProbeLink: the inbound is live, but the panel handed out no
 	// probe link for it on this path.
@@ -257,16 +260,20 @@ const (
 )
 
 // Exclusions is what a ConfigBuilder knows about why a target is *not* in
-// one mon-client's document: the mon-client's paths, whether the override
-// is on, and which inbounds the panel reports as enabled. It is a plain
-// value so the state engine can take it before opening a heartbeat's
-// transaction (the builder reads through its own handles) and ask it about
-// every target row inside it — and so the engine's tests can write one
-// down. The zero value knows nothing and names no reason.
+// one mon-client's document: the paths the panel serves, the paths this
+// mon-client probes of them, whether the override is on, and which inbounds
+// the panel reports as enabled. It is a plain value so the state engine can
+// take it before opening a heartbeat's transaction (the builder reads
+// through its own handles) and ask it about every target row inside it —
+// and so the engine's tests can write one down. The zero value knows
+// nothing and names no reason.
 type Exclusions struct {
 	// Known is false until the panel's material has been read.
 	Known bool
-	// Paths are the mon-client's paths, spec §5's default applied.
+	// Served is the panel's probed path set (panel.Material.Served).
+	Served map[string]bool
+	// Paths are the paths this mon-client probes: its paths vocabulary
+	// (spec §5.1's default applied) expanded by the material (ExpandPaths).
 	Paths map[string]bool
 	// Override is whether the panel's host override is on.
 	Override bool
@@ -275,14 +282,23 @@ type Exclusions struct {
 	Inbounds map[TargetKey]bool
 }
 
+// Retired reports whether key's path is one the panel no longer serves — a
+// hop that was removed, renamed or left joined/legacy, or proxy once the
+// chain has a probed hop (spec §5.1). Such a target is removed without an
+// event rather than paused: the panel drops its own row for it. Nothing is
+// retired while nothing is known.
+func (x Exclusions) Retired(key TargetKey) bool {
+	return x.Known && !x.Served[key.Path]
+}
+
 // Reason answers why key — a target that is not in the mon-client's
 // document — is out: one of the Pause* reasons, or "" when it is not a
 // config question at all (the inbound is disabled or gone, which
-// SyncInbounds handles as config_disabled, or nothing is known yet). It is
-// only meaningful for keys that are not in the document; for one that is,
-// the "default" answer below would be wrong.
+// SyncInbounds handles as config_disabled; the path is Retired; or nothing
+// is known yet). It is only meaningful for keys that are not in the
+// document; for one that is, the "default" answer below would be wrong.
 func (x Exclusions) Reason(key TargetKey) string {
-	if !x.Known {
+	if !x.Known || x.Retired(key) {
 		return ""
 	}
 	if enabled := x.Inbounds[TargetKey{InboundKind: key.InboundKind, InboundID: key.InboundID}]; !enabled {
@@ -300,8 +316,8 @@ func (x Exclusions) Reason(key TargetKey) string {
 
 // Expected lists the targets of one inbound kind this mon-client should be
 // probing by the panel's own state, with or without an item in its
-// document: every enabled inbound of that kind crossed with the mon-client's
-// paths, proxy only while the override is on. The state engine asks it for
+// document: every enabled inbound of that kind crossed with the paths the
+// mon-client probes, proxy only while the override is on. The state engine asks it for
 // AWG (decision #80 п. 10): a mon-client the panel gave no AWG probe peer
 // (pool exhausted, or not ensured yet) never probes that target and so
 // never creates its row, and without a row there is no PAUSED no_probe_link
@@ -333,8 +349,8 @@ func (x Exclusions) Expected(kind string) []TargetKey {
 
 // Exclusions returns the facts Exclusions.Reason decides by, for one
 // mon-client, from the same inputs a rebuild uses: the current material's
-// override, the mon-client's paths (with spec §5's default) and the
-// enabled flags in panel_inbounds. With no material yet the answer is the
+// served paths and override, the mon-client's paths expanded by it (with
+// spec §5.1's default) and the enabled flags in panel_inbounds. With no material yet the answer is the
 // zero value, which names no reason: pausing targets on a mon-server that
 // has not heard from the panel since start-up would be a guess.
 func (b *ConfigBuilder) Exclusions(ctx context.Context, monClientID string) (Exclusions, error) {
@@ -352,11 +368,15 @@ func (b *ConfigBuilder) Exclusions(ctx context.Context, monClientID string) (Exc
 	}
 	x := Exclusions{
 		Known:    true,
+		Served:   map[string]bool{},
 		Paths:    map[string]bool{},
 		Override: mat.Override.Enabled,
 		Inbounds: make(map[TargetKey]bool, len(rows)),
 	}
-	for _, p := range pathsOf(mc) {
+	for _, p := range mat.Served() {
+		x.Served[p] = true
+	}
+	for _, p := range ExpandPaths(pathsOf(mc), mat) {
 		x.Paths[p] = true
 	}
 	for _, r := range rows {
@@ -395,10 +415,10 @@ func (b *ConfigBuilder) buildAndStore(ctx context.Context, mc *store.MonClient, 
 }
 
 // build assembles the document itself: spec §5's targets rule (every path
-// of this mon-client crossed with that path's items, proxy only while the
-// panel's override is on, AWG items only the mon-client's own), the global
-// probe parameters, the probe URL, and finally the revision over everything
-// above.
+// this mon-client's paths expand into, spec §5.1, crossed with that path's
+// items — proxy only without a chain and while the panel's override is on,
+// AWG items only the mon-client's own), the global probe parameters, the
+// probe URL, and finally the revision over everything above.
 func (b *ConfigBuilder) build(mc *store.MonClient, mat panel.Material, set *store.Settings, protocols map[TargetKey]string) (*ConfigDoc, error) {
 	doc := &ConfigDoc{
 		MonClientID: mc.Id,
@@ -415,8 +435,8 @@ func (b *ConfigBuilder) build(mc *store.MonClient, mat panel.Material, set *stor
 		Targets: []ConfigTarget{},
 	}
 
-	for _, path := range pathsOf(mc) {
-		for _, item := range itemsFor(mat, path) {
+	for _, path := range ExpandPaths(pathsOf(mc), mat) {
+		for _, item := range mat.Items(path) {
 			if !itemFor(item, mc.Id) {
 				continue
 			}
@@ -454,35 +474,62 @@ func (b *ConfigBuilder) build(mc *store.MonClient, mat panel.Material, set *stor
 	return doc, nil
 }
 
-// pathsOf is spec §5's default: a mon-client with no paths stored (or an
-// unreadable column) probes both.
-func pathsOf(mc *store.MonClient) []string {
+// DefaultPaths is spec §5.1's default paths vocabulary, given at approval
+// (admin UI and ansible's auto-approval alike) and to a mon-client with
+// none stored: direct and every probed hop.
+func DefaultPaths() []string { return []string{store.PathDirect, store.PathHops} }
+
+// PathsOf is a mon-client's paths vocabulary with the default applied to a
+// row that has none (or an unreadable column), so no caller has to decide
+// what an empty list means.
+func PathsOf(mc *store.MonClient) []string {
 	paths := mc.PathsList()
 	if len(paths) == 0 {
-		return []string{store.PathProxy, store.PathDirect}
+		return DefaultPaths()
 	}
 	return paths
 }
 
-// itemsFor picks the material for one path. The proxy path exists only
-// while the panel's host override is on (spec §5): with it off there is no
-// proxy front to render configs for, and the poller will not even have
-// fetched any — checking here as well keeps a mon-client that asks for the
-// proxy path from silently getting the direct material.
-func itemsFor(mat panel.Material, path string) []panel.ProbeItem {
-	switch path {
-	case store.PathProxy:
-		if !mat.Override.Enabled {
-			return nil
-		}
-		return mat.Proxy
-	case store.PathDirect:
-		return mat.Direct
-	default:
-		// validatePaths rejects anything else before it can ever be stored;
-		// this is the belt to that braces.
-		return nil
+// pathsOf is PathsOf, for the builder's own call sites.
+func pathsOf(mc *store.MonClient) []string { return PathsOf(mc) }
+
+// ExpandPaths turns a paths vocabulary into the paths a mon-client probes
+// on the panel mat describes (spec §5.1): direct is direct; hops is every
+// probed hop of the chain, including hops that joined after the mon-client
+// was approved — or proxy on a panel without one; a hop by name is that
+// hop while the panel probes it, and nothing otherwise. A path reached
+// twice (hops and a name) is one path. The order is the vocabulary's, then
+// the chain's; the document sorts its targets anyway.
+func ExpandPaths(vocab []string, mat panel.Material) []string {
+	served := make(map[string]bool)
+	for _, p := range mat.Served() {
+		served[p] = true
 	}
+	chained := mat.Chained()
+	out := make([]string, 0, len(vocab))
+	add := func(p string) {
+		if !slices.Contains(out, p) {
+			out = append(out, p)
+		}
+	}
+	for _, v := range vocab {
+		switch {
+		case v == store.PathDirect:
+			add(store.PathDirect)
+		case v == store.PathHops && chained:
+			for _, p := range mat.HopPaths() {
+				add(p)
+			}
+		case v == store.PathHops:
+			add(store.PathProxy)
+		case chained && store.IsHopPath(v) && served[v]:
+			add(v)
+		}
+		// Anything else — a hop the panel does not probe, a hop by name on
+		// a panel without a chain, or a word validatePaths would have
+		// refused — expands into nothing.
+	}
+	return out
 }
 
 // itemFor reports whether item belongs in monClientID's document (decision
@@ -623,9 +670,42 @@ func (s snapshotSource) Snapshot(ctx context.Context) ([]panel.MonClientSnapshot
 			Region:        mc.Region,
 			State:         mc.State,
 			LastHeartbeat: last,
+			Paths:         pathsOf(&mc),
 		})
 	}
 	return out, nil
+}
+
+// SaveUnallocated files the panel's answer to the snapshot (contract §4.3,
+// spec §3): each mon-client's unallocated column becomes the pairs list
+// names for it, in the panel's order, and [] for one it does not name — the
+// panel lists every pair it could not serve on every ensure, so a
+// mon-client missing from the list has none. A pair of a mon-client that is
+// not in the registry (deleted since the snapshot) has nowhere to go and is
+// dropped. One transaction, so the admin UI never sees half an answer.
+func (s snapshotSource) SaveUnallocated(ctx context.Context, list []panel.Unallocated) error {
+	byClient := make(map[string][]store.UnallocatedPeer)
+	for _, u := range list {
+		byClient[u.MonClientId] = append(byClient[u.MonClientId], store.UnallocatedPeer{Path: u.Path, Reason: u.Reason})
+	}
+	return s.r.st.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var clients []store.MonClient
+		if err := tx.Select("id", "unallocated").Find(&clients).Error; err != nil {
+			return fmt.Errorf("registry: read unallocated: %w", err)
+		}
+		for i := range clients {
+			var next store.MonClient
+			next.SetUnallocated(byClient[clients[i].Id])
+			if next.Unallocated == clients[i].Unallocated {
+				continue
+			}
+			if err := tx.Model(&store.MonClient{}).Where("id = ?", clients[i].Id).
+				Update("unallocated", next.Unallocated).Error; err != nil {
+				return fmt.Errorf("registry: save unallocated of %s: %w", clients[i].Id, err)
+			}
+		}
+		return nil
+	})
 }
 
 // SnapshotSource returns the registry as the poller's snapshot source (spec

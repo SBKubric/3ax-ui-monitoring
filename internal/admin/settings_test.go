@@ -99,9 +99,9 @@ func TestSettings_SaveProbeRebuildsEveryConfig(t *testing.T) {
 	h.login()
 	h.withMaterial()
 
-	one := h.approveOne("7K3F9Q", "vps-ams-2", "203.0.113.5", "Amsterdam #2", "NL", []string{"proxy", "direct"})
+	one := h.approveOne("7K3F9Q", "vps-ams-2", "203.0.113.5", "Amsterdam #2", "NL", []string{"hops", "direct"})
 	h.clk.Advance(2 * 60 * 1e9)
-	two := h.approveOne("Q2V8NM", "vps-fra-1", "198.51.100.23", "Frankfurt #1", "DE", []string{"proxy"})
+	two := h.approveOne("Q2V8NM", "vps-fra-1", "198.51.100.23", "Frankfurt #1", "DE", []string{"hops"})
 
 	ctx := context.Background()
 	before := map[string]string{}
@@ -623,30 +623,34 @@ func TestSettings_SaveRealHostWithoutPanelIsJustSaved(t *testing.T) {
 	}
 }
 
-// TestSettings_CheckRefusesContractOne is decision #80 п. 9: a panel on
-// monitoring contract 1 answers, but mon-server would build no targets from
-// it, so Check fails with the text that names both versions and the cure —
-// and asks for no probe configs.
-func TestSettings_CheckRefusesContractOne(t *testing.T) {
-	h := newHarness(t)
-	h.login()
+// TestSettings_CheckRefusesContractMismatch is decisions #80 п. 9 and #61
+// п. 5: a panel on any other monitoring contract answers, but mon-server
+// would build no targets from it, so Check fails with the text that names
+// both versions and the side to update — and asks for no probe configs.
+func TestSettings_CheckRefusesContractMismatch(t *testing.T) {
+	for contract, want := range map[int]string{
+		2: "panel speaks monitoring contract 2, mon-server needs 3 — update the panel",
+		4: "panel speaks monitoring contract 4, mon-server needs 3 — update mon-server",
+	} {
+		h := newHarness(t)
+		h.login()
 
-	stub := paneltest.NewStub(t)
-	stub.SetContract(1)
+		stub := paneltest.NewStub(t)
+		stub.SetContract(contract)
 
-	w := h.do(http.MethodPost, "/admin/api/settings/check", map[string]any{
-		"panelUrl": stub.URL(), "monToken": stub.Token(),
-	})
-	if w.Code != http.StatusBadGateway {
-		t.Fatalf("status %d, want 502", w.Code)
-	}
-	const want = "panel speaks monitoring contract 1, mon-server needs 2 — update the panel"
-	if msg := decode(t, w).Msg; msg != want {
-		t.Fatalf("msg = %q, want %q", msg, want)
-	}
-	for _, r := range stub.Requests() {
-		if strings.HasSuffix(r.Path, "/probe/configs") {
-			t.Fatalf("Check read probe configs from a contract-1 panel: %s", r.Path)
+		w := h.do(http.MethodPost, "/admin/api/settings/check", map[string]any{
+			"panelUrl": stub.URL(), "monToken": stub.Token(),
+		})
+		if w.Code != http.StatusBadGateway {
+			t.Fatalf("contract %d: status %d, want 502", contract, w.Code)
+		}
+		if msg := decode(t, w).Msg; msg != want {
+			t.Fatalf("msg = %q, want %q", msg, want)
+		}
+		for _, r := range stub.Requests() {
+			if strings.HasSuffix(r.Path, "/probe/configs") {
+				t.Fatalf("Check read probe configs from a contract-%d panel: %s", contract, r.Path)
+			}
 		}
 	}
 }
@@ -657,10 +661,69 @@ func TestSettings_CheckRefusesContractOne(t *testing.T) {
 func TestSettings_GetStatusContractError(t *testing.T) {
 	h := newHarness(t)
 	h.login()
-	h.mat.contract = "panel speaks monitoring contract 1, mon-server needs 2 — update the panel"
+	h.mat.contract = "panel speaks monitoring contract 2, mon-server needs 3 — update the panel"
 
 	o := obj(t, h.do(http.MethodGet, "/admin/api/settings", nil))
 	if p := o["panel"].(map[string]any); p["contractError"] != h.mat.contract {
 		t.Fatalf("panel status = %+v, want contractError %q", p, h.mat.contract)
+	}
+}
+
+// TestSettings_CheckReadsEveryProbedHop is Check on a chained panel (spec
+// §9.4): besides direct it reads every probed hop by ?hop= and counts the
+// links per path, and never asks for proxy, which such a panel does not
+// serve.
+func TestSettings_CheckReadsEveryProbedHop(t *testing.T) {
+	h := newHarness(t)
+	h.login()
+
+	stub := paneltest.NewStub(t)
+	sub := "sub-1"
+	stub.SetProbeSubID(&sub)
+	stub.SetOverride(true, "a.example.net")
+	stub.SetChain("edge-a", []paneltest.Hop{
+		{Name: "core-1", Role: "inner", Host: "10.0.0.7", State: "joined"},
+		{Name: "edge-a", Role: "edge", Host: "a.example.net", State: "joined"},
+		{Name: "edge-x", Role: "edge", Host: "x.example.net", State: "pending"},
+	})
+	stub.SetItems("direct", []panel.ProbeItem{{Kind: store.InboundKindXray, InboundId: 12, Link: "vless://direct"}})
+	stub.SetItems("inner:core-1", []panel.ProbeItem{{Kind: store.InboundKindXray, InboundId: 12, Link: "vless://core"}})
+	stub.SetItems("edge:edge-a", []panel.ProbeItem{
+		{Kind: store.InboundKindXray, InboundId: 12, Link: "vless://a"},
+		paneltest.AwgItem("ams-1", "[Peer]"),
+	})
+
+	w := h.do(http.MethodPost, "/admin/api/settings/check", map[string]any{
+		"panelUrl": stub.URL(), "monToken": stub.Token(), "realHost": "real.example.net",
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d, body %s", w.Code, w.Body.String())
+	}
+	o := obj(t, w)
+	items := o["probeItems"].(map[string]any)
+	if items["direct"] != float64(1) || items["inner:core-1"] != float64(1) || items["edge:edge-a"] != float64(2) || len(items) != 3 {
+		t.Fatalf("probeItems = %+v, want direct 1, inner:core-1 1, edge:edge-a 2 and nothing else", items)
+	}
+	if chain := o["chain"].(map[string]any); chain["activeEdge"] != "edge-a" || len(chain["hops"].([]any)) != 2 {
+		t.Fatalf("chain = %+v, want the two probed hops with edge-a active", chain)
+	}
+	for _, r := range stub.Requests() {
+		if strings.HasSuffix(r.Path, "/probe/configs") && r.Query.Get("host") == "" && r.Query.Get("hop") == "" {
+			t.Fatal("Check asked a chained panel for the proxy path")
+		}
+	}
+}
+
+// TestSettings_GetStatusChain: the status line and the read-only proxy
+// front block get the chain of the last material (spec §9.4).
+func TestSettings_GetStatusChain(t *testing.T) {
+	h := newHarness(t)
+	h.login()
+	h.withChain()
+
+	o := obj(t, h.do(http.MethodGet, "/admin/api/settings", nil))
+	chain := o["panel"].(map[string]any)["chain"].(map[string]any)
+	if chain["chained"] != true || chain["activeEdge"] != "edge-a" || len(chain["hops"].([]any)) != 3 {
+		t.Fatalf("panel.chain = %+v", chain)
 	}
 }

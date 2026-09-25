@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -482,5 +483,107 @@ func TestRejections_PlacesEntriesOnTheBatch(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestHTTPClient_HopConfigs checks contract 3 §4.4's hop path: the hop goes
+// as ?hop=<name> (no host), the answer carries the hop's path, and the two
+// 409s a chain that moved answers with are IsHopConflict — while any other
+// 409 is not.
+func TestHTTPClient_HopConfigs(t *testing.T) {
+	s := paneltest.NewStub(t)
+	sub := "sub-1"
+	s.SetProbeSubID(&sub)
+	s.SetChain("edge-a", []paneltest.Hop{
+		{Name: "edge-a", Role: "edge", Host: "a.example.net", State: "joined"},
+		{Name: "edge-old", Role: "edge", Host: "o.example.net", State: "draining"},
+	})
+	s.SetItems("edge:edge-a", []panel.ProbeItem{{Kind: "xray", InboundId: 12, Link: "vless://a"}})
+	c, log := newClient(t, s)
+	ctx := context.Background()
+
+	pc, err := c.HopConfigs(ctx, "edge-a")
+	if err != nil {
+		t.Fatalf("HopConfigs: %v", err)
+	}
+	if pc.Path != "edge:edge-a" || len(pc.Items) != 1 || pc.Items[0].Link != "vless://a" {
+		t.Fatalf("answer = %+v, want edge:edge-a's material", pc)
+	}
+	r := s.Requests()[0]
+	if r.Query.Get("hop") != "edge-a" || r.Query.Has("host") {
+		t.Fatalf("query = %v, want hop=edge-a and no host", r.Query)
+	}
+
+	for name, code := range map[string]string{"gone": "unknown_hop", "edge-old": "hop_not_joined"} {
+		_, err := c.HopConfigs(ctx, name)
+		if !panel.IsHopConflict(err) {
+			t.Fatalf("HopConfigs(%s) = %v, want a hop conflict (%s)", name, err, code)
+		}
+	}
+	wantDelays(t, log.delays())
+
+	s.SetOverride(false, "")
+	if _, err := c.ProbeConfigs(ctx, ""); err == nil || panel.IsHopConflict(err) {
+		t.Fatalf("proxy with the override off = %v, want a 409 that is not a hop conflict", err)
+	}
+}
+
+// TestHTTPClient_ContractThreeShapes decodes contract 3's additions: the
+// chain in GET /state, the paths in the ensure body, and the unallocated
+// pairs with reasons in its answer.
+func TestHTTPClient_ContractThreeShapes(t *testing.T) {
+	s := paneltest.NewStub(t)
+	s.SetChain("edge-a", []paneltest.Hop{
+		{Name: "core-1", Role: "inner", Host: "10.0.0.7", State: "joined"},
+		{Name: "edge-a", Role: "edge", Host: "a.example.net", State: "legacy"},
+	})
+	s.SetUnallocated([]panel.Unallocated{{MonClientId: "ams-1", Path: "inner:core-1", Reason: "limit"}})
+	c, _ := newClient(t, s)
+	ctx := context.Background()
+
+	st, err := c.State(ctx)
+	if err != nil {
+		t.Fatalf("State: %v", err)
+	}
+	if st.Contract != 3 || st.Chain == nil || st.Chain.Active() != "edge-a" || len(st.Chain.ProbedHops()) != 2 {
+		t.Fatalf("state = %+v chain = %+v, want contract 3 with two probed hops", st, st.Chain)
+	}
+	if got := st.Chain.ProbedHops()[1].Path(); got != "edge:edge-a" {
+		t.Fatalf("hop path = %q, want edge:edge-a", got)
+	}
+
+	res, err := c.ProbeEnsure(ctx, []panel.MonClientSnapshot{{Id: "ams-1", State: "ONLINE", Paths: []string{"direct", "hops"}}})
+	if err != nil {
+		t.Fatalf("ProbeEnsure: %v", err)
+	}
+	if len(res.Unallocated) != 1 || res.Unallocated[0] != (panel.Unallocated{MonClientId: "ams-1", Path: "inner:core-1", Reason: "limit"}) {
+		t.Fatalf("unallocated = %+v", res.Unallocated)
+	}
+	if got := s.Ensured()[0][0].Paths; strings.Join(got, ",") != "direct,hops" {
+		t.Fatalf("snapshot paths = %v, want direct,hops", got)
+	}
+}
+
+// TestChain_ProbedHops checks the filter mon-server applies to the hops the
+// panel sends: joined and legacy ones by the grammar, in the panel's order;
+// anything else is not a path.
+func TestChain_ProbedHops(t *testing.T) {
+	var none *panel.Chain
+	if got := none.ProbedHops(); len(got) != 0 || none.Active() != "" {
+		t.Fatalf("nil chain: hops %v active %q, want none", got, none.Active())
+	}
+	c := &panel.Chain{Hops: []panel.Hop{
+		{Name: "core-1", Role: "inner", State: "joined"},
+		{Name: "edge-p", Role: "edge", State: "pending"},
+		{Name: "Bad_Name", Role: "edge", State: "joined"},
+		{Name: "mid", Role: "middle", State: "joined"},
+		{Name: "edge-a", Role: "edge", State: "legacy"},
+	}}
+	var got []string
+	for _, h := range c.ProbedHops() {
+		got = append(got, h.Path())
+	}
+	if strings.Join(got, ",") != "inner:core-1,edge:edge-a" {
+		t.Fatalf("ProbedHops = %v, want inner:core-1,edge:edge-a", got)
 	}
 }

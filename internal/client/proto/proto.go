@@ -10,6 +10,7 @@ package proto
 
 import (
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 )
@@ -30,20 +31,34 @@ func (k TargetKey) String() string {
 	return fmt.Sprintf("%s:%d:%s", k.InboundKind, k.InboundID, k.Path)
 }
 
+// pathRe is the path grammar of protocol §4.2: direct, proxy, or a chain
+// hop by name, edge:<name> / inner:<name> with <name> [a-z0-9-]{1,32}. It
+// repeats mon-server's store.ValidPath because internal/client/** imports
+// no mon-server package (see the package comment).
+var pathRe = regexp.MustCompile(`^(direct|proxy|(edge|inner):[a-z0-9-]{1,32})$`)
+
+// ValidPath reports whether p is a path by the protocol's grammar
+// (§4.2). Nothing in mon-client depends on which path it is; this is the
+// one check it makes (decision #61 п. 8).
+func ValidPath(p string) bool { return pathRe.MatchString(p) }
+
 // ParseTargetKey parses the `<kind>:<inboundId>:<path>` form String
-// produces back into a TargetKey. It only checks shape (exactly three
-// colon-separated parts, the middle one a non-negative integer) — mon-client
-// never needs to validate a kind or path against the protocol's own
-// enumeration, since every key it ever parses came from a config document
-// mon-server already built.
+// produces back into a TargetKey. The key is split into at most three
+// parts — a hop's path (edge:ams-1) has a ':' of its own (protocol §5.2) —
+// the middle one must be a non-negative integer and the last one a path by
+// the grammar; the kind is not checked, since every key mon-client parses
+// came from a config document mon-server already built.
 func ParseTargetKey(s string) (TargetKey, error) {
-	parts := strings.Split(s, ":")
+	parts := strings.SplitN(s, ":", 3)
 	if len(parts) != 3 {
 		return TargetKey{}, fmt.Errorf("proto: malformed target key %q", s)
 	}
 	id, err := strconv.Atoi(parts[1])
 	if err != nil || id < 0 {
 		return TargetKey{}, fmt.Errorf("proto: malformed target key %q: bad inboundId", s)
+	}
+	if !ValidPath(parts[2]) {
+		return TargetKey{}, fmt.Errorf("proto: malformed target key %q: bad path", s)
 	}
 	return TargetKey{InboundKind: parts[0], InboundID: id, Path: parts[2]}, nil
 }

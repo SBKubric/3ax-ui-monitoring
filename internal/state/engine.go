@@ -437,6 +437,31 @@ func (e *Engine) SyncInbounds(ctx context.Context, inbounds []panel.Inbound) err
 	})
 }
 
+// SyncPaths is panel.PathSync (spec §5.1, decision #61 п. 6, 9): served
+// is the panel's probed path set of a newly accepted material, and every
+// target of any mon-client on a path outside it — a hop that was removed,
+// renamed or left joined/legacy, or proxy once the chain has a probed hop —
+// is deleted. Silently: no event, no Telegram. The panel drops its own
+// mon_targets rows for those paths in the same transaction as the registry
+// change, so an event about them would only be refused or resurrect a row;
+// and removing a hop is the operator's act, not an incident. A hop that
+// comes back starts over with new UNKNOWN targets. An empty set is not an
+// answer (a material always serves direct) and removes nothing.
+func (e *Engine) SyncPaths(ctx context.Context, served []string) error {
+	if len(served) == 0 {
+		return nil
+	}
+	res := e.st.DB.WithContext(ctx).Where("path NOT IN ?", served).Delete(&store.Target{})
+	if res.Error != nil {
+		return fmt.Errorf("state: remove targets of paths the panel no longer serves: %w", res.Error)
+	}
+	if res.RowsAffected > 0 {
+		slog.Info("state: removed the targets of paths the panel no longer serves",
+			"count", res.RowsAffected, "served", served)
+	}
+	return nil
+}
+
 // MonClientDisabled is registry Hooks.Disabled (spec §6): an administrator
 // turning a mon-client off stops its probes, so its targets go UNKNOWN with
 // reason mon_client_disabled rather than freezing on whatever they last
@@ -686,12 +711,28 @@ func (e *Engine) retirePaused(tx *gorm.DB, monClientID string, keys map[registry
 // first heartbeat, and released like any no_probe_link once its item
 // appears.
 //
+// A target whose path the panel no longer serves (excl.Retired, spec §5.1)
+// is not paused but deleted, without an event — SyncPaths does the same for
+// every mon-client when the material changes; doing it here as well catches
+// a row a heartbeat racing that change re-created.
+//
 // It runs in the heartbeat for the same reason retirePaused does: this is
 // where mon-server knows which config the mon-client was actually handed.
 func (e *Engine) reconcilePauses(tx *gorm.DB, monClientID string, keys, rejected map[registry.TargetKey]bool, excl registry.Exclusions, nowMs int64) error {
-	var rows []store.Target
-	if err := tx.Where("mon_client_id = ?", monClientID).Order("id").Find(&rows).Error; err != nil {
+	var all []store.Target
+	if err := tx.Where("mon_client_id = ?", monClientID).Order("id").Find(&all).Error; err != nil {
 		return fmt.Errorf("state: read targets of %s: %w", monClientID, err)
+	}
+	rows := all[:0]
+	for _, t := range all {
+		key := registry.TargetKey{InboundKind: t.InboundKind, InboundID: t.InboundId, Path: t.Path}
+		if keys[key] || !excl.Retired(key) {
+			rows = append(rows, t)
+			continue
+		}
+		if err := tx.Delete(&store.Target{}, t.Id).Error; err != nil {
+			return fmt.Errorf("state: remove target %d of a path the panel no longer serves: %w", t.Id, err)
+		}
 	}
 	have := make(map[registry.TargetKey]bool, len(rows))
 	for _, t := range rows {
