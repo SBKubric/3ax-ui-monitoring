@@ -7,12 +7,14 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -95,6 +97,58 @@ func TestStartAndHealthz(t *testing.T) {
 
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+}
+
+// syncBuffer is a bytes.Buffer the default slog handler can write to from
+// the offline sweep's goroutine while the test reads it.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// TestStart_ReportsServerReady checks decision #84's plumbing: once the
+// listener can complete handshakes (at once in "files" mode), Start hands
+// the engine its serverReadyAt, which is what writes the one start-up line
+// about mon-server's own downtime. The offline sweep counts silence from
+// that same moment; internal/state's MarkOffline tests cover the counting.
+func TestStart_ReportsServerReady(t *testing.T) {
+	logs := &syncBuffer{}
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	a, _ := newTestApp(t)
+	last := clock.Ms(time.Now().Add(-5 * time.Minute))
+	mc := &store.MonClient{
+		Id: "ams-1", Name: "ams-1", Region: "NL", Enabled: true,
+		State: store.MonClientOnline, ApprovedAt: last, LastHeartbeat: &last,
+	}
+	if err := a.deps.Store.DB.Create(mc).Error; err != nil {
+		t.Fatalf("create mon-client: %v", err)
+	}
+
+	if _, err := a.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for !strings.Contains(logs.String(), "started; last heartbeat seen 5m0s ago") {
+		if time.Now().After(deadline) {
+			t.Fatalf("logs = %q, want the start-up line about the last heartbeat", logs.String())
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

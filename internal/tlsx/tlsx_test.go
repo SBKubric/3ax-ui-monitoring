@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"net"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -277,6 +278,68 @@ func TestManager_NilIsSafe(t *testing.T) {
 		t.Fatalf("nil Manager.Manage: %v", err)
 	}
 	mgr.Stop() // must not panic
+}
+
+// TestManager_Ready_ClosesOnceTheCertificateIsCached pins what
+// internal/app counts as serverReadyAt in acme-ip mode (decision #84 §2):
+// not the moment the socket is bound, but the moment certmagic has a
+// certificate in its cache to hand to a handshake. The certificate here is
+// put in storage by hand and cached the way ManageAsync caches one it
+// loaded or just obtained, so no ACME endpoint is involved.
+func TestManager_Ready_ClosesOnceTheCertificateIsCached(t *testing.T) {
+	const ip = "203.0.113.10"
+	dataDir := t.TempDir()
+	_, mgr, err := Build(config.TLSConfig{Mode: config.TLSModeACMEIP}, dataDir, ip)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	t.Cleanup(mgr.Stop)
+
+	select {
+	case <-mgr.Ready():
+		t.Fatal("Ready closed before any certificate was cached")
+	default:
+	}
+
+	certPath, keyPath := tlsxtest.WriteCert(t, t.TempDir(), nil, []net.IP{net.ParseIP(ip)})
+	issuerKey := mgr.magic.Issuers[0].IssuerKey()
+	ctx := context.Background()
+	for key, src := range map[string]string{
+		certmagic.StorageKeys.SiteCert(issuerKey, ip):       certPath,
+		certmagic.StorageKeys.SitePrivateKey(issuerKey, ip): keyPath,
+	} {
+		b, err := os.ReadFile(src)
+		if err != nil {
+			t.Fatalf("read %s: %v", src, err)
+		}
+		if err := mgr.magic.Storage.Store(ctx, key, b); err != nil {
+			t.Fatalf("store %s: %v", key, err)
+		}
+	}
+	if err := mgr.magic.Storage.Store(ctx, certmagic.StorageKeys.SiteMeta(issuerKey, ip), []byte("{}")); err != nil {
+		t.Fatalf("store meta: %v", err)
+	}
+	if _, err := mgr.magic.CacheManagedCertificate(ctx, ip); err != nil {
+		t.Fatalf("CacheManagedCertificate: %v", err)
+	}
+
+	select {
+	case <-mgr.Ready():
+	default:
+		t.Fatal("Ready still open after the certificate was cached")
+	}
+}
+
+// TestManager_Ready_NilIsReadyAtOnce: "files" mode has no Manager, and its
+// certificate was loaded by Build, so the listener is ready as soon as it
+// is bound.
+func TestManager_Ready_NilIsReadyAtOnce(t *testing.T) {
+	var mgr *Manager
+	select {
+	case <-mgr.Ready():
+	default:
+		t.Fatal("nil Manager.Ready is not closed")
+	}
 }
 
 func containsAll(hay []string, needles ...string) bool {

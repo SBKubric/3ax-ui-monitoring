@@ -270,6 +270,16 @@ func (e *Engine) Heartbeat(ctx context.Context, mc *store.MonClient, hb *Heartbe
 // the first time" and must not be overwritten with the alarm-worthy
 // OFFLINE.
 //
+// Silence is counted from max(last_heartbeat, readyAt), readyAt being the
+// moment this process's listener started completing TLS handshakes
+// (ServerReady; decision #84). Heartbeats that went unanswered while
+// mon-server itself was down are not the mon-client's fault: without this,
+// the first sweep after a long enough restart saw the stale last_heartbeat,
+// filed ONLINE → OFFLINE, and the mon-client's next heartbeat filed OFFLINE
+// → ONLINE a minute later — two false Telegram lines and a needless UNKNOWN
+// for every target. A mon-client that really died during the downtime still
+// goes OFFLINE, clientOfflineAfter intervals after readyAt.
+//
 // Each mon-client is swept in its own transaction, so a crash between "the
 // row says OFFLINE" and "its targets say UNKNOWN" cannot leave a mon-client
 // that is offline while its targets still claim to be up — nothing would
@@ -277,7 +287,7 @@ func (e *Engine) Heartbeat(ctx context.Context, mc *store.MonClient, hb *Heartbe
 // ONLINE rows. One transaction per mon-client rather than one for the whole
 // sweep: they are independent, and a single failure should not undo the
 // mon-clients already handled.
-func (e *Engine) MarkOffline(ctx context.Context) error {
+func (e *Engine) MarkOffline(ctx context.Context, readyAt time.Time) error {
 	set, err := e.st.LoadSettings()
 	if err != nil {
 		return fmt.Errorf("state: load settings: %w", err)
@@ -285,6 +295,12 @@ func (e *Engine) MarkOffline(ctx context.Context) error {
 	now := e.clk.Now()
 	nowMs := clock.Ms(now)
 	silence := int64(atLeast(set.ClientOfflineAfter, 1))*set.IntervalMs + set.HeartbeatTimeoutMs
+	if nowMs-clock.Ms(readyAt) <= silence {
+		// max(last_heartbeat, readyAt) is readyAt for every row that could
+		// qualify, and the server has not been up long enough to have
+		// seen that much silence from anyone.
+		return nil
+	}
 
 	var clients []store.MonClient
 	if err := e.st.DB.WithContext(ctx).
@@ -320,6 +336,30 @@ func (e *Engine) MarkOffline(ctx context.Context) error {
 		e.flush(ctx, &notify)
 	}
 	return nil
+}
+
+// ServerReady is called once by internal/app, when the listener starts
+// completing TLS handshakes (after the ACME certificate is in place), and
+// returns that moment as serverReadyAt for every later MarkOffline. It also
+// writes mon-server's only report of its own downtime (decision #84 §3): one
+// log line with the age of the freshest last_heartbeat of any mon-client.
+// There is no event and no Telegram — the panel's STALE and "monitoring
+// back" already tell the operator — and no line at all on an install no
+// mon-client has ever heartbeated to. A failed read only costs the line.
+func (e *Engine) ServerReady(ctx context.Context) time.Time {
+	now := e.clk.Now()
+
+	var last *int64
+	if err := e.st.DB.WithContext(ctx).Model(&store.MonClient{}).
+		Select("MAX(last_heartbeat)").Scan(&last).Error; err != nil {
+		slog.Warn("state: reading the last heartbeat at start failed", "err", err)
+		return now
+	}
+	if last != nil {
+		ago := now.Sub(clock.FromMs(*last)).Round(time.Second)
+		slog.Info(fmt.Sprintf("started; last heartbeat seen %s ago", ago))
+	}
+	return now
 }
 
 // SyncInbounds reacts to the panel's inbound list on every poll

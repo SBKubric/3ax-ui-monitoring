@@ -401,7 +401,20 @@ func (a *App) Start() (addr string, err error) {
 // (spec §7.3). A failed sweep is logged rather than fatal: the next tick
 // re-evaluates every mon-client from the database, so a transient SQLite
 // error costs at most one tick's latency on an OFFLINE verdict.
+//
+// The job does not start until the listener can complete a TLS handshake
+// (mgr.Ready: at once in "files" mode, once the ACME certificate is cached
+// in "acme-ip" mode). That moment is serverReadyAt, and every sweep counts
+// a mon-client's silence from no earlier than it (decision #84): a
+// heartbeat mon-server was not there to receive is not a missed one.
 func (a *App) runOfflineSweep(ctx context.Context) {
+	select {
+	case <-ctx.Done():
+		return
+	case <-a.mgr.Ready():
+	}
+	readyAt := a.engine.ServerReady(ctx)
+
 	t := time.NewTicker(offlineSweep)
 	defer t.Stop()
 	for {
@@ -409,7 +422,7 @@ func (a *App) runOfflineSweep(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			if err := a.engine.MarkOffline(ctx); err != nil {
+			if err := a.engine.MarkOffline(ctx, readyAt); err != nil {
 				slog.Warn("app: marking silent mon-clients offline failed", "err", err)
 			}
 		}

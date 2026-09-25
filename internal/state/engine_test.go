@@ -1,10 +1,12 @@
 package state
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -556,7 +558,9 @@ func TestHeartbeat_PanelDownStaysSilentForUnknownTransitions(t *testing.T) {
 // TestMarkOffline covers spec §7.3 end to end: silence past
 // clientOfflineAfter intervals turns the mon-client OFFLINE with reason
 // heartbeat_missed and drops its targets to UNKNOWN without alerting on
-// each one.
+// each one. mon-server has been ready since baseTime, before the heartbeat,
+// so this is plain silence with no restart in it: the count runs from
+// last_heartbeat exactly as it did before decision #84.
 func TestMarkOffline(t *testing.T) {
 	f := newFixture(t)
 	f.clk.Advance(time.Minute)
@@ -570,7 +574,7 @@ func TestMarkOffline(t *testing.T) {
 
 	// One millisecond short of the threshold: nothing happens yet.
 	f.clk.Advance(silence)
-	if err := f.e.MarkOffline(context.Background()); err != nil {
+	if err := f.e.MarkOffline(context.Background(), baseTime); err != nil {
 		t.Fatalf("MarkOffline: %v", err)
 	}
 	if got := f.reload().State; got != store.MonClientOnline {
@@ -578,7 +582,7 @@ func TestMarkOffline(t *testing.T) {
 	}
 
 	f.clk.Advance(time.Millisecond)
-	if err := f.e.MarkOffline(context.Background()); err != nil {
+	if err := f.e.MarkOffline(context.Background(), baseTime); err != nil {
 		t.Fatalf("MarkOffline: %v", err)
 	}
 	mc := f.reload()
@@ -609,7 +613,7 @@ func TestMarkOffline(t *testing.T) {
 	// A second sweep must not repeat itself.
 	before := len(evs)
 	f.clk.Advance(time.Hour)
-	if err := f.e.MarkOffline(context.Background()); err != nil {
+	if err := f.e.MarkOffline(context.Background(), baseTime); err != nil {
 		t.Fatalf("MarkOffline: %v", err)
 	}
 	if len(f.events()) != before {
@@ -630,7 +634,7 @@ func TestMarkOffline_NeverSeenClientIsLeftAlone(t *testing.T) {
 	f := newFixture(t)
 	f.clk.Advance(24 * time.Hour)
 
-	if err := f.e.MarkOffline(context.Background()); err != nil {
+	if err := f.e.MarkOffline(context.Background(), baseTime); err != nil {
 		t.Fatalf("MarkOffline: %v", err)
 	}
 	if got := f.reload().State; got != store.MonClientNever {
@@ -650,7 +654,7 @@ func TestMarkOffline_PanelDownAnnouncesItself(t *testing.T) {
 	f.panelDown = true
 	f.clk.Advance(time.Hour)
 
-	if err := f.e.MarkOffline(context.Background()); err != nil {
+	if err := f.e.MarkOffline(context.Background(), baseTime); err != nil {
 		t.Fatalf("MarkOffline: %v", err)
 	}
 	want := tg.MsgMonClientTransition("ams-1", "NL", store.MonClientOnline, store.MonClientOffline)
@@ -660,6 +664,145 @@ func TestMarkOffline_PanelDownAnnouncesItself(t *testing.T) {
 	evs := f.events()
 	if !evs[len(evs)-1].Notified {
 		t.Fatalf("event = %+v, want notified=true", evs[len(evs)-1])
+	}
+}
+
+// offlineSilence is spec §7.3's threshold under the fixture's settings:
+// clientOfflineAfter whole intervals plus the heartbeat timeout.
+func (f *fixture) offlineSilence() time.Duration {
+	f.t.Helper()
+	set, err := f.st.LoadSettings()
+	if err != nil {
+		f.t.Fatalf("LoadSettings: %v", err)
+	}
+	return time.Duration(int64(set.ClientOfflineAfter)*set.IntervalMs+set.HeartbeatTimeoutMs) * time.Millisecond
+}
+
+// sweep runs one pass of the 20 s liveness job for a mon-server that became
+// ready at readyAt, and advances the clock to the next tick.
+func (f *fixture) sweep(readyAt time.Time) {
+	f.t.Helper()
+	if err := f.e.MarkOffline(context.Background(), readyAt); err != nil {
+		f.t.Fatalf("MarkOffline: %v", err)
+	}
+	f.clk.Advance(20 * time.Second)
+}
+
+// TestMarkOffline_RestartAfterDowntimeIsNotAnOutage is issue #89 (decision
+// #84): mon-server itself was down for longer than clientOfflineAfter
+// intervals, and the first sweeps after it comes back must not count its
+// own downtime as the mon-client's silence. Before the fix the first sweep
+// saw the stale last_heartbeat and filed ONLINE → OFFLINE, and the
+// mon-client's next heartbeat filed OFFLINE → ONLINE a moment later.
+func TestMarkOffline_RestartAfterDowntimeIsNotAnOutage(t *testing.T) {
+	f := newFixture(t)
+	f.clk.Advance(time.Minute)
+	f.beat(f.cycle(1, result(keyProxy, true, "")))
+	before := f.events()
+
+	f.clk.Advance(f.offlineSilence() + time.Minute) // mon-server is down
+	readyAt := f.clk.Now()
+
+	// The mon-client's next heartbeat lands within one interval of the
+	// listener coming back; the sweeps on either side of it stay quiet.
+	for range 3 {
+		f.sweep(readyAt)
+	}
+	f.beat(f.cycle(2, result(keyProxy, true, "")))
+	for range 3 {
+		f.sweep(readyAt)
+	}
+
+	if got := f.events(); len(got) != len(before) {
+		t.Fatalf("events after the restart = %+v, want none", got[len(before):])
+	}
+	if got := f.reload().State; got != store.MonClientOnline {
+		t.Fatalf("state = %s, want ONLINE throughout", got)
+	}
+	if got := f.targetState(keyProxy); got.State != store.TargetUp {
+		t.Fatalf("target = %s/%s, want still UP", got.State, got.Reason)
+	}
+	if len(f.tgr.Sent) != 0 {
+		t.Fatalf("telegram = %v, want nothing", f.tgr.Sent)
+	}
+}
+
+// TestMarkOffline_ClientDeadDuringDowntime is the other half of decision
+// #84 §1: a mon-client that really died while mon-server was down still goes
+// OFFLINE, clientOfflineAfter intervals after serverReadyAt — the silence
+// the running server saw itself — and not a moment earlier.
+func TestMarkOffline_ClientDeadDuringDowntime(t *testing.T) {
+	f := newFixture(t)
+	f.clk.Advance(time.Minute)
+	f.beat(f.cycle(1, result(keyProxy, true, "")))
+
+	f.clk.Advance(f.offlineSilence() + time.Minute) // mon-server is down
+	readyAt := f.clk.Now()
+
+	f.clk.Advance(f.offlineSilence())
+	if err := f.e.MarkOffline(context.Background(), readyAt); err != nil {
+		t.Fatalf("MarkOffline: %v", err)
+	}
+	if got := f.reload().State; got != store.MonClientOnline {
+		t.Fatalf("state = %s, want still ONLINE exactly at the threshold after serverReadyAt", got)
+	}
+
+	f.clk.Advance(time.Millisecond)
+	if err := f.e.MarkOffline(context.Background(), readyAt); err != nil {
+		t.Fatalf("MarkOffline: %v", err)
+	}
+	if got := f.reload().State; got != store.MonClientOffline {
+		t.Fatalf("state = %s, want OFFLINE once the server itself has seen the whole silence", got)
+	}
+	evs := f.events()
+	if last := evs[len(evs)-1]; last.Kind != eventKindTarget || last.Reason != ReasonMonClientOffline {
+		t.Fatalf("last event = %+v, want the target's move to UNKNOWN", last)
+	}
+	var offline int
+	for _, ev := range evs {
+		if ev.Kind == eventKindMonClient && ev.To == store.MonClientOffline && ev.Reason == ReasonHeartbeatMissed {
+			offline++
+		}
+	}
+	if offline != 1 {
+		t.Fatalf("events = %+v, want exactly one mon_client OFFLINE heartbeat_missed", evs)
+	}
+}
+
+// TestServerReady_LogsTheFreshestHeartbeat pins decision #84 §3: mon-server
+// reports its own downtime only as one log line at start, measured from the
+// most recent last_heartbeat of any mon-client, and says nothing when no
+// mon-client has ever heartbeated.
+func TestServerReady_LogsTheFreshestHeartbeat(t *testing.T) {
+	var logs bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	f := newFixture(t)
+	if got := f.e.ServerReady(context.Background()); !got.Equal(f.clk.Now()) {
+		t.Fatalf("ServerReady = %v, want the clock's now %v", got, f.clk.Now())
+	}
+	if strings.Contains(logs.String(), "last heartbeat seen") {
+		t.Fatalf("logs = %q, want no heartbeat line before any mon-client heartbeated", logs.String())
+	}
+
+	older := clock.Ms(baseTime)
+	other := &store.MonClient{
+		Id: "msk-1", Name: "msk-1", Region: "RU", Enabled: true,
+		State: store.MonClientOffline, ApprovedAt: older, LastHeartbeat: &older,
+	}
+	if err := f.st.DB.Create(other).Error; err != nil {
+		t.Fatalf("create mon-client: %v", err)
+	}
+	f.clk.Advance(time.Minute)
+	f.beat()
+	f.clk.Advance(4*time.Minute + 2*time.Second)
+
+	logs.Reset()
+	f.e.ServerReady(context.Background())
+	if want := "started; last heartbeat seen 4m2s ago"; !strings.Contains(logs.String(), want) {
+		t.Fatalf("logs = %q, want %q", logs.String(), want)
 	}
 }
 
@@ -1019,7 +1162,7 @@ func TestRevoke_AlreadyOfflineFilesNoTransition(t *testing.T) {
 	f.clk.Advance(time.Minute)
 	f.beat(f.cycle(1, result(keyProxy, true, "")))
 	f.clk.Advance(time.Hour)
-	if err := f.e.MarkOffline(context.Background()); err != nil {
+	if err := f.e.MarkOffline(context.Background(), baseTime); err != nil {
 		t.Fatalf("MarkOffline: %v", err)
 	}
 	before := len(f.events())
