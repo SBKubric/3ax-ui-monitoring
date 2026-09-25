@@ -19,7 +19,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/amnezia-vpn/amneziawg-go/v3/conn"
 	"github.com/amnezia-vpn/amneziawg-go/v3/device"
 
 	"github.com/SBKubric/3ax-ui-monitoring/internal/client/config"
@@ -72,7 +71,7 @@ func Open(cfg *config.AWGConfig) (*Device, error) {
 	if err != nil {
 		return nil, fmt.Errorf("awg: create netstack tun: %w", err)
 	}
-	dev := device.NewDevice(tun, conn.NewDefaultBind(), ring.logger())
+	dev := device.NewDevice(tun, newBind(), ring.logger())
 	if err := dev.IpcSet(cfg.UAPI); err != nil {
 		dev.Close()
 		return nil, fmt.Errorf("awg: apply uapi config: %w", err)
