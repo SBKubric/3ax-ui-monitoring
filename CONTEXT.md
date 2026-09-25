@@ -1,6 +1,6 @@
 # 3AX-UI monitoring
 
-Мониторинг inbound'ов панели 3AX-UI: один mon-server и коробки mon-client в целевых регионах, которые проверяют, что каждый inbound real server работает для реальных клиентов через proxy front и напрямую. Термины real server, proxy front, host override и tunnel subscription определены в [CONTEXT.md репо панели](https://github.com/SBKubric/3ax-ui-proxy/blob/main/CONTEXT.md) и здесь повторены для чтения без переключения.
+Мониторинг inbound'ов панели 3AX-UI: один mon-server и коробки mon-client в целевых регионах, которые проверяют, что каждый inbound real server работает для реальных клиентов через proxy front и напрямую. Термины real server, proxy front, host override, tunnel subscription и термины цепочки (chain, hop, edge front, inner front, active edge) определены в [CONTEXT.md репо панели](https://github.com/SBKubric/3ax-ui-proxy/blob/main/CONTEXT.md) и здесь повторены для чтения без переключения — в объёме, нужном мониторингу.
 
 ## Language
 
@@ -13,12 +13,32 @@ _Avoid_: upstream, hidden server, panel box
 _Avoid_: proxy box, relay server, relay панель, front
 
 **Host override**:
-Глобальная настройка панели, подменяющая адрес real server на адрес proxy front во всех выдаваемых конфигах и ссылках подписки.
+Глобальная настройка панели, подменяющая адрес real server на адрес proxy front (с цепочкой — active edge) во всех выдаваемых конфигах и ссылках подписки.
 _Avoid_: proxy override, address substitution
 
 **Tunnel subscription**:
 Публичный маршрут подписки панели, отдающий по subId клиентские конфиги AmneziaWG и WireGuard той же подписки; дополняет xray-подписку, не меняя её.
 _Avoid_: AWG subscription, conf feed, tunnel feed
+
+**Chain** (цепочка):
+Связный список proxy front'ов между клиентами и real server: каждое звено relay'ит на следующее. На панель — одна цепочка; её реестр панель отдаёт mon-server в `GET /state`.
+_Avoid_: multi-hop, relay chain, route
+
+**Hop** (звено):
+Один proxy front в составе цепочки; у каждого звена, которое мониторинг пробирует, свой path.
+_Avoid_: node, link, box
+
+**Edge front** (внешнее звено):
+Звено, которое видят клиенты; кандидат на host override. Path — `edge:<name>`.
+_Avoid_: entry node, public front, exit
+
+**Inner front** (внутреннее звено):
+Звено, которое знают только соседние звенья; в клиентские конфиги не попадает. Path — `inner:<name>`; его проба проверяет отрезок цепочки от этого звена до real server.
+_Avoid_: middle hop, intermediate, transit
+
+**Active edge** (активное edge):
+Edge front, на который сейчас указывает host override. Отдельного path у него нет: пробируются все edge, и его смена targets не меняет.
+_Avoid_: current front, primary
 
 **mon-server**:
 Единственный внешний сервис мониторинга на отдельном сервере: ведёт реестр mon-clients, получает у real server конфиги probe accounts и текущий host override, раздаёт mon-clients их targets, считает состояние каждого target и сообщает real server переходы и статистику.
@@ -33,7 +53,7 @@ _Avoid_: agent, probe node, sensor
 _Avoid_: check, monitor, endpoint
 
 **Path**:
-Через какой адрес target достигает real server: `proxy` (адрес proxy front из host override) или `direct` (настоящий адрес real server).
+Через какой адрес target достигает real server: `direct` (настоящий адрес real server), `edge:<name>` или `inner:<name>` (конкретное звено цепочки по имени) либо, только на панели без цепочки, `proxy` (адрес proxy front из host override). В `paths` mon-client'а, кроме `direct` и конкретных звеньев, допустим `hops` — все пробируемые звенья цепочки, включая будущие (на панели без цепочки — `proxy`).
 _Avoid_: mode, route
 
 **Probe account**:
