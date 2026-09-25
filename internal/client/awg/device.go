@@ -19,7 +19,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/amnezia-vpn/amneziawg-go/v3/conn"
 	"github.com/amnezia-vpn/amneziawg-go/v3/device"
 
 	"github.com/SBKubric/3ax-ui-monitoring/internal/client/config"
@@ -56,9 +55,10 @@ type Device struct {
 
 // Open brings up a fresh netstack device for cfg: a netTUN with the
 // `.conf`'s addresses and MTU (our copy of amneziawg-go's CreateNetTUN —
-// see netTUN for why), NewDevice on the default UDP bind, IpcSet with the
-// UAPI blob internal/client/config already rendered in IpcSet order, then
-// Up (research §3.4).
+// see netTUN for why), NewDevice on a batch-1 UDP bind (probeBind — see
+// there why not the default one), IpcSet with the UAPI blob
+// internal/client/config already rendered in IpcSet order, then Up
+// (research §3.4).
 //
 // The stack has no DNS resolver: mon-client always dials mon-server by
 // address, never by name (spec §4), so a resolver inside the tunnel would
@@ -72,7 +72,7 @@ func Open(cfg *config.AWGConfig) (*Device, error) {
 	if err != nil {
 		return nil, fmt.Errorf("awg: create netstack tun: %w", err)
 	}
-	dev := device.NewDevice(tun, conn.NewDefaultBind(), ring.logger())
+	dev := newDevice(tun, ring.logger())
 	if err := dev.IpcSet(cfg.UAPI); err != nil {
 		dev.Close()
 		return nil, fmt.Errorf("awg: apply uapi config: %w", err)
@@ -82,6 +82,13 @@ func Open(cfg *config.AWGConfig) (*Device, error) {
 		return nil, fmt.Errorf("awg: bring device up: %w", err)
 	}
 	return &Device{dev: dev, tun: tun, ring: ring}, nil
+}
+
+// newDevice is the one way this package builds an amneziawg-go device, so
+// Check judges a config on the very device Open would run it on: netTUN
+// underneath, probeBind for the UDP side.
+func newDevice(tun *netTUN, log *device.Logger) *device.Device {
+	return device.NewDevice(tun, newProbeBind(), log)
 }
 
 // DialContext opens a TCP connection through the tunnel. It is the
