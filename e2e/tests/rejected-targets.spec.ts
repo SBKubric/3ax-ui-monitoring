@@ -17,7 +17,7 @@ test('targets a mon-client rejected are shown with their errors', async ({ admin
   // (requests.spec.ts); this one is about what a heartbeat leaves behind.
   const approved = await adminPage.request.post(`/admin/api/requests/${requestId}/approve`, {
     headers: { 'X-Requested-With': 'XMLHttpRequest' },
-    data: { mode: 'new', name: 'Rejecting Box', region: 'E2E', paths: ['proxy', 'direct'] },
+    data: { mode: 'new', name: 'Rejecting Box', region: 'E2E', paths: ['direct', 'hops'] },
   });
   expect(approved.status(), await approved.text()).toBe(200);
   const monClientId: string = (await approved.json()).obj.monClientId;
