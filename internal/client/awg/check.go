@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net/netip"
 
-	"github.com/amnezia-vpn/amneziawg-go/v3/conn"
 	"github.com/amnezia-vpn/amneziawg-go/v3/device"
 
 	"github.com/SBKubric/3ax-ui-monitoring/internal/client/config"
@@ -42,7 +41,7 @@ func Check(cfg *config.AWGConfig) error {
 	}
 	// A logger that drops everything: IpcSet logs its own error before
 	// returning it, and the returned one is all a rejection needs.
-	dev := device.NewDevice(tun, conn.NewDefaultBind(), device.NewLogger(device.LogLevelSilent, ""))
+	dev := newDevice(tun, device.NewLogger(device.LogLevelSilent, ""))
 	defer dev.Close()
 	if err := dev.IpcSet(uapi); err != nil {
 		return fmt.Errorf("awg: apply uapi config: %w", err)
