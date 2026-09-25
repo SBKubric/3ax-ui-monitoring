@@ -167,11 +167,11 @@ func TestRebuild_ProtocolComesFromPanelInbounds(t *testing.T) {
 }
 
 // TestRebuild_ProxyOnlyClientNeverSeesRealServer is the hostile-region rule
-// (protocol §4.2): a mon-client with paths=["proxy"] gets no direct targets
+// (protocol §4.2): a mon-client with paths=["hops"] gets no direct targets
 // and its document never mentions the real server's address.
 func TestRebuild_ProxyOnlyClientNeverSeesRealServer(t *testing.T) {
 	b, r, st, clk, _ := newTestBuilder(t)
-	mc := approve(t, r, clk, "hostile-1", []string{store.PathProxy})
+	mc := approve(t, r, clk, "hostile-1", []string{store.PathHops})
 
 	if err := b.RebuildAll(context.Background()); err != nil {
 		t.Fatalf("RebuildAll: %v", err)
@@ -220,7 +220,7 @@ func TestRebuild_OverrideOffDropsProxyTargets(t *testing.T) {
 // panel has already substituted the right host, so mon-server copies.
 func TestRebuild_LinkAndConfPassedThrough(t *testing.T) {
 	b, r, _, clk, _ := newTestBuilder(t)
-	mc := approve(t, r, clk, "ams-1", []string{store.PathProxy})
+	mc := approve(t, r, clk, "ams-1", []string{store.PathHops})
 	if err := b.RebuildAll(context.Background()); err != nil {
 		t.Fatalf("RebuildAll: %v", err)
 	}
@@ -312,7 +312,7 @@ func TestRevision_ChangesWith(t *testing.T) {
 		{
 			name: "paths",
 			mutate: func(t *testing.T, b *ConfigBuilder, st *store.Store, r *Registry, mat *fakeMaterial, id string) {
-				if err := r.Update(context.Background(), id, "ams-1", "", []string{store.PathProxy}); err != nil {
+				if err := r.Update(context.Background(), id, "ams-1", "", []string{store.PathHops}); err != nil {
 					t.Fatalf("Update: %v", err)
 				}
 			},
@@ -528,6 +528,80 @@ func TestSnapshotSource(t *testing.T) {
 	}
 }
 
+// TestSnapshotSource_Paths checks contract 3 §4.3: the snapshot carries
+// every mon-client's paths as stored, with the default applied to a row
+// that has none, so the panel keeps AWG probe peers only for the pairs each
+// one probes.
+func TestSnapshotSource_Paths(t *testing.T) {
+	r, st, clk := newTestRegistry(t)
+	mc := approve(t, r, clk, "ams-1", []string{store.PathDirect})
+	if err := st.DB.Model(&store.MonClient{}).Where("id = ?", mc.Id).Update("paths", "[]").Error; err != nil {
+		t.Fatalf("clear paths: %v", err)
+	}
+	approve(t, r, clk, "msk-1", []string{store.PathDirect})
+
+	snap, err := r.SnapshotSource().Snapshot(context.Background())
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	got := map[string]string{}
+	for _, s := range snap {
+		got[s.Id] = strings.Join(s.Paths, ",")
+	}
+	if got["ams-1"] != strings.Join(pathsOf(&store.MonClient{}), ",") || got["msk-1"] != "direct" {
+		t.Fatalf("snapshot paths = %v, want the default for ams-1 and direct for msk-1", got)
+	}
+}
+
+// TestSnapshotSource_SaveUnallocated checks that the ensure's unallocated
+// pairs land on their mon-clients (spec §3 mon_clients.unallocated) with
+// the panel's reasons, that a mon-client the list does not name is cleared,
+// and that a pair of a mon-client mon-server does not know is ignored.
+func TestSnapshotSource_SaveUnallocated(t *testing.T) {
+	r, _, clk := newTestRegistry(t)
+	approve(t, r, clk, "ams-1", nil)
+	approve(t, r, clk, "msk-1", nil)
+	src := r.SnapshotSource()
+	ctx := context.Background()
+
+	err := src.SaveUnallocated(ctx, []panel.Unallocated{
+		{MonClientId: "ams-1", Path: "inner:core-1", Reason: store.UnallocatedLimit},
+		{MonClientId: "ams-1", Path: "edge:edge-b", Reason: store.UnallocatedLimit},
+		{MonClientId: "msk-1", Path: store.PathDirect, Reason: store.UnallocatedPoolExhausted},
+		{MonClientId: "gone-1", Path: store.PathDirect, Reason: store.UnallocatedLimit},
+	})
+	if err != nil {
+		t.Fatalf("SaveUnallocated: %v", err)
+	}
+	unallocated := func(id string) string {
+		mc, err := r.Get(ctx, id)
+		if err != nil {
+			t.Fatalf("Get(%s): %v", id, err)
+		}
+		var out []string
+		for _, u := range mc.UnallocatedList() {
+			out = append(out, u.Path+"/"+u.Reason)
+		}
+		return strings.Join(out, ",")
+	}
+	if got := unallocated("ams-1"); got != "inner:core-1/limit,edge:edge-b/limit" {
+		t.Fatalf("ams-1 unallocated = %s", got)
+	}
+	if got := unallocated("msk-1"); got != "direct/pool_exhausted" {
+		t.Fatalf("msk-1 unallocated = %s", got)
+	}
+
+	if err := src.SaveUnallocated(ctx, []panel.Unallocated{{MonClientId: "msk-1", Path: store.PathDirect, Reason: store.UnallocatedLimit}}); err != nil {
+		t.Fatalf("SaveUnallocated: %v", err)
+	}
+	if got := unallocated("ams-1"); got != "" {
+		t.Fatalf("ams-1 unallocated = %s after a list without it, want cleared", got)
+	}
+	if got := unallocated("msk-1"); got != "direct/limit" {
+		t.Fatalf("msk-1 unallocated = %s, want the new reason", got)
+	}
+}
+
 // --- End to end through the real poller and a panel stub ---
 
 // TestRebuildAllThroughPoller drives the whole seam spec §4 step 3
@@ -608,8 +682,8 @@ func TestExclusions_Reason(t *testing.T) {
 		key      TargetKey
 		want     string
 	}{
-		{"path taken off the mon-client", []string{store.PathProxy}, true, direct12, PausePathRemoved},
-		{"override switched off", []string{store.PathProxy, store.PathDirect}, false, proxy12, PauseOverrideDisabled},
+		{"path taken off the mon-client", []string{store.PathHops}, true, direct12, PausePathRemoved},
+		{"override switched off", []string{store.PathHops, store.PathDirect}, false, proxy12, PauseOverrideDisabled},
 		{"path removed wins over override", []string{store.PathDirect}, false, proxy12, PausePathRemoved},
 		{"enabled inbound without a probe link", []string{store.PathDirect}, true, direct13, PauseNoProbeLink},
 		{"disabled inbound is the inbound's business", []string{store.PathDirect}, true, direct14, ""},
@@ -638,7 +712,7 @@ func TestExclusions_Reason(t *testing.T) {
 	t.Run("no material says nothing", func(t *testing.T) {
 		b, r, _, clk, mat := newTestBuilder(t)
 		mat.ok = false
-		mc := approve(t, r, clk, "ams-1", []string{store.PathProxy})
+		mc := approve(t, r, clk, "ams-1", []string{store.PathHops})
 		x, err := b.Exclusions(context.Background(), mc.Id)
 		if err != nil {
 			t.Fatalf("Exclusions: %v", err)
@@ -722,7 +796,7 @@ func TestRebuild_AwgItemsArePerMonClient(t *testing.T) {
 func TestExclusions_ExpectedAwgTargets(t *testing.T) {
 	b, r, st, clk, mat := newTestBuilder(t)
 	waw := approve(t, r, clk, "waw-1", nil)
-	hostile := approve(t, r, clk, "hostile-1", []string{store.PathProxy})
+	hostile := approve(t, r, clk, "hostile-1", []string{store.PathHops})
 
 	render := func(keys []TargetKey) string {
 		out := make([]string, 0, len(keys))
@@ -764,5 +838,201 @@ func TestExclusions_ExpectedAwgTargets(t *testing.T) {
 	mat.ok = false
 	if got := expected(waw.Id); got != "" {
 		t.Errorf("no material: waw-1 expects %q, want nothing", got)
+	}
+}
+
+// --- Paths by chain (spec §5.1, decision #61) ---
+
+// chainMaterial is sampleMaterial on a chained panel: an inner hop and two
+// edges, edge-a active, each hop with its own xray link and one AWG peer
+// per mon-client (ams-1 everywhere, fra-1 on the edges only). Proxy items
+// are left in to prove they are never used once the chain has probed hops.
+func chainMaterial(active string) panel.Material {
+	m := sampleMaterial()
+	m.Revision = "rev-chain-" + active
+	m.Chain = &panel.Chain{Revision: 7, ActiveEdge: &active, Hops: []panel.Hop{
+		{Name: "core-1", Role: "inner", Host: "10.0.0.7", State: "joined"},
+		{Name: "edge-a", Role: "edge", Host: "a.example.net", State: "joined"},
+		{Name: "edge-b", Role: "edge", Host: "b.example.net", State: "legacy"},
+	}}
+	m.Hops = map[string][]panel.ProbeItem{}
+	for _, h := range m.Chain.Hops {
+		items := []panel.ProbeItem{
+			{Kind: store.InboundKindXray, InboundId: 12, Link: "vless://probe@" + h.Host + ":443#probe-12"},
+			{Kind: store.InboundKindAwg, InboundId: 0, MonClientId: "ams-1", Conf: "[Peer]\nEndpoint = " + h.Host + ":51820\n"},
+		}
+		if h.Role == "edge" {
+			items = append(items, panel.ProbeItem{Kind: store.InboundKindAwg, InboundId: 0, MonClientId: "fra-1", Conf: "# fra-1\n[Peer]\nEndpoint = " + h.Host + ":51820\n"})
+		}
+		m.Hops[h.Path()] = items
+	}
+	return m
+}
+
+// TestExpandPaths is spec §5.1's table: direct is direct; hops is every
+// probed hop — or proxy on a panel without one; a hop by name is that hop
+// while it is probed and nothing otherwise; a repeat after expansion is one
+// path.
+func TestExpandPaths(t *testing.T) {
+	flat := sampleMaterial()
+	chained := chainMaterial("edge-a")
+	cases := []struct {
+		name  string
+		mat   panel.Material
+		vocab []string
+		want  string
+	}{
+		{"no chain, default", flat, []string{store.PathDirect, store.PathHops}, "direct,proxy"},
+		{"no chain, hops only", flat, []string{store.PathHops}, "proxy"},
+		{"no chain, a hop by name", flat, []string{store.PathDirect, "edge:edge-a"}, "direct"},
+		{"chain, default", chained, []string{store.PathDirect, store.PathHops}, "direct,inner:core-1,edge:edge-a,edge:edge-b"},
+		{"chain, hops only", chained, []string{store.PathHops}, "inner:core-1,edge:edge-a,edge:edge-b"},
+		{"chain, hops by name", chained, []string{"edge:edge-b", "inner:core-1"}, "edge:edge-b,inner:core-1"},
+		{"chain, a hop that is not probed", chained, []string{store.PathDirect, "edge:gone", "inner:edge-a"}, "direct"},
+		{"chain, hops and a name", chained, []string{store.PathHops, "edge:edge-a"}, "inner:core-1,edge:edge-a,edge:edge-b"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := strings.Join(ExpandPaths(tc.vocab, tc.mat), ","); got != tc.want {
+				t.Fatalf("ExpandPaths(%v) = %s, want %s", tc.vocab, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestRebuild_ChainTargets checks the targets of a chained panel (decision
+// #61 п. 1): inbounds × direct and every probed hop, proxy never, each
+// hop's link as the panel rendered it, and AWG only where the mon-client
+// has its own peer.
+func TestRebuild_ChainTargets(t *testing.T) {
+	b, r, _, clk, mat := newTestBuilder(t)
+	mat.m = chainMaterial("edge-a")
+	ams := approve(t, r, clk, "ams-1", nil)
+	fra := approve(t, r, clk, "fra-1", []string{store.PathHops})
+	if err := b.RebuildAll(context.Background()); err != nil {
+		t.Fatalf("RebuildAll: %v", err)
+	}
+
+	amsDoc := mustCurrent(t, b, ams.Id)
+	want := "awg:0/direct,awg:0/edge:edge-a,awg:0/edge:edge-b,awg:0/inner:core-1,xray:12/direct,xray:12/edge:edge-a,xray:12/edge:edge-b,xray:12/inner:core-1"
+	if got := strings.Join(keysOf(amsDoc), ","); got != want {
+		t.Fatalf("ams-1 targets = %s, want %s", got, want)
+	}
+	for _, tgt := range amsDoc.Targets {
+		if tgt.InboundKind == store.InboundKindXray && tgt.Path == "inner:core-1" && tgt.Link != "vless://probe@10.0.0.7:443#probe-12" {
+			t.Errorf("inner:core-1 link = %q, want the hop's own", tgt.Link)
+		}
+	}
+	// fra-1 has no peer on the inner hop: no AWG target there.
+	want = "awg:0/edge:edge-a,awg:0/edge:edge-b,xray:12/edge:edge-a,xray:12/edge:edge-b,xray:12/inner:core-1"
+	if got := strings.Join(keysOf(mustCurrent(t, b, fra.Id)), ","); got != want {
+		t.Fatalf("fra-1 targets = %s, want %s", got, want)
+	}
+}
+
+// TestRevision_Chain checks what a wave of the chain does to config
+// revisions (decision #61 п. 1–2, spec §5): switching the active edge
+// changes nothing a mon-client is told, so no revision moves; a hop joining
+// moves the revision of a mon-client that follows every hop, but not of one
+// that names its hops; the chain appearing moves every revision (proxy
+// leaves, the hops come in).
+func TestRevision_Chain(t *testing.T) {
+	b, r, _, clk, mat := newTestBuilder(t)
+	all := approve(t, r, clk, "ams-1", nil)
+	named := approve(t, r, clk, "fra-1", []string{"edge:edge-a"})
+	ctx := context.Background()
+	rebuild := func() (string, string) {
+		t.Helper()
+		if err := b.RebuildAll(ctx); err != nil {
+			t.Fatalf("RebuildAll: %v", err)
+		}
+		return mustRevision(t, b, all.Id), mustRevision(t, b, named.Id)
+	}
+
+	flatAll, flatNamed := rebuild()
+
+	mat.m = chainMaterial("edge-a")
+	chainAll, chainNamed := rebuild()
+	if chainAll == flatAll || chainNamed == flatNamed {
+		t.Fatal("the chain appearing left a config revision unchanged")
+	}
+
+	mat.m = chainMaterial("edge-b")
+	if a, n := rebuild(); a != chainAll || n != chainNamed {
+		t.Fatalf("active edge switch moved config revisions: %s→%s, %s→%s", chainAll, a, chainNamed, n)
+	}
+
+	m := chainMaterial("edge-b")
+	m.Revision = "rev-joined"
+	m.Chain.Hops = append(m.Chain.Hops, panel.Hop{Name: "edge-c", Role: "edge", Host: "c.example.net", State: "joined"})
+	m.Hops["edge:edge-c"] = []panel.ProbeItem{{Kind: store.InboundKindXray, InboundId: 12, Link: "vless://probe@c.example.net:443#probe-12"}}
+	mat.m = m
+	a, n := rebuild()
+	if a == chainAll {
+		t.Fatal("a hop joining left the revision of a mon-client on hops unchanged")
+	}
+	if n != chainNamed {
+		t.Fatal("a hop joining moved the revision of a mon-client that names other hops")
+	}
+}
+
+// TestExclusions_Chain is spec §5.1 for targets outside the document on a
+// chained panel: a path the panel no longer serves (proxy, a hop that left)
+// is Retired — removed without an event, never PAUSED — while a served hop
+// the mon-client does not probe is path_removed, and a served hop the panel
+// gave this mon-client no AWG peer on is no_probe_link.
+func TestExclusions_Chain(t *testing.T) {
+	b, r, _, clk, mat := newTestBuilder(t)
+	mat.m = chainMaterial("edge-a")
+	named := approve(t, r, clk, "fra-1", []string{store.PathDirect, "edge:edge-a"})
+	all := approve(t, r, clk, "ams-1", nil)
+
+	key := func(kind string, path string) TargetKey {
+		id := 12
+		if kind == store.InboundKindAwg {
+			id = 0
+		}
+		return TargetKey{InboundKind: kind, InboundID: id, Path: path}
+	}
+	x, err := b.Exclusions(context.Background(), named.Id)
+	if err != nil {
+		t.Fatalf("Exclusions: %v", err)
+	}
+	for _, tc := range []struct {
+		key     TargetKey
+		retired bool
+		reason  string
+	}{
+		{key(store.InboundKindXray, store.PathProxy), true, ""},
+		{key(store.InboundKindXray, "edge:gone"), true, ""},
+		{key(store.InboundKindXray, "edge:edge-b"), false, PausePathRemoved},
+		{key(store.InboundKindAwg, "edge:edge-a"), false, PauseNoProbeLink},
+	} {
+		if got := x.Retired(tc.key); got != tc.retired {
+			t.Errorf("Retired(%+v) = %v, want %v", tc.key, got, tc.retired)
+		}
+		if got := x.Reason(tc.key); got != tc.reason {
+			t.Errorf("Reason(%+v) = %q, want %q", tc.key, got, tc.reason)
+		}
+	}
+
+	// The AWG targets owed by the panel's state follow the expansion too.
+	x, err = b.Exclusions(context.Background(), all.Id)
+	if err != nil {
+		t.Fatalf("Exclusions: %v", err)
+	}
+	var got []string
+	for _, k := range x.Expected(store.InboundKindAwg) {
+		got = append(got, k.Path)
+	}
+	if strings.Join(got, ",") != "direct,edge:edge-a,edge:edge-b,inner:core-1" {
+		t.Fatalf("Expected(awg) = %v, want direct and every hop", got)
+	}
+
+	// Without material nothing is retired: that would be a guess.
+	mat.ok = false
+	x, _ = b.Exclusions(context.Background(), all.Id)
+	if x.Retired(key(store.InboundKindXray, store.PathProxy)) {
+		t.Fatal("a target was retired without material")
 	}
 }

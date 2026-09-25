@@ -250,6 +250,7 @@ func newApp(d Deps, readTimeout, writeTimeout time.Duration) (*App, error) {
 		Stats:     buckets,
 	})
 	poller.SetInbounds(engine)
+	poller.SetPathSync(engine)
 	poller.SetStats(buckets)
 	reg.SetHooks(registry.Hooks{
 		PathsChanged: configs.Rebuild,

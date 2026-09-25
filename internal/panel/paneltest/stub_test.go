@@ -162,7 +162,7 @@ func TestStub_BareNotFoundWithoutToken(t *testing.T) {
 }
 
 // TestStub_StateCarriesContractHeader checks contract §1: every successful
-// answer announces X-Mon-Contract, 2 by default (decision #80 п. 9), and
+// answer announces X-Mon-Contract, 3 by default (decision #61 п. 5), and
 // GET /state repeats it in the body.
 func TestStub_StateCarriesContractHeader(t *testing.T) {
 	s := paneltest.NewStub(t)
@@ -172,16 +172,19 @@ func TestStub_StateCarriesContractHeader(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
-	if got := resp.Header.Get("X-Mon-Contract"); got != "2" {
-		t.Fatalf("X-Mon-Contract = %q, want \"2\"", got)
+	if got := resp.Header.Get("X-Mon-Contract"); got != "3" {
+		t.Fatalf("X-Mon-Contract = %q, want \"3\"", got)
 	}
 
 	var st panel.State
 	if err := json.Unmarshal(body, &st); err != nil {
 		t.Fatalf("decode state: %v", err)
 	}
-	if st.Contract != 2 {
-		t.Fatalf("state.contract = %d, want 2", st.Contract)
+	if st.Contract != 3 {
+		t.Fatalf("state.contract = %d, want 3", st.Contract)
+	}
+	if st.Chain != nil {
+		t.Fatalf("state.chain = %+v, want absent while the chain registry is empty", st.Chain)
 	}
 	if st.Revision != s.Revision() {
 		t.Fatalf("state.revision = %q, want %q", st.Revision, s.Revision())
@@ -259,15 +262,15 @@ func TestStub_ContractTwoShapes(t *testing.T) {
 		{Kind: "xray", InboundId: 12, Link: "vless://x@real:443"},
 		paneltest.AwgItem("ams-1", "[Interface]\n"),
 	})
-	s.SetUnallocated([]string{"fra-1"})
+	s.SetUnallocated([]panel.Unallocated{{MonClientId: "fra-1", Path: "direct", Reason: "pool_exhausted"}})
 
 	resp, body := do(t, s, http.MethodPost, "/probe/ensure", s.Token(),
 		map[string]any{"monClients": []panel.MonClientSnapshot{{Id: "ams-1"}, {Id: "fra-1"}}})
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("ensure status = %d, want 200", resp.StatusCode)
 	}
-	if !strings.Contains(string(body), `"unallocated":["fra-1"]`) {
-		t.Fatalf("ensure body = %s, want unallocated [fra-1]", body)
+	if !strings.Contains(string(body), `"unallocated":[{"monClientId":"fra-1","path":"direct","reason":"pool_exhausted"}]`) {
+		t.Fatalf("ensure body = %s, want unallocated fra-1 × direct, pool_exhausted", body)
 	}
 
 	_, body = do(t, s, http.MethodGet, "/probe/configs?host=real", s.Token(), nil)
@@ -512,5 +515,143 @@ func TestStub_LegacyAnswersAreEmpty(t *testing.T) {
 	}
 	if got := s.Events(); len(got) != 1 {
 		t.Fatalf("Events() = %d rows, want the event stored", len(got))
+	}
+}
+
+// chainHops is a chain registry with every state a hop can be in: two
+// joined edges given out of name order, a legacy inner, a joined inner, and
+// one pending and one draining hop that the panel does not probe.
+func chainHops() []paneltest.Hop {
+	return []paneltest.Hop{
+		{Name: "edge-b", Role: "edge", Host: "b.example.net", State: "joined"},
+		{Name: "core-2", Role: "inner", Host: "10.0.0.8", State: "joined"},
+		{Name: "edge-a", Role: "edge", Host: "a.example.net", State: "joined"},
+		{Name: "core-1", Role: "inner", Host: "10.0.0.7", State: "legacy"},
+		{Name: "edge-new", Role: "edge", Host: "n.example.net", State: "pending"},
+		{Name: "edge-old", Role: "edge", Host: "o.example.net", State: "draining"},
+	}
+}
+
+// TestStub_StateCarriesChain checks contract 3 §4.1: /state carries the
+// chain with only its joined and legacy hops — inner ones first in chain
+// order, then the edges by name — plus the active edge and the chain's own
+// revision, and a chain change moves the contract revision (§4.2).
+func TestStub_StateCarriesChain(t *testing.T) {
+	s := paneltest.NewStub(t)
+	s.SetInbounds(contractInbounds())
+	before := s.Revision()
+	s.SetChain("edge-a", chainHops())
+
+	_, body := do(t, s, http.MethodGet, "/state", s.Token(), nil)
+	var st panel.State
+	if err := json.Unmarshal(body, &st); err != nil {
+		t.Fatalf("decode state: %v", err)
+	}
+	if st.Chain == nil {
+		t.Fatalf("state = %s, want a chain", body)
+	}
+	var got []string
+	for _, h := range st.Chain.Hops {
+		got = append(got, h.Role+":"+h.Name+"@"+h.Host+"/"+h.State)
+	}
+	want := "inner:core-2@10.0.0.8/joined,inner:core-1@10.0.0.7/legacy,edge:edge-a@a.example.net/joined,edge:edge-b@b.example.net/joined"
+	if strings.Join(got, ",") != want {
+		t.Fatalf("chain.hops = %v, want %s", got, want)
+	}
+	if st.Chain.ActiveEdge == nil || *st.Chain.ActiveEdge != "edge-a" {
+		t.Fatalf("chain.activeEdge = %v, want edge-a", st.Chain.ActiveEdge)
+	}
+	if st.Chain.Revision == 0 {
+		t.Fatal("chain.revision = 0, want the registry's counter")
+	}
+
+	withChain := s.Revision()
+	if withChain == before {
+		t.Fatal("revision did not move when the chain appeared")
+	}
+	s.SetChain("edge-b", chainHops())
+	if s.Revision() == withChain {
+		t.Fatal("revision did not move when the active edge switched")
+	}
+
+	// An active edge that is pending is not among the hops (contract §4.1).
+	s.SetChain("edge-new", chainHops())
+	_, body = do(t, s, http.MethodGet, "/state", s.Token(), nil)
+	st = panel.State{}
+	if err := json.Unmarshal(body, &st); err != nil {
+		t.Fatalf("decode state: %v", err)
+	}
+	if st.Chain.ActiveEdge == nil || *st.Chain.ActiveEdge != "edge-new" || len(st.Chain.Hops) != 4 {
+		t.Fatalf("chain = %+v, want the pending active edge named but not listed", st.Chain)
+	}
+}
+
+// TestStub_HopConfigs checks contract 3 §4.4: ?hop=<name> (and its synonym
+// ?edge=) renders the path of that hop by its role, an unknown name — or a
+// hop and an edge that disagree — is 409 unknown_hop, and a hop that is in
+// the registry but not joined or legacy is 409 hop_not_joined.
+func TestStub_HopConfigs(t *testing.T) {
+	s := paneltest.NewStub(t)
+	s.SetChain("edge-a", chainHops())
+	s.SetItems("edge:edge-a", []panel.ProbeItem{{Kind: "xray", InboundId: 12, Link: "vless://x@a.example.net:443"}})
+	s.SetItems("inner:core-1", []panel.ProbeItem{{Kind: "xray", InboundId: 12, Link: "vless://x@10.0.0.7:443"}})
+	if resp, _ := do(t, s, http.MethodPost, "/probe/ensure", s.Token(), map[string]any{"monClients": []any{}}); resp.StatusCode != http.StatusOK {
+		t.Fatalf("ensure status = %d", resp.StatusCode)
+	}
+
+	for _, tc := range []struct{ query, path, link string }{
+		{"hop=edge-a", "edge:edge-a", "vless://x@a.example.net:443"},
+		{"edge=edge-a", "edge:edge-a", "vless://x@a.example.net:443"},
+		{"hop=core-1", "inner:core-1", "vless://x@10.0.0.7:443"},
+		{"hop=edge-a&edge=edge-a", "edge:edge-a", "vless://x@a.example.net:443"},
+	} {
+		resp, body := do(t, s, http.MethodGet, "/probe/configs?"+tc.query, s.Token(), nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("%s: status = %d body = %s", tc.query, resp.StatusCode, body)
+		}
+		var pc panel.ProbeConfigs
+		if err := json.Unmarshal(body, &pc); err != nil {
+			t.Fatalf("%s: decode: %v", tc.query, err)
+		}
+		if pc.Path != tc.path || len(pc.Items) != 1 || pc.Items[0].Link != tc.link || pc.Revision != s.Revision() {
+			t.Fatalf("%s: answer = %+v, want path %s with %s at the current revision", tc.query, pc, tc.path, tc.link)
+		}
+	}
+
+	for _, tc := range []struct{ query, code string }{
+		{"hop=nope", "unknown_hop"},
+		{"hop=edge-a&edge=edge-b", "unknown_hop"},
+		{"hop=edge-new", "hop_not_joined"},
+		{"edge=edge-old", "hop_not_joined"},
+	} {
+		resp, body := do(t, s, http.MethodGet, "/probe/configs?"+tc.query, s.Token(), nil)
+		if resp.StatusCode != http.StatusConflict || !strings.Contains(string(body), tc.code) {
+			t.Fatalf("%s: status = %d body = %s, want 409 %s", tc.query, resp.StatusCode, body, tc.code)
+		}
+	}
+}
+
+// TestStub_EnsureRecordsPaths checks contract 3 §4.3: the snapshot carries
+// each mon-client's paths vocabulary, the stub keeps it for a test to
+// assert on, and a value outside the vocabulary (a stale "proxy") is
+// refused whole.
+func TestStub_EnsureRecordsPaths(t *testing.T) {
+	s := paneltest.NewStub(t)
+	snapshot := []panel.MonClientSnapshot{
+		{Id: "ams-1", State: "ONLINE", Paths: []string{"direct", "hops"}},
+		{Id: "msk-1", State: "NEVER", Paths: []string{"edge:edge-a", "inner:core-1"}},
+	}
+	if resp, body := do(t, s, http.MethodPost, "/probe/ensure", s.Token(), map[string]any{"monClients": snapshot}); resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d body = %s", resp.StatusCode, body)
+	}
+	ensured := s.Ensured()
+	if len(ensured) != 1 || strings.Join(ensured[0][1].Paths, ",") != "edge:edge-a,inner:core-1" {
+		t.Fatalf("Ensured() = %+v, want the paths as sent", ensured)
+	}
+
+	bad := []panel.MonClientSnapshot{{Id: "ams-1", State: "ONLINE", Paths: []string{"proxy"}}}
+	resp, body := do(t, s, http.MethodPost, "/probe/ensure", s.Token(), map[string]any{"monClients": bad})
+	if resp.StatusCode != http.StatusBadRequest || !strings.Contains(string(body), "invalid_body") {
+		t.Fatalf("paths [proxy]: status = %d body = %s, want 400 invalid_body", resp.StatusCode, body)
 	}
 }

@@ -8,7 +8,10 @@
   var strings = {
     approveTitle: 'Approve registration request',
     compareCode: "Compare the code with the box's log before approving.",
-    pathsHint: 'For boxes in hostile regions leave only proxy: direct reveals the real server\'s address to that box.',
+    pathsHint: 'hops follows every probed hop of the chain, including hops that join later (proxy while the panel has no chain). ' +
+      'Uncheck direct on boxes in hostile regions: it reveals the real server\'s address to that box. ' +
+      'Uncheck hops to pick hops by name — an inner hop is not reachable from every region.',
+    noHops: 'The panel has no probed hops right now.',
     replaceHint: 'The replacement keeps the existing id, its history, name, region and paths; the old token is revoked on approve.',
     nameRequired: 'Name is required.',
     pickExisting: 'Pick the mon-client this box replaces.',
@@ -26,8 +29,9 @@
         strings: strings,
         requests: [],
         clients: [],
+        chain: { hops: [] },
         limits: { perIpPerMin: 1, pendingPerIp: 3, pendingGlobal: 20 },
-        modal: { open: false, request: null, mode: 'new', name: '', region: '', proxy: true, direct: true, existingId: null, busy: false }
+        modal: { open: false, request: null, mode: 'new', name: '', region: '', paths: mon.picker(), existingId: null, busy: false }
       };
     },
     computed: {
@@ -53,10 +57,12 @@
         if (!env.success) { return; }
         this.requests = env.obj.pending || [];
         this.clients = env.obj.clients || [];
+        this.chain = env.obj.chain || { hops: [] };
         this.limits = env.obj.limits || this.limits;
         this.now = env.obj.now;
         this.pending = this.requests.length;
       },
+      hopOptions: function (named) { return mon.hopOptions(this.chain, named); },
       rowClass: function (r) { return r.suggestReplacement ? 'sel' : ''; },
       openApprove: function (r, mode) {
         this.modal = {
@@ -65,8 +71,7 @@
           mode: mode,
           name: '',
           region: '',
-          proxy: true,
-          direct: true,
+          paths: mon.picker(),
           existingId: r.suggestReplacement ? r.suggestReplacement.monClientId : null,
           busy: false
         };
@@ -77,9 +82,7 @@
         var body = { mode: m.mode };
         if (m.mode === 'new') {
           if (!m.name) { mon.notifyErr(strings.nameRequired); return; }
-          var paths = [];
-          if (m.proxy) { paths.push('proxy'); }
-          if (m.direct) { paths.push('direct'); }
+          var paths = mon.pickedPaths(m.paths);
           if (!paths.length) { mon.notifyErr(strings.pickPath); return; }
           body.name = m.name;
           body.region = m.region;

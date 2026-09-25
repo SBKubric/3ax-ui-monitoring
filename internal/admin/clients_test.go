@@ -2,7 +2,9 @@ package admin
 
 import (
 	"context"
+	"fmt"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/SBKubric/3ax-ui-monitoring/internal/panel"
@@ -43,7 +45,7 @@ func TestClients_List(t *testing.T) {
 	h := newHarness(t)
 	h.login()
 	h.withMaterial()
-	id := h.approveOne("7K3F9Q", "vps-ams-2", "203.0.113.5", "Amsterdam #2", "NL", []string{"proxy", "direct"})
+	id := h.approveOne("7K3F9Q", "vps-ams-2", "203.0.113.5", "Amsterdam #2", "NL", []string{"hops", "direct"})
 
 	w := h.do(http.MethodGet, "/admin/api/clients", nil)
 	if w.Code != http.StatusOK {
@@ -77,7 +79,7 @@ func TestClients_UpdateChangesPathsAndRevision(t *testing.T) {
 	h := newHarness(t)
 	h.login()
 	h.withMaterial()
-	id := h.approveOne("7K3F9Q", "vps-ams-2", "203.0.113.5", "Amsterdam #2", "NL", []string{"proxy", "direct"})
+	id := h.approveOne("7K3F9Q", "vps-ams-2", "203.0.113.5", "Amsterdam #2", "NL", []string{"hops", "direct"})
 
 	before, err := h.configs.CurrentRevision(context.Background(), id)
 	if err != nil {
@@ -85,7 +87,7 @@ func TestClients_UpdateChangesPathsAndRevision(t *testing.T) {
 	}
 
 	w := h.do(http.MethodPost, "/admin/api/clients/"+id, map[string]any{
-		"name": "Amsterdam #2 (moved)", "region": "NL", "paths": []string{"proxy"},
+		"name": "Amsterdam #2 (moved)", "region": "NL", "paths": []string{"hops"},
 	})
 	if w.Code != http.StatusOK {
 		t.Fatalf("status %d, body %s", w.Code, w.Body.String())
@@ -184,7 +186,7 @@ func TestClients_Delete(t *testing.T) {
 func TestClients_ListShowsRejectedTargets(t *testing.T) {
 	h := newHarness(t)
 	h.login()
-	id := h.approveOne("7K3F9Q", "vps-ams-2", "203.0.113.5", "Amsterdam #2", "NL", []string{"proxy"})
+	id := h.approveOne("7K3F9Q", "vps-ams-2", "203.0.113.5", "Amsterdam #2", "NL", []string{"hops"})
 
 	rows := func() map[string]any {
 		t.Helper()
@@ -210,5 +212,141 @@ func TestClients_ListShowsRejectedTargets(t *testing.T) {
 	r := got[0].(map[string]any)
 	if r["target"] != "awg:3:proxy" || r["error"] != `[Interface] has an unknown key "Foo"` {
 		t.Fatalf("rejected target = %+v, want the stored one", r)
+	}
+}
+
+// withChain is withMaterial on a chained panel (spec §5.1): an inner hop and
+// two edges, edge-a active, plus a pending edge the panel does not probe.
+func (h *harness) withChain() {
+	h.t.Helper()
+	h.withMaterial()
+	active := "edge-a"
+	h.mat.mat.Chain = &panel.Chain{Revision: 3, ActiveEdge: &active, Hops: []panel.Hop{
+		{Name: "core-1", Role: "inner", Host: "10.0.0.7", State: "joined"},
+		{Name: "edge-a", Role: "edge", Host: "a.example.net", State: "joined"},
+		{Name: "edge-b", Role: "edge", Host: "b.example.net", State: "legacy"},
+	}}
+	h.mat.mat.Hops = map[string][]panel.ProbeItem{
+		"inner:core-1": {{Kind: store.InboundKindXray, InboundId: 12, Link: "vless://core-1"}},
+		"edge:edge-a":  {{Kind: store.InboundKindXray, InboundId: 12, Link: "vless://edge-a"}},
+		"edge:edge-b":  {{Kind: store.InboundKindXray, InboundId: 12, Link: "vless://edge-b"}},
+	}
+}
+
+// strs turns a decoded JSON array into strings.
+func strs(v any) []string {
+	var out []string
+	for _, x := range v.([]any) {
+		out = append(out, x.(string))
+	}
+	return out
+}
+
+// TestClients_ListChainAndProbes is spec §9.3 on a chained panel: the page
+// gets the chain's probed hops for the paths picker and the path filter,
+// and every mon-client the paths it probes now — hops expanded, a hop by
+// name only while it is probed — which is what the filter matches on.
+func TestClients_ListChainAndProbes(t *testing.T) {
+	h := newHarness(t)
+	h.login()
+	h.withChain()
+	all := h.approveOne("7K3F9Q", "vps-ams-2", "203.0.113.5", "Amsterdam #2", "NL", nil)
+	named := h.approveOne("Q2V8NM", "vps-fra-1", "198.51.100.23", "Frankfurt #1", "DE", []string{"edge:edge-b", "edge:gone"})
+
+	o := obj(t, h.do(http.MethodGet, "/admin/api/clients", nil))
+	chain := o["chain"].(map[string]any)
+	if chain["chained"] != true || chain["activeEdge"] != "edge-a" {
+		t.Fatalf("chain = %+v, want chained with edge-a active", chain)
+	}
+	if got := strs(chain["served"]); len(got) != 4 || got[0] != "direct" || got[1] != "inner:core-1" {
+		t.Fatalf("served = %v, want direct then the hops in chain order", got)
+	}
+	hops := chain["hops"].([]any)
+	if len(hops) != 3 || hops[1].(map[string]any)["path"] != "edge:edge-a" || hops[1].(map[string]any)["active"] != true {
+		t.Fatalf("hops = %+v, want three with edge:edge-a active", hops)
+	}
+
+	probes := map[string]string{}
+	paths := map[string]string{}
+	for _, c := range o["clients"].([]any) {
+		row := c.(map[string]any)
+		probes[row["id"].(string)] = fmt.Sprint(strs(row["probes"]))
+		paths[row["id"].(string)] = fmt.Sprint(strs(row["paths"]))
+	}
+	if probes[all] != "[direct inner:core-1 edge:edge-a edge:edge-b]" || paths[all] != "[direct hops]" {
+		t.Fatalf("%s: paths %s probes %s, want the default expanded into every hop", all, paths[all], probes[all])
+	}
+	if probes[named] != "[edge:edge-b]" || paths[named] != "[edge:edge-b edge:gone]" {
+		t.Fatalf("%s: paths %s probes %s, want only the probed hop it names", named, paths[named], probes[named])
+	}
+}
+
+// TestClients_ListShowsUnallocated is spec §9.3: the pairs the panel's last
+// ensure left without an AWG probe peer are listed per mon-client with the
+// panel's reason, for the "no peer" tag and the Edit modal.
+func TestClients_ListShowsUnallocated(t *testing.T) {
+	h := newHarness(t)
+	h.login()
+	id := h.approveOne("7K3F9Q", "vps-ams-2", "203.0.113.5", "Amsterdam #2", "NL", nil)
+	var mc store.MonClient
+	mc.SetUnallocated([]store.UnallocatedPeer{{Path: "inner:core-1", Reason: store.UnallocatedLimit}, {Path: "direct", Reason: store.UnallocatedPoolExhausted}})
+	if err := h.st.DB.Model(&store.MonClient{}).Where("id = ?", id).Update("unallocated", mc.Unallocated).Error; err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	o := obj(t, h.do(http.MethodGet, "/admin/api/clients", nil))
+	row := o["clients"].([]any)[0].(map[string]any)
+	un := row["unallocated"].([]any)
+	if len(un) != 2 || un[0].(map[string]any)["path"] != "inner:core-1" || un[0].(map[string]any)["reason"] != "limit" ||
+		un[1].(map[string]any)["reason"] != "pool_exhausted" {
+		t.Fatalf("unallocated = %+v", un)
+	}
+	// Without material nothing is known about the chain: an empty picker,
+	// and no expansion to filter by.
+	if chain := o["chain"].(map[string]any); chain["chained"] != false || len(chain["hops"].([]any)) != 0 {
+		t.Fatalf("chain without material = %+v", chain)
+	}
+	if row["probes"] != nil {
+		t.Fatalf("probes without material = %v, want null", row["probes"])
+	}
+}
+
+// TestClients_UpdateHopPaths: Edit takes hops by name, and refuses proxy
+// (it left the vocabulary, spec §5.1) with a message naming what is valid.
+func TestClients_UpdateHopPaths(t *testing.T) {
+	h := newHarness(t)
+	h.login()
+	h.withChain()
+	id := h.approveOne("7K3F9Q", "vps-ams-2", "203.0.113.5", "Amsterdam #2", "NL", nil)
+
+	w := h.do(http.MethodPost, "/admin/api/clients/"+id, map[string]any{
+		"name": "Amsterdam #2", "region": "NL", "paths": []string{"direct", "inner:core-1"},
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("update: %s", w.Body.String())
+	}
+	row := obj(t, h.do(http.MethodGet, "/admin/api/clients", nil))["clients"].([]any)[0].(map[string]any)
+	if got := fmt.Sprint(strs(row["probes"])); got != "[direct inner:core-1]" {
+		t.Fatalf("probes = %s", got)
+	}
+
+	w = h.do(http.MethodPost, "/admin/api/clients/"+id, map[string]any{
+		"name": "Amsterdam #2", "region": "NL", "paths": []string{"proxy"},
+	})
+	if w.Code != http.StatusBadRequest || !strings.Contains(decode(t, w).Msg, "hops") {
+		t.Fatalf("update with proxy: %d %s, want 400 naming the vocabulary", w.Code, w.Body.String())
+	}
+}
+
+// TestRequests_ListCarriesChain: the Approve modal's paths picker offers
+// the probed hops of the last GET /state (spec §9.2).
+func TestRequests_ListCarriesChain(t *testing.T) {
+	h := newHarness(t)
+	h.login()
+	h.withChain()
+	o := obj(t, h.do(http.MethodGet, "/admin/api/requests", nil))
+	chain := o["chain"].(map[string]any)
+	if len(chain["hops"].([]any)) != 3 {
+		t.Fatalf("chain = %+v, want the three probed hops", chain)
 	}
 }

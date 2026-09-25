@@ -1,13 +1,22 @@
 /* mon-clients page (spec §9.3): the registry as the panel's inbound table —
- * "⋯" for Edit / Revoke / Delete, a switch for Enabled, the full config
- * error, the targets the box rejected with their errors, and both revisions
- * in the Edit modal. Target state is deliberately
- * absent: the panel's Monitoring page owns it. */
+ * "⋯" for Edit / Revoke / Delete, a switch for Enabled, a filter by path
+ * (a mon-client matches the paths its own paths expand into: hops matches
+ * every probed hop), the full config error, the targets the box rejected
+ * with their errors, the pairs the panel gave no AWG probe peer with the
+ * panel's reason, and both revisions in the Edit modal. Target state is
+ * deliberately absent: the panel's Monitoring page owns it. */
 (function () {
   'use strict';
 
   var strings = {
-    pathsHint: 'For boxes in hostile regions leave only proxy: direct reveals the real server\'s address to that box.',
+    pathsHint: 'hops follows every probed hop of the chain, including hops that join later (proxy while the panel has no chain). ' +
+      'Uncheck direct on boxes in hostile regions: it reveals the real server\'s address to that box. ' +
+      'Uncheck hops to pick hops by name — an inner hop is not reachable from every region.',
+    noHops: 'The panel has no probed hops right now.',
+    reasons: {
+      pool_exhausted: 'the AWG server\'s address pool is exhausted',
+      limit: 'past the panel\'s monProbePeerLimit'
+    },
     revokeWarning: 'The box gets 401 on its next call, wipes its state and sends a new registration request. Approve that request as a replacement to give it this id back. The registry row, its history and its paths stay.',
     deleteWarning: 'The row and its targets are removed for good. The panel drops its own copy on the next snapshot. A box that comes back gets a brand-new id.',
     nameRequired: 'Name is required.',
@@ -19,10 +28,22 @@
       return {
         strings: strings,
         clients: [],
-        edit: { open: false, client: null, name: '', region: '', proxy: true, direct: true, busy: false },
+        chain: { hops: [], served: [] },
+        pathFilter: undefined,
+        edit: { open: false, client: null, name: '', region: '', paths: mon.picker(), busy: false },
         revoke: { open: false, client: null, busy: false },
         remove: { open: false, client: null, busy: false }
       };
+    },
+    computed: {
+      filterOptions: function () {
+        return (this.chain.served || []).map(function (p) { return { value: p, label: p }; });
+      },
+      shown: function () {
+        var f = this.pathFilter;
+        if (!f) { return this.clients; }
+        return this.clients.filter(function (c) { return (c.probes || []).indexOf(f) >= 0; });
+      }
     },
     mounted: function () { this.load(); },
     methods: {
@@ -30,6 +51,7 @@
         var env = await mon.api('GET', '/admin/api/clients');
         if (!env.success) { mon.notifyErr(env.msg); return; }
         this.clients = env.obj.clients || [];
+        this.chain = env.obj.chain || { hops: [], served: [] };
         this.now = env.obj.now;
       },
       stateLabel: function (c) {
@@ -38,6 +60,12 @@
         return c.state;
       },
       stateClass: function (c) { return c.enabled ? c.state : 'DISABLED'; },
+      hopOptions: function (named) { return mon.hopOptions(this.chain, named); },
+      reasonText: function (reason) { return strings.reasons[reason] || reason; },
+      unallocatedTitle: function (c) {
+        var self = this;
+        return (c.unallocated || []).map(function (u) { return u.path + ': ' + self.reasonText(u.reason); }).join('\n');
+      },
       rejectedTitle: function (c) {
         return (c.rejectedTargets || []).map(function (r) { return r.target + ': ' + r.error; }).join('\n');
       },
@@ -47,17 +75,14 @@
           client: c,
           name: c.name,
           region: c.region,
-          proxy: c.paths.indexOf('proxy') >= 0,
-          direct: c.paths.indexOf('direct') >= 0,
+          paths: mon.picker(c.paths),
           busy: false
         };
       },
       save: async function () {
         var e = this.edit;
         if (!e.name) { mon.notifyErr(strings.nameRequired); return; }
-        var paths = [];
-        if (e.proxy) { paths.push('proxy'); }
-        if (e.direct) { paths.push('direct'); }
+        var paths = mon.pickedPaths(e.paths);
         if (!paths.length) { mon.notifyErr(strings.pickPath); return; }
 
         e.busy = true;

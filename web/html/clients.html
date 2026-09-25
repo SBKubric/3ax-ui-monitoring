@@ -2,6 +2,8 @@
 <section class="card tight hd">
   <h3>mon-clients</h3>
   <a-tag data-testid="clients-count">[[ clients.length ]] registered</a-tag>
+  <a-select v-model:value="pathFilter" :options="filterOptions" allow-clear placeholder="All paths"
+            style="min-width: 180px" data-testid="clients-path-filter"></a-select>
   <span class="sp"></span>
   <span class="muted small">"⋯" → Edit · Revoke · Delete. Revoke makes the box drop its state and register again.</span>
 </section>
@@ -15,7 +17,7 @@
       </tr>
     </thead>
     <tbody>
-      <tr v-for="c in clients" :key="c.id" data-testid="client-row" :data-client-id="c.id" :class="c.enabled ? '' : 'dis'">
+      <tr v-for="c in shown" :key="c.id" data-testid="client-row" :data-client-id="c.id" :class="c.enabled ? '' : 'dis'">
         <td class="c">
           <a-dropdown trigger="click">
             <a-button size="small" data-testid="client-actions">⋯</a-button>
@@ -40,7 +42,7 @@
           <span v-if="c.lastHeartbeat">[[ ago(c.lastHeartbeat, now) ]]</span>
           <span class="muted" v-else>approved [[ ago(c.approvedAt, now) ]]</span>
         </td>
-        <td data-testid="client-paths"><a-tag v-for="p in c.paths" :key="p" :color="p === 'proxy' ? 'blue' : 'default'">[[ p ]]</a-tag></td>
+        <td data-testid="client-paths"><a-tag v-for="p in c.paths" :key="p" :color="p === 'hops' ? 'blue' : 'default'" data-testid="client-path">[[ p ]]</a-tag></td>
         <td data-testid="client-version">
           <span v-if="c.version">v[[ c.version ]] <span class="muted">· xray [[ c.xrayVersion || '?' ]]</span></span>
           <span class="muted" v-else>—</span>
@@ -50,9 +52,11 @@
           <span class="mono muted" v-else-if="c.appliedRevision || c.serverRevision">[[ shortRev(c.appliedRevision || c.serverRevision) ]]</span>
           <span class="muted" v-else>—</span>
           <a-tag color="warning" v-if="c.rejectedTargets && c.rejectedTargets.length" :title="rejectedTitle(c)" data-testid="client-rejected">⚠ [[ c.rejectedTargets.length ]] rejected</a-tag>
+          <a-tag color="warning" v-if="c.unallocated && c.unallocated.length" :title="unallocatedTitle(c)" data-testid="client-unallocated">⚠ [[ c.unallocated.length ]] no peer</a-tag>
         </td>
       </tr>
       <tr v-if="!clients.length"><td colspan="8" class="muted" data-testid="clients-empty">No mon-clients yet. Approve a registration request first.</td></tr>
+      <tr v-else-if="!shown.length"><td colspan="8" class="muted" data-testid="clients-filtered-empty">No mon-client probes [[ pathFilter ]].</td></tr>
     </tbody>
   </table>
 </section>
@@ -76,8 +80,15 @@
     <div class="fi">
       <label>Paths</label>
       <div>
-        <a-checkbox v-model:checked="edit.proxy" data-testid="edit-path-proxy">proxy</a-checkbox>
-        <a-checkbox v-model:checked="edit.direct" data-testid="edit-path-direct">direct</a-checkbox>
+        <a-checkbox v-model:checked="edit.paths.direct" data-testid="edit-path-direct">direct</a-checkbox>
+        <a-checkbox v-model:checked="edit.paths.hops" data-testid="edit-path-hops">hops</a-checkbox>
+      </div>
+      <div v-if="!edit.paths.hops" data-testid="edit-path-hop-list">
+        <a-checkbox-group v-model:value="edit.paths.named">
+          <a-checkbox v-for="o in hopOptions(edit.paths.named)" :key="o.value" :value="o.value"
+                      :data-path="o.value"><span data-testid="edit-path-hop">[[ o.label ]]</span></a-checkbox>
+        </a-checkbox-group>
+        <div class="muted tiny" v-if="!hopOptions(edit.paths.named).length">[[ strings.noHops ]]</div>
       </div>
       <div class="muted tiny">[[ strings.pathsHint ]]</div>
     </div>
@@ -100,6 +111,18 @@
           <pre class="pre" data-testid="edit-rejected-target-error">[[ r.error ]]</pre>
         </div>
       </div>
+    </div>
+    <div class="fi" v-if="edit.client.unallocated && edit.client.unallocated.length">
+      <label>AWG targets without a probe peer (PAUSED no_probe_link)</label>
+      <table class="t" data-testid="edit-unallocated">
+        <thead><tr><th>Path</th><th>Reason</th></tr></thead>
+        <tbody>
+          <tr v-for="u in edit.client.unallocated" :key="u.path" data-testid="edit-unallocated-row">
+            <td class="mono small" data-testid="edit-unallocated-path">[[ u.path ]]</td>
+            <td data-testid="edit-unallocated-reason"><span class="mono small">[[ u.reason ]]</span> <span class="muted tiny">— [[ reasonText(u.reason) ]]</span></td>
+          </tr>
+        </tbody>
+      </table>
     </div>
     <div class="hd right">
       <a-button data-testid="edit-cancel" @click="edit.open = false">Cancel</a-button>

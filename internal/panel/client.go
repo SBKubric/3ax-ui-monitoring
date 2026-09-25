@@ -34,7 +34,7 @@ const (
 	// (CheckContract, decision #80 п. 9), which is where the poller looks
 	// before building anything.
 	contractHeader  = "X-Mon-Contract"
-	contractVersion = "2"
+	contractVersion = "3"
 
 	// requestTimeout bounds one attempt end to end (spec §4: "таймаут 10
 	// с"). It bounds a single HTTP round trip, nothing more: a poll cycle
@@ -162,6 +162,11 @@ type Client interface {
 	// applied; a non-empty host asks for the direct path against that
 	// address.
 	ProbeConfigs(ctx context.Context, host string) (*ProbeConfigs, error)
+	// HopConfigs fetches the probe material for one chain hop's path,
+	// edge:<name> or inner:<name> by its role (contract 3 §4.4, ?hop=). A
+	// hop the registry does not know, or knows but does not probe, is a 409
+	// unknown_hop or hop_not_joined (IsHopConflict).
+	HopConfigs(ctx context.Context, hop string) (*ProbeConfigs, error)
 	// PostEvents delivers one batch of state transitions (contract §4.6).
 	PostEvents(ctx context.Context, events []store.EventPayload) (*EventsResult, error)
 	// PostStats delivers one batch of 5-minute aggregates (contract §4.7).
@@ -296,6 +301,32 @@ func (c *HTTPClient) ProbeConfigs(ctx context.Context, host string) (*ProbeConfi
 		return nil, err
 	}
 	return &out, nil
+}
+
+// HopConfigs implements Client.
+func (c *HTTPClient) HopConfigs(ctx context.Context, hop string) (*ProbeConfigs, error) {
+	var out ProbeConfigs
+	if err := c.do(ctx, http.MethodGet, "/probe/configs", url.Values{"hop": []string{hop}}, nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// The panel's answers to ?hop= for a hop it will not render (contract 3
+// §4.4): the chain registry changed between GET /state and the request.
+const (
+	codeUnknownHop   = "unknown_hop"
+	codeHopNotJoined = "hop_not_joined"
+)
+
+// IsHopConflict reports the two 409s of HopConfigs: the hop was renamed or
+// removed, or left joined/legacy, after the GET /state that named it. The
+// answer is stale rather than wrong, so the material is dropped and read
+// again on the next cycle (spec §4 step 3).
+func IsHopConflict(err error) bool {
+	var apiErr *APIError
+	return errors.As(err, &apiErr) && apiErr.Status == http.StatusConflict &&
+		(apiErr.Code == codeUnknownHop || apiErr.Code == codeHopNotJoined)
 }
 
 // PostEvents implements Client. It sends whatever it is given: enforcing the

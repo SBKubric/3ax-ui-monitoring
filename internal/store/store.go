@@ -137,8 +137,10 @@ func ensurePrivateDir(dir string) error {
 	return nil
 }
 
-// Migrate brings the schema up to date with every model this step declares.
-// It is idempotent: gorm's AutoMigrate only adds what is missing, so calling
+// Migrate brings the schema up to date with every model this step declares,
+// then runs the data migrations that go with it (migrateProxyPaths). It is
+// idempotent: gorm's AutoMigrate only adds what is missing and a data
+// migration finds nothing left to rewrite the second time, so calling
 // Migrate again on an already-current database is a fast no-op, which is
 // what lets Open call it unconditionally on every process start.
 func (s *Store) Migrate() error {
@@ -147,5 +149,5 @@ func (s *Store) Migrate() error {
 			return fmt.Errorf("store: migrate %T: %w", m, err)
 		}
 	}
-	return nil
+	return s.migrateProxyPaths()
 }

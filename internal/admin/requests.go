@@ -118,9 +118,11 @@ func (h *Handler) listRequests(c *gin.Context) {
 		})
 	}
 
+	mat, have := h.material()
 	ok(c, gin.H{
 		"pending": views,
 		"clients": picker,
+		"chain":   chainView(mat, have),
 		"now":     clock.Ms(h.deps.Clock.Now()),
 		"limits": gin.H{
 			"perIpPerMin":   limitPerIPPerMin,
@@ -149,15 +151,9 @@ func (h *Handler) attemptNumber(req *store.RegistrationRequest) int {
 	return int(n)
 }
 
-// pathsOrDefault is a mon-client's paths with spec §6's default applied, so
-// the UI never has to decide what an empty list means.
-func pathsOrDefault(mc *store.MonClient) []string {
-	paths := mc.PathsList()
-	if len(paths) == 0 {
-		return []string{store.PathProxy, store.PathDirect}
-	}
-	return paths
-}
+// pathsOrDefault is a mon-client's paths with spec §5.1's default applied,
+// so the UI never has to decide what an empty list means.
+func pathsOrDefault(mc *store.MonClient) []string { return registry.PathsOf(mc) }
 
 // approveBody is the Approve modal's submission (spec §9.2). Mode is "new"
 // or "replace" — the administrator's explicit choice, never inferred from
@@ -256,7 +252,7 @@ func failRegistry(c *gin.Context, err error, fallback string) {
 	case errors.Is(err, registry.ErrClientNotFound):
 		fail(c, http.StatusNotFound, "No such mon-client.")
 	case errors.Is(err, registry.ErrInvalidPath):
-		fail(c, http.StatusBadRequest, "Paths must be \"proxy\", \"direct\", or both.")
+		fail(c, http.StatusBadRequest, "Paths are \"direct\", \"hops\" and hops by name (\"edge:<name>\", \"inner:<name>\").")
 	default:
 		slog.Error("admin: registry call failed", "err", err)
 		fail(c, http.StatusInternalServerError, fallback)

@@ -108,10 +108,11 @@ var (
 	// handler: 400 invalid_body.
 	ErrInvalidPairingCode = errors.New("registry: pairing code must match [A-Z2-9]{6}")
 	// ErrInvalidPath means Approve/ApproveAsReplacement's/Update's paths
-	// argument contained something other than "proxy"/"direct" — handler:
-	// 400 invalid_body. Never reachable from /v1/register* (that surface
-	// never validates paths), only from the admin API (step 10).
-	ErrInvalidPath = errors.New("registry: path must be \"proxy\" or \"direct\"")
+	// argument contained something outside the paths vocabulary of spec
+	// §5.1 — direct, hops, edge:<name>, inner:<name> — handler: 400
+	// invalid_body. Never reachable from /v1/register* (that surface never
+	// validates paths), only from the admin API (step 10).
+	ErrInvalidPath = errors.New("registry: paths are \"direct\", \"hops\", \"edge:<name>\" or \"inner:<name>\"")
 	// ErrRequestNotPending means Approve/ApproveAsReplacement/Reject was
 	// called on a request that is not (or no longer) pending — an admin UI
 	// bug (double-click, stale page), not a mon-client-facing error.
@@ -499,28 +500,33 @@ func (r *Registry) ExpireRequests(ctx context.Context) (int, error) {
 // ---------------------------------------------------------------------
 
 // ApproveInput is what an administrator supplies when approving a pending
-// request (spec §9.2's Approve modal). Paths defaults to ["proxy","direct"]
-// when empty; only those two values are ever valid (spec §6).
+// request (spec §9.2's Approve modal). Paths is the paths vocabulary of
+// spec §5.1 and defaults to ["direct","hops"] when empty.
 type ApproveInput struct {
 	Name   string
 	Region string
 	Paths  []string
 }
 
-// validatePaths checks paths against the only two values a mon-client
-// understands (protocol §4.1: proxy/direct), applying spec §6's default
-// when paths is empty, and returns a defensive copy so the caller can't
-// mutate what gets stored after the fact.
+// validatePaths checks paths against the paths vocabulary of spec §5.1 —
+// direct, hops, or a hop by name (edge:<name>, inner:<name>) — applying the
+// default when paths is empty, and returns a defensive copy without
+// repeats so the caller can't mutate what gets stored after the fact.
+// proxy is refused: it left the vocabulary for hops (decision #61 п. 3).
+// A hop by name is checked by grammar only; whether the chain has it is the
+// expansion's question, every time a config is built.
 func validatePaths(paths []string) ([]string, error) {
 	if len(paths) == 0 {
-		return []string{store.PathProxy, store.PathDirect}, nil
+		return DefaultPaths(), nil
 	}
-	out := make([]string, len(paths))
-	for i, p := range paths {
-		if p != store.PathProxy && p != store.PathDirect {
+	out := make([]string, 0, len(paths))
+	for _, p := range paths {
+		if p != store.PathDirect && p != store.PathHops && !store.IsHopPath(p) {
 			return nil, fmt.Errorf("%w: %q", ErrInvalidPath, p)
 		}
-		out[i] = p
+		if !slices.Contains(out, p) {
+			out = append(out, p)
+		}
 	}
 	return out, nil
 }
@@ -832,7 +838,7 @@ func (r *Registry) Update(ctx context.Context, id string, name, region string, p
 
 // samePaths compares two path sets order-independently: admin UI checkboxes
 // and a stored JSON array have no meaningful order of their own, so
-// ["direct","proxy"] and ["proxy","direct"] are the same set and must not
+// ["direct","hops"] and ["hops","direct"] are the same set and must not
 // trigger a spurious PathsChanged/config rebuild.
 func samePaths(a, b []string) bool {
 	as := slices.Clone(a)

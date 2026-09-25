@@ -10,7 +10,8 @@ const (
 	InboundKindAwg  = "awg"
 )
 
-// Paths a target is probed over (CONTEXT.md: Path).
+// Paths a target is probed over (CONTEXT.md: Path). Besides these two a
+// path names a chain hop, edge:<name> or inner:<name> (HopPath, spec §5.1).
 const (
 	PathDirect = "direct"
 	PathProxy  = "proxy"
@@ -140,7 +141,8 @@ type RegistrationRequest struct {
 func (RegistrationRequest) TableName() string { return "registration_requests" }
 
 // MonClient is one entry of the mon-client registry (spec §3, §6). Paths is
-// stored as a JSON array (`["proxy","direct"]`); use PathsList/SetPaths
+// stored as a JSON array of the paths vocabulary (`["direct","hops"]`,
+// spec §5.1); use PathsList/SetPaths
 // rather than touching the column directly so every caller agrees on the
 // encoding. TokenHash is a SHA-256 hex digest — the plaintext token exists
 // only for the instant it is issued (see RegistrationRequest.ApprovedToken)
@@ -181,6 +183,12 @@ type MonClient struct {
 	// heartbeat reported as rejected from its applied revision (protocol
 	// §5.3 client.rejectedTargets); see RejectedList/SetRejected.
 	RejectedTargets string `json:"-" gorm:"column:rejected_targets;not null;default:'[]'"`
+	// Unallocated is the JSON list of this mon-client's paths the panel's
+	// last POST /probe/ensure gave no AWG probe peer, each with the panel's
+	// reason (spec §4 step 2, contract §4.3); see UnallocatedList/
+	// SetUnallocated. Their AWG targets are PAUSED no_probe_link, and this
+	// is where the admin UI finds out why (spec §9.3).
+	Unallocated string `json:"-" gorm:"column:unallocated;not null;default:'[]'"`
 
 	RemoteIp         string `json:"remoteIp" gorm:"column:remote_ip"`
 	ApprovedAt       int64  `json:"approvedAt" gorm:"column:approved_at"`
@@ -230,6 +238,47 @@ func (m *MonClient) SetRejected(list []RejectedTarget) {
 	m.RejectedTargets = string(b)
 }
 
+// Reasons the panel gives for a pair without an AWG probe peer (contract
+// §4.3 unallocated[].reason).
+const (
+	// UnallocatedPoolExhausted: the AWG server's address pool ran out.
+	UnallocatedPoolExhausted = "pool_exhausted"
+	// UnallocatedLimit: the pair is past the panel's monProbePeerLimit.
+	UnallocatedLimit = "limit"
+)
+
+// UnallocatedPeer is one entry of MonClient.Unallocated: a path of this
+// mon-client the panel gave no AWG probe peer, and the panel's reason.
+type UnallocatedPeer struct {
+	Path   string `json:"path"`
+	Reason string `json:"reason"`
+}
+
+// UnallocatedList decodes Unallocated. An empty or malformed column is no
+// unallocated pairs.
+func (m *MonClient) UnallocatedList() []UnallocatedPeer {
+	if m.Unallocated == "" {
+		return nil
+	}
+	var out []UnallocatedPeer
+	if err := json.Unmarshal([]byte(m.Unallocated), &out); err != nil {
+		return nil
+	}
+	return out
+}
+
+// SetUnallocated encodes list into Unallocated, nil as "[]".
+func (m *MonClient) SetUnallocated(list []UnallocatedPeer) {
+	if list == nil {
+		list = []UnallocatedPeer{}
+	}
+	b, err := json.Marshal(list)
+	if err != nil {
+		panic("store: marshal unallocated: " + err.Error())
+	}
+	m.Unallocated = string(b)
+}
+
 // PathsList decodes Paths into a []string. A malformed or empty column
 // (e.g. a row created before Paths was set) decodes to nil rather than
 // panicking — callers that need a default should ask for one explicitly.
@@ -271,7 +320,7 @@ type Target struct {
 	MonClientId string `json:"monClientId" gorm:"column:mon_client_id;not null;size:64;uniqueIndex:idx_ms_targets_key,priority:1"`
 	InboundKind string `json:"inboundKind" gorm:"column:inbound_kind;not null;size:16;uniqueIndex:idx_ms_targets_key,priority:2"`
 	InboundId   int    `json:"inboundId" gorm:"column:inbound_id;not null;uniqueIndex:idx_ms_targets_key,priority:3"`
-	Path        string `json:"path" gorm:"column:path;not null;size:16;uniqueIndex:idx_ms_targets_key,priority:4"`
+	Path        string `json:"path" gorm:"column:path;not null;uniqueIndex:idx_ms_targets_key,priority:4"`
 
 	// State is one of the Target* constants.
 	State           string `json:"state" gorm:"column:state;size:16;not null;default:UNKNOWN"`
@@ -358,7 +407,7 @@ type StatsBucket struct {
 	MonClientId string `json:"monClientId" gorm:"column:mon_client_id;not null;size:64;uniqueIndex:idx_ms_stats_buckets_key,priority:1"`
 	InboundKind string `json:"inboundKind" gorm:"column:inbound_kind;not null;size:16;uniqueIndex:idx_ms_stats_buckets_key,priority:2"`
 	InboundId   int    `json:"inboundId" gorm:"column:inbound_id;not null;uniqueIndex:idx_ms_stats_buckets_key,priority:3"`
-	Path        string `json:"path" gorm:"column:path;not null;size:16;uniqueIndex:idx_ms_stats_buckets_key,priority:4"`
+	Path        string `json:"path" gorm:"column:path;not null;uniqueIndex:idx_ms_stats_buckets_key,priority:4"`
 	BucketStart int64  `json:"bucketStart" gorm:"column:bucket_start;not null;uniqueIndex:idx_ms_stats_buckets_key,priority:5"`
 
 	NOk   int `json:"nOk" gorm:"column:n_ok;not null;default:0"`
@@ -402,7 +451,7 @@ type ProbeSeen struct {
 	MonClientId string `json:"monClientId" gorm:"column:mon_client_id;not null;size:64"`
 	InboundKind string `json:"inboundKind" gorm:"column:inbound_kind;not null;size:16"`
 	InboundId   int    `json:"inboundId" gorm:"column:inbound_id;not null"`
-	Path        string `json:"path" gorm:"column:path;not null;size:16"`
+	Path        string `json:"path" gorm:"column:path;not null"`
 	EgressIp    string `json:"egressIp" gorm:"column:egress_ip"`
 	SeenAt      int64  `json:"seenAt" gorm:"column:seen_at;not null;index:idx_ms_probe_seen_seen_at"`
 	// UnknownTarget marks a probe whose (inboundKind, inboundId, path) is

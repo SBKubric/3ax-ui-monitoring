@@ -74,7 +74,7 @@ func TestRequests_ApproveNew(t *testing.T) {
 	id := h.register("7K3F9Q", "vps-ams-2", "203.0.113.5")
 
 	w := h.do(http.MethodPost, "/admin/api/requests/"+id+"/approve", map[string]any{
-		"mode": "new", "name": "Amsterdam #2", "region": "NL", "paths": []string{"proxy", "direct"},
+		"mode": "new", "name": "Amsterdam #2", "region": "NL", "paths": []string{"hops", "direct"},
 	})
 	if w.Code != http.StatusOK {
 		t.Fatalf("status %d, body %s", w.Code, w.Body.String())
@@ -120,7 +120,7 @@ func TestRequests_ApproveAsReplacement(t *testing.T) {
 
 	first := h.register("7K3F9Q", "msk-1", "198.51.100.7")
 	if w := h.do(http.MethodPost, "/admin/api/requests/"+first+"/approve", map[string]any{
-		"mode": "new", "name": "Moscow #1", "region": "RU", "paths": []string{"proxy"},
+		"mode": "new", "name": "Moscow #1", "region": "RU", "paths": []string{"hops"},
 	}); w.Code != http.StatusOK {
 		t.Fatalf("first approve: %s", w.Body.String())
 	}

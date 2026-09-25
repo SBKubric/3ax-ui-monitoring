@@ -488,8 +488,8 @@ func TestApprove_CreatesClientWithHashAndDefaults(t *testing.T) {
 	if !mc.Enabled {
 		t.Fatal("Enabled = false, want true")
 	}
-	if got := mc.PathsList(); !samePaths(got, []string{store.PathProxy, store.PathDirect}) {
-		t.Fatalf("Paths = %v, want default [proxy direct]", got)
+	if got := mc.PathsList(); !samePaths(got, []string{store.PathDirect, store.PathHops}) {
+		t.Fatalf("Paths = %v, want default [direct hops]", got)
 	}
 
 	poll, err := r.Poll(context.Background(), out.RequestID)
@@ -502,13 +502,28 @@ func TestApprove_CreatesClientWithHashAndDefaults(t *testing.T) {
 	}
 }
 
+// TestApprove_RejectsInvalidPath checks the paths vocabulary of spec §5.1:
+// anything but direct, hops or a hop by name is refused — proxy included,
+// which left the vocabulary for hops.
 func TestApprove_RejectsInvalidPath(t *testing.T) {
-	r, _, _ := newTestRegistry(t)
-	out := register(t, r, "h", "", "1.1.1.1")
+	r, _, clk := newTestRegistry(t)
+	for i, bad := range [][]string{{"foo"}, {"proxy"}, {"direct", "edge:"}, {"edge:AMS"}, {"middle:x"}} {
+		clk.Advance(rateLimitWindow)
+		out := register(t, r, "h", "", fmt.Sprintf("1.1.1.%d", i+1))
+		_, err := r.Approve(context.Background(), out.RequestID, ApproveInput{Name: "Test", Paths: bad})
+		if !errors.Is(err, ErrInvalidPath) {
+			t.Fatalf("Approve(%v) err = %v, want ErrInvalidPath", bad, err)
+		}
+	}
+}
 
-	_, err := r.Approve(context.Background(), out.RequestID, ApproveInput{Name: "Test", Paths: []string{"foo"}})
-	if !errors.Is(err, ErrInvalidPath) {
-		t.Fatalf("Approve err = %v, want ErrInvalidPath", err)
+// TestApprove_PathsVocabulary checks what the vocabulary accepts and how it
+// is stored: direct, hops and hops by name, a repeat kept once.
+func TestApprove_PathsVocabulary(t *testing.T) {
+	r, _, clk := newTestRegistry(t)
+	mc := approve(t, r, clk, "ams-1", []string{"edge:edge-a", store.PathDirect, "inner:core-1", "edge:edge-a"})
+	if got := mc.PathsList(); strings.Join(got, ",") != "edge:edge-a,direct,inner:core-1" {
+		t.Fatalf("Paths = %v, want edge:edge-a,direct,inner:core-1", got)
 	}
 }
 
@@ -578,7 +593,7 @@ func TestApproveAsReplacement(t *testing.T) {
 	r, _, clk := newTestRegistry(t)
 
 	out1 := register(t, r, "h1", "", "1.1.1.1")
-	existing, err := r.Approve(context.Background(), out1.RequestID, ApproveInput{Name: "Amsterdam", Region: "eu", Paths: []string{"proxy"}})
+	existing, err := r.Approve(context.Background(), out1.RequestID, ApproveInput{Name: "Amsterdam", Region: "eu", Paths: []string{"hops"}})
 	if err != nil {
 		t.Fatalf("Approve: %v", err)
 	}
@@ -605,7 +620,7 @@ func TestApproveAsReplacement(t *testing.T) {
 	if replaced.Name != "Amsterdam" || replaced.Region != "eu" {
 		t.Fatalf("name/region changed: %+v", replaced)
 	}
-	if !samePaths(replaced.PathsList(), []string{"proxy"}) {
+	if !samePaths(replaced.PathsList(), []string{"hops"}) {
 		t.Fatalf("Paths = %v, want [proxy] (unchanged)", replaced.PathsList())
 	}
 	if replaced.State != store.MonClientNever {
@@ -874,7 +889,7 @@ func TestDelete_UnknownClient(t *testing.T) {
 func TestUpdate_PathsChangedHookOnlyFiresOnRealChange(t *testing.T) {
 	r, _, _ := newTestRegistry(t)
 	out := register(t, r, "h", "", "1.1.1.1")
-	mc, err := r.Approve(context.Background(), out.RequestID, ApproveInput{Name: "Test", Paths: []string{"proxy", "direct"}})
+	mc, err := r.Approve(context.Background(), out.RequestID, ApproveInput{Name: "Test", Paths: []string{"hops", "direct"}})
 	if err != nil {
 		t.Fatalf("Approve: %v", err)
 	}
@@ -886,14 +901,14 @@ func TestUpdate_PathsChangedHookOnlyFiresOnRealChange(t *testing.T) {
 	}})
 
 	// Same set, different order: must not count as a change.
-	if err := r.Update(context.Background(), mc.Id, "Test", "", []string{"direct", "proxy"}); err != nil {
+	if err := r.Update(context.Background(), mc.Id, "Test", "", []string{"direct", "hops"}); err != nil {
 		t.Fatalf("Update (reordered, unchanged): %v", err)
 	}
 	if calls != 0 {
 		t.Fatalf("PathsChanged calls = %d, want 0 for a reordered-but-unchanged set", calls)
 	}
 
-	if err := r.Update(context.Background(), mc.Id, "Test", "", []string{"proxy"}); err != nil {
+	if err := r.Update(context.Background(), mc.Id, "Test", "", []string{"hops"}); err != nil {
 		t.Fatalf("Update (changed): %v", err)
 	}
 	if calls != 1 {
@@ -904,8 +919,8 @@ func TestUpdate_PathsChangedHookOnlyFiresOnRealChange(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
-	if !samePaths(got.PathsList(), []string{"proxy"}) {
-		t.Fatalf("Paths after Update = %v, want [proxy]", got.PathsList())
+	if !samePaths(got.PathsList(), []string{"hops"}) {
+		t.Fatalf("Paths after Update = %v, want [hops]", got.PathsList())
 	}
 }
 

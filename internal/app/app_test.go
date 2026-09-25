@@ -902,3 +902,161 @@ func TestProbe_WiredIntoServer(t *testing.T) {
 		t.Fatalf("body = %s, want the echoed nonce", body)
 	}
 }
+
+// TestPerHop_WiredEndToEnd walks decision #61 through the wired App against
+// a contract-3 panel stub: a mon-client on the default paths probes direct
+// and proxy while the panel has no chain; once a hop is probed, proxy's
+// target is removed without an event and the hop's target takes its place;
+// switching the active edge changes neither the config revision nor any
+// target; a hop that leaves takes its targets with it, silently.
+func TestPerHop_WiredEndToEnd(t *testing.T) {
+	dir := t.TempDir()
+	certPath, keyPath := tlsxtest.WriteSelfSigned(t, dir)
+	st, err := store.Open(filepath.Join(dir, "t.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	clk := clock.NewFake(time.Date(2026, 9, 25, 10, 0, 0, 0, time.UTC))
+	cfg := &config.Config{
+		Listen: "127.0.0.1:0", PublicIP: "127.0.0.1", DataDir: dir,
+		TLS: config.TLSConfig{Mode: config.TLSModeFiles, Cert: certPath, Key: keyPath},
+	}
+	a, err := New(Deps{Cfg: cfg, Store: st, Clock: clk, Notifier: tg.Nop{}})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	link := func(host string) []panel.ProbeItem {
+		return []panel.ProbeItem{{Kind: store.InboundKindXray, InboundId: 12, Link: "vless://probe@" + host + ":443"}}
+	}
+	stub := paneltest.NewStub(t)
+	stub.SetInbounds([]panel.Inbound{{Kind: store.InboundKindXray, InboundId: 12, Protocol: "vless", Port: 443, Enable: true}})
+	stub.SetOverride(true, "a.example.net")
+	stub.SetItems(store.PathDirect, link("real.example.net"))
+	stub.SetItems(store.PathProxy, link("a.example.net"))
+	stub.SetItems("edge:edge-a", link("a.example.net"))
+	stub.SetItems("edge:edge-b", link("b.example.net"))
+	set := store.DefaultSettings()
+	set.PanelURL = stub.URL()
+	set.MonToken = stub.Token()
+	set.RealHost = "real.example.net"
+	if err := st.SaveSettings(set); err != nil {
+		t.Fatalf("SaveSettings: %v", err)
+	}
+
+	ctx := context.Background()
+	reg := a.Registry()
+	out, err := reg.Register(ctx, registry.RegisterInput{PairingCode: "ABCDEF", Hostname: "h", RemoteIP: "198.51.100.9"})
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if _, err := reg.Approve(ctx, out.RequestID, registry.ApproveInput{Name: "ams-1"}); err != nil {
+		t.Fatalf("Approve: %v", err)
+	}
+
+	seq := int64(0)
+	beat := func(paths ...string) {
+		t.Helper()
+		mc, err := reg.Get(ctx, "ams-1")
+		if err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+		seq++
+		var results []state.Result
+		for _, p := range paths {
+			results = append(results, state.Result{InboundKind: store.InboundKindXray, InboundID: 12, Path: p, Ok: true})
+		}
+		clk.Advance(time.Minute)
+		if _, err := a.State().Heartbeat(ctx, mc, &state.HeartbeatRequest{
+			MonClientID: "ams-1", Client: state.ClientInfo{Version: "0.1.0"},
+			Cycles: []state.Cycle{{Seq: seq, Ts: clock.Ms(clk.Now()), Results: results}},
+		}); err != nil {
+			t.Fatalf("Heartbeat: %v", err)
+		}
+	}
+	poll := func() {
+		t.Helper()
+		if err := a.Poller().Poll(ctx); err != nil {
+			t.Fatalf("Poll: %v", err)
+		}
+	}
+	targets := func() string {
+		t.Helper()
+		var rows []store.Target
+		if err := st.DB.Order("path").Find(&rows).Error; err != nil {
+			t.Fatalf("read targets: %v", err)
+		}
+		var out []string
+		for _, r := range rows {
+			out = append(out, r.Path+"="+r.State)
+		}
+		return strings.Join(out, ",")
+	}
+	revision := func() string {
+		t.Helper()
+		rev, err := a.Configs().CurrentRevision(ctx, "ams-1")
+		if err != nil {
+			t.Fatalf("CurrentRevision: %v", err)
+		}
+		return rev
+	}
+
+	poll()
+	beat(store.PathDirect, store.PathProxy)
+	if got := targets(); got != "direct=UP,proxy=UP" {
+		t.Fatalf("targets without a chain = %s", got)
+	}
+	if snap := stub.Ensured(); len(snap) == 0 || strings.Join(snap[0][0].Paths, ",") != "direct,hops" {
+		t.Fatalf("ensure snapshot = %+v, want ams-1 with paths direct,hops", snap)
+	}
+	poll()
+	sent := len(stub.Events())
+
+	hops := []paneltest.Hop{
+		{Name: "edge-a", Role: "edge", Host: "a.example.net", State: "joined"},
+		{Name: "edge-b", Role: "edge", Host: "b.example.net", State: "joined"},
+	}
+	stub.SetChain("edge-a", hops)
+	poll()
+	if got := targets(); got != "direct=UP" {
+		t.Fatalf("targets once hops are probed = %s, want proxy removed", got)
+	}
+	beat(store.PathDirect, "edge:edge-a", "edge:edge-b")
+	if got := targets(); got != "direct=UP,edge:edge-a=UP,edge:edge-b=UP" {
+		t.Fatalf("targets on the chain = %s", got)
+	}
+	poll()
+	for _, ev := range stub.Events()[sent:] {
+		if ev.Path == store.PathProxy {
+			t.Fatalf("an event was sent for the retired proxy target: %+v", ev)
+		}
+	}
+	sent = len(stub.Events())
+
+	// The active edge switches: new panel revision, same config, no events.
+	before := revision()
+	stub.SetChain("edge-b", hops)
+	poll()
+	beat(store.PathDirect, "edge:edge-a", "edge:edge-b")
+	poll()
+	if after := revision(); after != before {
+		t.Fatalf("config revision %s → %s on an active edge switch, want unchanged", before, after)
+	}
+	if evs := stub.Events()[sent:]; len(evs) != 0 {
+		t.Fatalf("an active edge switch produced events: %+v", evs)
+	}
+
+	// edge-a starts draining: its target goes, silently.
+	stub.SetChain("edge-b", []paneltest.Hop{
+		{Name: "edge-a", Role: "edge", Host: "a.example.net", State: "draining"},
+		hops[1],
+	})
+	poll()
+	if got := targets(); got != "direct=UP,edge:edge-b=UP" {
+		t.Fatalf("targets after edge-a left = %s", got)
+	}
+	poll()
+	if evs := stub.Events()[sent:]; len(evs) != 0 {
+		t.Fatalf("a hop leaving produced events: %+v", evs)
+	}
+}

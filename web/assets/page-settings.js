@@ -12,7 +12,7 @@
     monToken: "The monToken from the panel's Monitoring settings tab. Check asks the panel for GET /state and the probe configs (for the typed realHost) with what is typed here — nothing is saved.",
     panelCa: "Optional. PEM certificate chain the panel's TLS certificate is checked against, replacing the system CAs for panel requests — paste the panel's own certificate if it is self-signed. Empty: system CAs. Check uses what is typed here.",
     realHost: "Host substituted into direct targets: the real server as clients reach it without the override. Defaults to the panel URL's host. Only mon-clients with the direct path ever see it. Saving a new realHost or panel URL re-reads the probe configs from the panel and rebuilds every mon-client config.",
-    proxyFront: "Read-only, as the panel reports it in GET /state. mon-server has no setting of its own: the front lives in the panel's host override, and /probe/configs already carries it.",
+    proxyFront: "Read-only, as the panel reports it in GET /state: the host override and, with a chain, its probed hops (every one is probed, the active edge included). mon-server has no setting of its own: the front lives in the panel, and /probe/configs already carries it.",
     telegram: 'Used when the panel is unreachable (PANEL_DOWN) and for config errors reported by mon-clients.',
     probe: 'Sent to every mon-client in its config; changing any of these bumps every config revision.',
     tls: 'From the bootstrap config (tls.mode, tls.acmeCa), read-only here. In acme-ip mode the certificate is issued for this box\'s IP from the Let\'s Encrypt short-lived profile, by the CA shown.',
@@ -41,7 +41,7 @@
         probeFields: probeFields,
         tab: 'real',
         form: {},
-        status: { configured: false, reachable: false, unknownAuthority: false, contractError: '', polled: false, revision: '', inbounds: 0, override: { enabled: false, host: '' } },
+        status: { configured: false, reachable: false, unknownAuthority: false, contractError: '', polled: false, revision: '', inbounds: 0, override: { enabled: false, host: '' }, chain: { chained: false, activeEdge: '', hops: [] } },
         bootstrap: { listen: '', publicIp: '', dataDir: '', tlsMode: '', acmeCa: '', acmeDirectory: '', adminCommand: '', cert: null },
         busy: false,
         checking: false,
@@ -59,6 +59,10 @@
         line += ' · revision ' + (this.status.revision || '—');
         line += ' · ' + this.status.inbounds + ' inbounds';
         line += ' · override → ' + (this.status.override.enabled ? (this.status.override.host || '(on)') : 'off');
+        var chain = this.status.chain;
+        if (chain && chain.chained) {
+          line += ' · chain: ' + chain.hops.length + ' probed hops, active edge ' + (chain.activeEdge || '—');
+        }
         return line;
       },
       panelHost: function () {
@@ -134,7 +138,9 @@
           (env.obj.override.enabled ? (env.obj.override.host || '(on)') : 'off') + ' · panel ' + (env.obj.panelVersion || '?') +
           (env.obj.probeError
             ? ' · probe configs: ' + env.obj.probeError
-            : ' · probe links for ' + env.obj.realHost + ': ' + env.obj.probeItems.direct + ' direct, ' + env.obj.probeItems.proxy + ' proxy');
+            : ' · probe links for ' + env.obj.realHost + ': ' + Object.keys(env.obj.probeItems).map(function (p) {
+              return env.obj.probeItems[p] + ' ' + p;
+            }).join(', '));
         mon.notifyOk(env.msg);
       },
       sendTest: async function () {

@@ -40,7 +40,18 @@
 
       <div class="sli">
         <div><div class="tt">Proxy front</div><div class="d">[[ strings.proxyFront ]]</div></div>
-        <div class="in ro mono" data-testid="proxy-front">[[ proxyFrontLine ]]</div>
+        <div>
+          <div class="in ro mono" data-testid="proxy-front">[[ proxyFrontLine ]]</div>
+          <table class="t" v-if="status.chain && status.chain.hops.length" data-testid="proxy-front-hops">
+            <thead><tr><th>Hop</th><th>Role</th><th>State</th><th>Host</th></tr></thead>
+            <tbody>
+              <tr v-for="h in status.chain.hops" :key="h.path" data-testid="proxy-front-hop">
+                <td class="mono">[[ h.name ]] <a-tag v-if="h.active" color="green">active</a-tag></td>
+                <td>[[ h.role ]]</td><td>[[ h.state ]]</td><td class="mono">[[ h.host ]]</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
       </div>
     </a-tab-pane>
 
