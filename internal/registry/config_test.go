@@ -528,6 +528,80 @@ func TestSnapshotSource(t *testing.T) {
 	}
 }
 
+// TestSnapshotSource_Paths checks contract 3 §4.3: the snapshot carries
+// every mon-client's paths as stored, with the default applied to a row
+// that has none, so the panel keeps AWG probe peers only for the pairs each
+// one probes.
+func TestSnapshotSource_Paths(t *testing.T) {
+	r, st, clk := newTestRegistry(t)
+	mc := approve(t, r, clk, "ams-1", []string{store.PathDirect})
+	if err := st.DB.Model(&store.MonClient{}).Where("id = ?", mc.Id).Update("paths", "[]").Error; err != nil {
+		t.Fatalf("clear paths: %v", err)
+	}
+	approve(t, r, clk, "msk-1", []string{store.PathDirect})
+
+	snap, err := r.SnapshotSource().Snapshot(context.Background())
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	got := map[string]string{}
+	for _, s := range snap {
+		got[s.Id] = strings.Join(s.Paths, ",")
+	}
+	if got["ams-1"] != strings.Join(pathsOf(&store.MonClient{}), ",") || got["msk-1"] != "direct" {
+		t.Fatalf("snapshot paths = %v, want the default for ams-1 and direct for msk-1", got)
+	}
+}
+
+// TestSnapshotSource_SaveUnallocated checks that the ensure's unallocated
+// pairs land on their mon-clients (spec §3 mon_clients.unallocated) with
+// the panel's reasons, that a mon-client the list does not name is cleared,
+// and that a pair of a mon-client mon-server does not know is ignored.
+func TestSnapshotSource_SaveUnallocated(t *testing.T) {
+	r, _, clk := newTestRegistry(t)
+	approve(t, r, clk, "ams-1", nil)
+	approve(t, r, clk, "msk-1", nil)
+	src := r.SnapshotSource()
+	ctx := context.Background()
+
+	err := src.SaveUnallocated(ctx, []panel.Unallocated{
+		{MonClientId: "ams-1", Path: "inner:core-1", Reason: store.UnallocatedLimit},
+		{MonClientId: "ams-1", Path: "edge:edge-b", Reason: store.UnallocatedLimit},
+		{MonClientId: "msk-1", Path: store.PathDirect, Reason: store.UnallocatedPoolExhausted},
+		{MonClientId: "gone-1", Path: store.PathDirect, Reason: store.UnallocatedLimit},
+	})
+	if err != nil {
+		t.Fatalf("SaveUnallocated: %v", err)
+	}
+	unallocated := func(id string) string {
+		mc, err := r.Get(ctx, id)
+		if err != nil {
+			t.Fatalf("Get(%s): %v", id, err)
+		}
+		var out []string
+		for _, u := range mc.UnallocatedList() {
+			out = append(out, u.Path+"/"+u.Reason)
+		}
+		return strings.Join(out, ",")
+	}
+	if got := unallocated("ams-1"); got != "inner:core-1/limit,edge:edge-b/limit" {
+		t.Fatalf("ams-1 unallocated = %s", got)
+	}
+	if got := unallocated("msk-1"); got != "direct/pool_exhausted" {
+		t.Fatalf("msk-1 unallocated = %s", got)
+	}
+
+	if err := src.SaveUnallocated(ctx, []panel.Unallocated{{MonClientId: "msk-1", Path: store.PathDirect, Reason: store.UnallocatedLimit}}); err != nil {
+		t.Fatalf("SaveUnallocated: %v", err)
+	}
+	if got := unallocated("ams-1"); got != "" {
+		t.Fatalf("ams-1 unallocated = %s after a list without it, want cleared", got)
+	}
+	if got := unallocated("msk-1"); got != "direct/limit" {
+		t.Fatalf("msk-1 unallocated = %s, want the new reason", got)
+	}
+}
+
 // --- End to end through the real poller and a panel stub ---
 
 // TestRebuildAllThroughPoller drives the whole seam spec §4 step 3

@@ -623,9 +623,42 @@ func (s snapshotSource) Snapshot(ctx context.Context) ([]panel.MonClientSnapshot
 			Region:        mc.Region,
 			State:         mc.State,
 			LastHeartbeat: last,
+			Paths:         pathsOf(&mc),
 		})
 	}
 	return out, nil
+}
+
+// SaveUnallocated files the panel's answer to the snapshot (contract §4.3,
+// spec §3): each mon-client's unallocated column becomes the pairs list
+// names for it, in the panel's order, and [] for one it does not name — the
+// panel lists every pair it could not serve on every ensure, so a
+// mon-client missing from the list has none. A pair of a mon-client that is
+// not in the registry (deleted since the snapshot) has nowhere to go and is
+// dropped. One transaction, so the admin UI never sees half an answer.
+func (s snapshotSource) SaveUnallocated(ctx context.Context, list []panel.Unallocated) error {
+	byClient := make(map[string][]store.UnallocatedPeer)
+	for _, u := range list {
+		byClient[u.MonClientId] = append(byClient[u.MonClientId], store.UnallocatedPeer{Path: u.Path, Reason: u.Reason})
+	}
+	return s.r.st.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var clients []store.MonClient
+		if err := tx.Select("id", "unallocated").Find(&clients).Error; err != nil {
+			return fmt.Errorf("registry: read unallocated: %w", err)
+		}
+		for i := range clients {
+			var next store.MonClient
+			next.SetUnallocated(byClient[clients[i].Id])
+			if next.Unallocated == clients[i].Unallocated {
+				continue
+			}
+			if err := tx.Model(&store.MonClient{}).Where("id = ?", clients[i].Id).
+				Update("unallocated", next.Unallocated).Error; err != nil {
+				return fmt.Errorf("registry: save unallocated of %s: %w", clients[i].Id, err)
+			}
+		}
+		return nil
+	})
 }
 
 // SnapshotSource returns the registry as the poller's snapshot source (spec

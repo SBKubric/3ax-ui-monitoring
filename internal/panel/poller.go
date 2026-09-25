@@ -58,7 +58,7 @@ const (
 
 	// pollCycleDeadline bounds one whole Poll cycle. client.go's
 	// requestTimeout only bounds a single HTTP round trip; a cycle touches
-	// several endpoints (state, ensure, up to two probe/configs, events,
+	// several endpoints (state, ensure, a probe/configs per path, events,
 	// stats) and each retries independently to exhaustion (spec §4: up to
 	// three retries with 1→2→4s backoff), so a persistently failing panel
 	// can stretch one cycle to a few minutes, not the ~10s a reader of
@@ -104,12 +104,18 @@ const (
 )
 
 // SnapshotSource supplies the mon-client registry snapshot POST
-// /probe/ensure replaces the panel's cache with (spec §4 step 2).
-// internal/registry implements it; the poller treats a nil source as an
-// empty registry, so a mon-server with no mon-clients yet still ensures the
-// probe set.
+// /probe/ensure replaces the panel's cache with (spec §4 step 2), and files
+// the panel's answer to it: the pairs of those mon-clients that got no AWG
+// probe peer, with the reasons (contract 3 §4.3), which the admin UI shows
+// (spec §9.3). internal/registry implements it; the poller treats a nil
+// source as an empty registry, so a mon-server with no mon-clients yet still
+// ensures the probe set.
 type SnapshotSource interface {
 	Snapshot(ctx context.Context) ([]MonClientSnapshot, error)
+	// SaveUnallocated replaces every mon-client's unallocated pairs with
+	// the ones list names (an empty list clears them all). It is called
+	// after every successful ensure.
+	SaveUnallocated(ctx context.Context, list []Unallocated) error
 }
 
 // ConfigBuilder rebuilds every mon-client's config document (spec §5). The
@@ -130,6 +136,14 @@ type InboundSync interface {
 	SyncInbounds(ctx context.Context, inbounds []Inbound) error
 }
 
+// PathSync is told the panel's probed path set whenever a new material is
+// accepted (spec §5.1): the targets of a path outside it — a hop that was
+// removed, renamed or left joined/legacy, or proxy once the chain has a
+// probed hop — are removed without events. internal/state implements it.
+type PathSync interface {
+	SyncPaths(ctx context.Context, served []string) error
+}
+
 // StatsFlusher sends the closed stats buckets at the end of a cycle (spec §4
 // step 4). It takes the Client rather than owning one so that there is
 // exactly one place — this package — that knows how to reach the panel and
@@ -139,10 +153,11 @@ type StatsFlusher interface {
 }
 
 // Material is everything one panel revision gave mon-server: the revision
-// itself, the override that was in force, the probe set's subId and the
-// probe items per path. Step 5 builds each mon-client's config document out
-// of it, which is why it is a value: a builder gets a snapshot that cannot
-// change under it mid-build.
+// itself, the override and the chain that were in force, the probe set's
+// subId and the probe items per path. Step 5 builds each mon-client's
+// config document out of it, which is why it is a value: a builder gets a
+// snapshot that cannot change under it mid-build (Hops is never written
+// after the material is made).
 type Material struct {
 	Revision string
 	// Host is the realHost the direct items were fetched for
@@ -152,9 +167,58 @@ type Material struct {
 	// #51 §4).
 	Host       string
 	Override   Override
+	Chain      *Chain
 	ProbeSubID string
 	Proxy      []ProbeItem
 	Direct     []ProbeItem
+	// Hops holds the items of every probed hop by its path, edge:<name> or
+	// inner:<name> (spec §5.1); empty on a panel without a chain.
+	Hops map[string][]ProbeItem
+}
+
+// Chained reports whether the panel has probed hops (spec §5.1): then the
+// paths are direct and one per hop, and proxy is not a path at all.
+func (m Material) Chained() bool { return len(m.Chain.ProbedHops()) > 0 }
+
+// HopPaths are the probed hops' paths in the panel's order (inner ones from
+// the panel outwards, then the edges by name).
+func (m Material) HopPaths() []string {
+	hops := m.Chain.ProbedHops()
+	out := make([]string, 0, len(hops))
+	for _, h := range hops {
+		out = append(out, h.Path())
+	}
+	return out
+}
+
+// Served is the panel's probed path set (spec §5.1, contract §3): direct
+// and a path per probed hop, or — without one — direct and proxy. Proxy is
+// in the set with the override off too: its targets are then PAUSED
+// override_disabled, not gone, because the path itself still exists.
+func (m Material) Served() []string {
+	if m.Chained() {
+		return append([]string{store.PathDirect}, m.HopPaths()...)
+	}
+	return []string{store.PathDirect, store.PathProxy}
+}
+
+// Items is the material of one path. The proxy path has items only on a
+// panel without a chain and with the override on (spec §5.1): otherwise
+// there is no proxy front to render configs for, and the poller will not
+// have fetched any — answering nil here as well keeps a mon-client that asks
+// for proxy from silently getting another path's material.
+func (m Material) Items(path string) []ProbeItem {
+	switch path {
+	case store.PathDirect:
+		return m.Direct
+	case store.PathProxy:
+		if m.Chained() || !m.Override.Enabled {
+			return nil
+		}
+		return m.Proxy
+	default:
+		return m.Hops[path]
+	}
 }
 
 // PollerDeps are the Poller's collaborators. Everything except Store and
@@ -174,6 +238,7 @@ type PollerDeps struct {
 	Snapshot SnapshotSource
 	Configs  ConfigBuilder
 	Inbounds InboundSync
+	Paths    PathSync
 	Stats    StatsFlusher
 
 	// NewClient builds the client for a (panelUrl, monToken, panelCa)
@@ -193,6 +258,7 @@ type Poller struct {
 	snapshot  SnapshotSource
 	configs   ConfigBuilder
 	inbounds  InboundSync
+	paths     PathSync
 	stats     StatsFlusher
 	fixed     Client
 	newClient func(baseURL, token string, rootCAs *x509.CertPool) Client
@@ -247,8 +313,8 @@ type Poller struct {
 	unconfiguredLogged bool
 
 	// contractErr is the refusal of the last GET /state that answered with
-	// a contract older than RequiredContract (decision #80 п. 9), nil once
-	// a new enough panel answers. It is what the Settings status line
+	// a contract other than RequiredContract (decisions #80 п. 9, #61 п. 5),
+	// nil once a matching panel answers. It is what the Settings status line
 	// shows, and it latches the WARN log to once per spell.
 	contractErr error
 
@@ -269,6 +335,7 @@ func NewPoller(d PollerDeps) *Poller {
 		snapshot:  d.Snapshot,
 		configs:   d.Configs,
 		inbounds:  d.Inbounds,
+		paths:     d.Paths,
 		stats:     d.Stats,
 		fixed:     d.Client,
 		newClient: d.NewClient,
@@ -300,6 +367,10 @@ func (p *Poller) SetConfigs(c ConfigBuilder) { p.mu.Lock(); p.configs = c; p.mu.
 // SetInbounds sets the sink for the panel's inbound list.
 func (p *Poller) SetInbounds(i InboundSync) { p.mu.Lock(); p.inbounds = i; p.mu.Unlock() }
 
+// SetPathSync sets the sink told the probed path set on every material
+// change.
+func (p *Poller) SetPathSync(s PathSync) { p.mu.Lock(); p.paths = s; p.mu.Unlock() }
+
 // SetStats sets the stats flusher run at the end of each cycle.
 func (p *Poller) SetStats(s StatsFlusher) { p.mu.Lock(); p.stats = s; p.mu.Unlock() }
 
@@ -324,7 +395,7 @@ func (p *Poller) UnknownAuthority() bool {
 }
 
 // ContractError is the refusal message while the panel speaks a contract
-// older than RequiredContract (decision #80 п. 9), "" otherwise. The admin
+// other than RequiredContract (decisions #80 п. 9, #61 п. 5), "" otherwise. The admin
 // UI's status line shows it: the poll cycle keeps running but builds no
 // targets, and nothing else on the page would explain why.
 func (p *Poller) ContractError() string {
@@ -442,11 +513,12 @@ func (p *Poller) Poll(ctx context.Context) error {
 		}
 	}
 
-	// Decision #80 п. 9: a panel older than contract 2 hands out one shared
-	// AWG probe peer, which the paths and mon-clients steal from each
-	// other. Nothing is ensured, synced or read from it, so no target is
-	// built; the outbox is still drained, since events and stats have not
-	// changed shape.
+	// Decisions #80 п. 9, #61 п. 5: the contract must match exactly. An
+	// older panel has no chain (or one shared AWG probe peer that the paths
+	// and mon-clients steal from each other), a newer one rules this build
+	// does not know. Nothing is ensured, synced or read from it, so no
+	// target is built; the outbox is still drained, since events and stats
+	// have not changed shape.
 	if err := p.noteContract(st); err != nil {
 		fail(err)
 		fail(p.flush(ctx, set, cl))
@@ -480,13 +552,7 @@ func (p *Poller) Poll(ctx context.Context) error {
 		if res.Revision != "" {
 			revision = res.Revision
 		}
-		if len(res.Unallocated) > 0 {
-			// Decision #80 п. 10: the panel's AWG address pool is full. Those
-			// mon-clients get no AWG item, and their AWG targets go PAUSED
-			// no_probe_link through the config builder.
-			slog.Warn("panel: no AWG probe peer for some mon-clients, the panel's address pool is exhausted",
-				"monClients", res.Unallocated)
-		}
+		p.saveUnallocated(ctx, res.Unallocated)
 	}
 
 	p.applyState(ctx, st, revision)
@@ -498,6 +564,27 @@ func (p *Poller) Poll(ctx context.Context) error {
 	fail(p.flush(ctx, set, cl))
 
 	return firstErr
+}
+
+// saveUnallocated files ensure's unallocated pairs with the registry
+// (decisions #80 п. 10, #61 п. 12): those pairs get no AWG item, their AWG
+// targets go PAUSED no_probe_link through the config builder, and the
+// admin UI shows why. A non-empty list is also a WARN, since it means
+// monitoring the operator asked for is not happening.
+func (p *Poller) saveUnallocated(ctx context.Context, list []Unallocated) {
+	if len(list) > 0 {
+		slog.Warn("panel: no AWG probe peer for some mon-client × path pairs (pool_exhausted: the AWG address pool is full; limit: past the panel's monProbePeerLimit)",
+			"unallocated", list)
+	}
+	p.mu.Lock()
+	src := p.snapshot
+	p.mu.Unlock()
+	if src == nil {
+		return
+	}
+	if err := src.SaveUnallocated(ctx, list); err != nil {
+		slog.Warn("panel: saving the unallocated probe peers failed", "err", err)
+	}
 }
 
 // applyState records everything GET /state told us that outlives the cycle:
@@ -576,10 +663,13 @@ func (p *Poller) snapshotOrEmpty(ctx context.Context) []MonClientSnapshot {
 
 // refreshMaterial implements spec §4 step 3: on a new revision (or on a
 // fresh process with no material at all) re-read the probe configs for the
-// direct path, and for the proxy path too when the override is on. An answer
-// whose revision does not match the cycle's current one belongs to a
-// configuration mon-server has already moved past, so both answers are
-// discarded and the old material kept until the next cycle.
+// direct path and for every other path the panel serves (spec §5.1): each
+// probed hop of the chain by ?hop=, or — without a chain — the proxy path
+// when the override is on. An answer whose revision does not match the
+// cycle's current one, or a hop the panel no longer renders (409
+// unknown_hop / hop_not_joined), belongs to a configuration mon-server has
+// already moved past, so every answer is discarded and the old material
+// kept until the next cycle.
 func (p *Poller) refreshMaterial(ctx context.Context, set *store.Settings, cl Client, st *State, revision, subID string) error {
 	_, err := p.readMaterial(ctx, set, cl, st, revision, subID)
 	return err
@@ -606,76 +696,117 @@ func (p *Poller) readMaterial(ctx context.Context, set *store.Settings, cl Clien
 		return false, nil
 	}
 
+	mat := Material{
+		Revision:   revision,
+		Host:       host,
+		Override:   st.Override,
+		Chain:      st.Chain,
+		ProbeSubID: subID,
+	}
+	// foreign collects the revision of every answer that is not the cycle's:
+	// one is enough to discard them all.
+	foreign := map[string]string{}
+
 	direct, err := cl.ProbeConfigs(ctx, host)
 	if err := p.observe(ctx, set, err); err != nil {
 		return false, err
 	}
+	mat.Direct = direct.Items
+	if direct.Revision != revision {
+		foreign[store.PathDirect] = direct.Revision
+	}
 
-	var proxyItems []ProbeItem
-	proxyRevision := revision
-	if st.Override.Enabled {
+	switch hops := st.Chain.ProbedHops(); {
+	case len(hops) > 0:
+		// Spec §5.1: with probed hops, proxy is not a path — edge:<active>
+		// replaces it — and every probed hop is read by name.
+		mat.Hops = make(map[string][]ProbeItem, len(hops))
+		for _, h := range hops {
+			pc, err := cl.HopConfigs(ctx, h.Name)
+			if err := p.observe(ctx, set, err); err != nil {
+				if IsHopConflict(err) {
+					slog.Warn("panel: the chain changed while its probe configs were read, discarding them until the next cycle",
+						"hop", h.Name, "err", err)
+					return false, nil
+				}
+				return false, err
+			}
+			mat.Hops[h.Path()] = pc.Items
+			if pc.Revision != revision {
+				foreign[h.Path()] = pc.Revision
+			}
+		}
+	case st.Override.Enabled:
 		proxy, err := cl.ProbeConfigs(ctx, "")
 		if err := p.observe(ctx, set, err); err != nil {
 			return false, err
 		}
-		proxyItems = proxy.Items
-		proxyRevision = proxy.Revision
+		mat.Proxy = proxy.Items
+		if proxy.Revision != revision {
+			foreign[store.PathProxy] = proxy.Revision
+		}
 	}
 
-	if direct.Revision != revision || proxyRevision != revision {
+	if len(foreign) > 0 {
 		slog.Warn("panel: discarding probe configs from a foreign revision",
-			"current", revision, "direct", direct.Revision, "proxy", proxyRevision)
+			"current", revision, "foreign", foreign)
 		return false, nil
 	}
 
 	p.mu.Lock()
-	p.material = Material{
-		Revision:   revision,
-		Host:       host,
-		Override:   st.Override,
-		ProbeSubID: subID,
-		Proxy:      proxyItems,
-		Direct:     direct.Items,
-	}
+	p.material = mat
 	p.haveMaterial = true
 	p.materialStale = false
 	builder := p.configs
+	paths := p.paths
 	p.mu.Unlock()
 
 	slog.Info("panel: new probe material",
-		"revision", revision, "host", host, "direct", len(direct.Items), "proxy", len(proxyItems),
-		"override", st.Override.Enabled)
+		"revision", revision, "host", host, "direct", len(mat.Direct), "proxy", len(mat.Proxy),
+		"hops", len(mat.Hops), "activeEdge", st.Chain.Active(), "override", st.Override.Enabled)
 
-	if builder == nil {
-		return true, nil
+	if builder != nil {
+		if err := builder.RebuildAll(ctx); err != nil {
+			return true, fmt.Errorf("panel: rebuilding mon-client configs: %w", err)
+		}
 	}
-	if err := builder.RebuildAll(ctx); err != nil {
-		return true, fmt.Errorf("panel: rebuilding mon-client configs: %w", err)
+	// After the rebuild, so no document still names a path whose targets
+	// are being removed.
+	if paths != nil {
+		if err := paths.SyncPaths(ctx, mat.Served()); err != nil {
+			return true, fmt.Errorf("panel: removing the targets of paths the panel no longer serves: %w", err)
+		}
 	}
 	return true, nil
 }
 
-// ErrContractTooOld marks CheckContract's refusal, for a caller that needs
-// to tell it apart from a panel that could not be reached.
-var ErrContractTooOld = errors.New("panel: monitoring contract too old")
+// ErrContractMismatch marks CheckContract's refusal, for a caller that
+// needs to tell it apart from a panel that could not be reached.
+var ErrContractMismatch = errors.New("panel: monitoring contract mismatch")
 
 // contractError is CheckContract's refusal. Its text is what the logs, the
-// poll cycle's error and the admin UI all show, so it names both versions
-// and the cure.
+// poll cycle's error and the admin UI all show (spec §4 step 1, §9.4), so
+// it names both versions and the cure: the side that is behind is the one
+// to update.
 type contractError struct{ got int }
 
 func (e contractError) Error() string {
-	return fmt.Sprintf("panel speaks monitoring contract %d, mon-server needs %d — update the panel", e.got, RequiredContract)
+	cure := "update the panel"
+	if e.got > RequiredContract {
+		cure = "update mon-server"
+	}
+	return fmt.Sprintf("panel speaks monitoring contract %d, mon-server needs %d — %s", e.got, RequiredContract, cure)
 }
 
-func (e contractError) Is(target error) bool { return target == ErrContractTooOld }
+func (e contractError) Is(target error) bool { return target == ErrContractMismatch }
 
-// CheckContract refuses a GET /state from a panel older than
-// RequiredContract (decision #80 п. 9). A missing field is contract 1: the
-// field has been there since the first contract, so its absence cannot mean
-// anything newer.
+// CheckContract refuses a GET /state from a panel on any contract but
+// RequiredContract, older or newer (decisions #80 п. 9, #61 п. 5: an exact
+// match; the panel and mon-server are updated together). A missing field is
+// contract 1: the field has been there since the first contract, so its
+// absence cannot mean anything newer.
 func CheckContract(st *State) error {
-	if st.Contract >= RequiredContract {
+	if st.Contract == RequiredContract {
 		return nil
 	}
 	got := st.Contract
@@ -1151,7 +1282,7 @@ func (p *Poller) clientFor(set *store.Settings) (Client, error) {
 	return p.client, nil
 }
 
-// noteContract records whether st comes from a panel speaking a new enough
+// noteContract records whether st comes from a panel speaking the
 // contract, logging a refusal once per spell (the poll cycle's own error
 // repeats it every minute) and the recovery once.
 func (p *Poller) noteContract(st *State) error {

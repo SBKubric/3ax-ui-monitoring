@@ -623,30 +623,34 @@ func TestSettings_SaveRealHostWithoutPanelIsJustSaved(t *testing.T) {
 	}
 }
 
-// TestSettings_CheckRefusesContractOne is decision #80 п. 9: a panel on
-// monitoring contract 1 answers, but mon-server would build no targets from
-// it, so Check fails with the text that names both versions and the cure —
-// and asks for no probe configs.
-func TestSettings_CheckRefusesContractOne(t *testing.T) {
-	h := newHarness(t)
-	h.login()
+// TestSettings_CheckRefusesContractMismatch is decisions #80 п. 9 and #61
+// п. 5: a panel on any other monitoring contract answers, but mon-server
+// would build no targets from it, so Check fails with the text that names
+// both versions and the side to update — and asks for no probe configs.
+func TestSettings_CheckRefusesContractMismatch(t *testing.T) {
+	for contract, want := range map[int]string{
+		2: "panel speaks monitoring contract 2, mon-server needs 3 — update the panel",
+		4: "panel speaks monitoring contract 4, mon-server needs 3 — update mon-server",
+	} {
+		h := newHarness(t)
+		h.login()
 
-	stub := paneltest.NewStub(t)
-	stub.SetContract(1)
+		stub := paneltest.NewStub(t)
+		stub.SetContract(contract)
 
-	w := h.do(http.MethodPost, "/admin/api/settings/check", map[string]any{
-		"panelUrl": stub.URL(), "monToken": stub.Token(),
-	})
-	if w.Code != http.StatusBadGateway {
-		t.Fatalf("status %d, want 502", w.Code)
-	}
-	const want = "panel speaks monitoring contract 1, mon-server needs 2 — update the panel"
-	if msg := decode(t, w).Msg; msg != want {
-		t.Fatalf("msg = %q, want %q", msg, want)
-	}
-	for _, r := range stub.Requests() {
-		if strings.HasSuffix(r.Path, "/probe/configs") {
-			t.Fatalf("Check read probe configs from a contract-1 panel: %s", r.Path)
+		w := h.do(http.MethodPost, "/admin/api/settings/check", map[string]any{
+			"panelUrl": stub.URL(), "monToken": stub.Token(),
+		})
+		if w.Code != http.StatusBadGateway {
+			t.Fatalf("contract %d: status %d, want 502", contract, w.Code)
+		}
+		if msg := decode(t, w).Msg; msg != want {
+			t.Fatalf("msg = %q, want %q", msg, want)
+		}
+		for _, r := range stub.Requests() {
+			if strings.HasSuffix(r.Path, "/probe/configs") {
+				t.Fatalf("Check read probe configs from a contract-%d panel: %s", contract, r.Path)
+			}
 		}
 	}
 }
@@ -657,7 +661,7 @@ func TestSettings_CheckRefusesContractOne(t *testing.T) {
 func TestSettings_GetStatusContractError(t *testing.T) {
 	h := newHarness(t)
 	h.login()
-	h.mat.contract = "panel speaks monitoring contract 1, mon-server needs 2 — update the panel"
+	h.mat.contract = "panel speaks monitoring contract 2, mon-server needs 3 — update the panel"
 
 	o := obj(t, h.do(http.MethodGet, "/admin/api/settings", nil))
 	if p := o["panel"].(map[string]any); p["contractError"] != h.mat.contract {
