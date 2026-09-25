@@ -24,7 +24,9 @@ issue #23. Расхождения со спекой — не правятся з
   (`mon-server admin set …`).
 - **Панель** (эпик proxy#43) с настроенным **Real server**/`monToken` в mon-server (README
   §"4. Run") и хотя бы одним xray-inbound'ом (Reality) и одним AWG-сервером, у которых заведены
-  probe accounts на оба path (`proxy`, `direct`).
+  probe accounts на оба path (`proxy`, `direct`). На панели с цепочкой вместо `proxy` — path
+  каждого пробируемого звена (`edge:<name>`, `inner:<name>`, [mon-server.md](../spec/mon-server.md)
+  §5.1): «оба path» ниже читать как «каждый path», а в логе — `probe xray:<inboundId>:edge:<name> ok …`.
 - Собранный образ mon-client:
 
   ```sh

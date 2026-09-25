@@ -53,7 +53,7 @@ GET /v1/register/<requestId>
 
 ### 4.1 Ревизия
 
-**Config revision** — первые 16 hex SHA-256 от канонического JSON документа §4.2 без поля `configRevision`. Меняется, когда меняется ревизия панели (`GET /state`), paths этого mon-client, `probe`-параметры или `probeUrl`. Считается per-mon-client; ревизия панели наружу не транслируется.
+**Config revision** — первые 16 hex SHA-256 от канонического JSON документа §4.2 без поля `configRevision`. Меняется, когда меняется материал панели для этого mon-client (по ревизии панели `GET /state`, куда с контракта 3 входит и цепочка), его paths, `probe`-параметры или `probeUrl`; смена ревизии панели, не задевшая материал (переключение active edge), config revision не двигает. Считается per-mon-client; ревизия панели наружу не транслируется.
 
 ### 4.2 `GET /v1/config`
 
@@ -64,14 +64,16 @@ GET /v1/register/<requestId>
   "probeUrl": "https://203.0.113.10:443/v1/probe",
   "probe": {"intervalMs": 60000, "budgetMs": 20000, "connectMs": 5000, "tlsMs": 10000, "headersMs": 10000, "startJitterMs": 5000, "heartbeatTimeoutMs": 10000},
   "targets": [
-    {"inboundKind": "xray", "inboundId": 12, "path": "proxy",  "protocol": "vless", "link": "vless://…@front.example.net:443?security=reality&…#probe-12"},
-    {"inboundKind": "xray", "inboundId": 12, "path": "direct", "protocol": "vless", "link": "vless://…@203.0.113.10:443?…#probe-12"},
-    {"inboundKind": "awg",  "inboundId": 0,  "path": "proxy",  "protocol": "awg",   "conf": "[Interface]\n…\n[Peer]\nEndpoint = front.example.net:51820\n…"}
+    {"inboundKind": "xray", "inboundId": 12, "path": "edge:ams-1",   "protocol": "vless", "link": "vless://…@198.51.100.20:443?security=reality&…#probe-12"},
+    {"inboundKind": "xray", "inboundId": 12, "path": "inner:core-1", "protocol": "vless", "link": "vless://…@198.51.100.7:443?security=reality&…#probe-12"},
+    {"inboundKind": "xray", "inboundId": 12, "path": "direct",       "protocol": "vless", "link": "vless://…@203.0.113.10:443?…#probe-12"},
+    {"inboundKind": "awg",  "inboundId": 0,  "path": "edge:ams-1",   "protocol": "awg",   "conf": "[Interface]\n…\n[Peer]\nEndpoint = 198.51.100.20:51820\n…"}
   ]
 }
 ```
 
-- mon-server собирает `targets` как `items` из `GET /probe/configs` (path `proxy`, только при `override.enabled`) и `GET /probe/configs?host=<real>` (path `direct`) панели × `paths` этого mon-client (default `[proxy, direct]`; для коробок во враждебных регионах владелец оставляет только `proxy`, чтобы не светить настоящий адрес real server как Reality-endpoint). Все inbound'ы — всем mon-clients; фильтра по inbound'ам в v1 нет. xray-ссылки общие, а AWG `.conf` у каждого mon-client свой (решение [#80](https://github.com/SBKubric/3ax-ui-monitoring/issues/80)): панель держит AWG probe-пир на mon-client × path, и mon-client получает только свой; wire-форма target'а от этого не меняется. Нет своего пира — нет AWG-target'а в конфиге (у mon-server он `PAUSED no_probe_link`).
+- mon-server собирает `targets` как `items` из `GET /probe/configs?host=<real>` (path `direct`) и `GET /probe/configs?hop=<name>` на каждое пробируемое звено цепочки (path `edge:<name>` / `inner:<name>`; на панели без цепочки — `GET /probe/configs`, path `proxy`, только при `override.enabled`) × `paths` этого mon-client (словарь `direct` | `hops` | явные звенья, default `[direct, hops]`; для коробок во враждебных регионах владелец снимает `direct`, чтобы не светить настоящий адрес real server как Reality-endpoint) — [mon-server.md](mon-server.md) §5.1, решение [#61](https://github.com/SBKubric/3ax-ui-monitoring/issues/61). Все inbound'ы — всем mon-clients; фильтра по inbound'ам в v1 нет. xray-ссылки общие, а AWG `.conf` у каждого mon-client свой (решение [#80](https://github.com/SBKubric/3ax-ui-monitoring/issues/80)): панель держит AWG probe-пир на mon-client × path, и mon-client получает только свой; wire-форма target'а от этого не меняется. Нет своего пира — нет AWG-target'а в конфиге (у mon-server он `PAUSED no_probe_link`).
+- **Грамматика `path`**: `direct` | `proxy` | `edge:<name>` | `inner:<name>`, `<name>` — имя звена цепочки (`[a-z0-9-]{1,32}`); `proxy` приходит только от панели без цепочки. Поведение mon-client от path не зависит: он только проверяет грамматику и возвращает path в результатах и ключах target'а (§5.2, §5.3). Кроме допустимых значений path, протокол не меняется и остаётся v1; дизайн mon-client тоже (решение [#61](https://github.com/SBKubric/3ax-ui-monitoring/issues/61) п. 8).
 - `link`/`conf` отдаются **как есть**: mon-server прозрачен, знание протоколов (ссылка → xray-outbound, .conf → netstack-устройство) живёт только в mon-client. Выключенных inbound'ов в `targets` нет — mon-server сам держит их как `PAUSED`.
 - `probe`-параметры — из research: цикл 60 с, бюджет пробы 20 с, connect 5 с, TLS 10 с, заголовки 10 с, джиттер старта 0–5 с, heartbeat 10 с. Настраиваются в admin UI глобально; пороги state machine (3/2/4-за-30/15) mon-client не нужны и в конфиг не входят.
 
@@ -91,11 +93,12 @@ GET /v1/register/<requestId>
 ### 5.2 Tunnel probe (через туннель)
 
 ```http
-GET /v1/probe?target=xray:12:proxy&n=<nonce>
+GET /v1/probe?target=xray:12:edge:ams-1&n=<nonce>
 Authorization: Bearer <client token>
 → 200 {"nonce": "<тот же>", "egressIp": "162.159.x.x", "serverTs": 1757721600000}
 ```
 
+- **Ключ target'а** — `<kind>:<inboundId>:<path>`; path может сам содержать `:` (`edge:ams-1`), поэтому обе стороны делят ключ по `:` не больше чем на 3 части (`strings.SplitN(key, ":", 3)`) и проверяют третью часть по грамматике path (§4.2), а не по белому списку `direct`/`proxy`. Тот же ключ — в `client.rejectedTargets` (§5.3).
 - Ключ target'а и токен едут в запросе, потому что source IP пробы — real server или его WARP-egress и target'а не выдаёт.
 - mon-server по этим запросам **состояние не считает**, только логирует «seen» (`monClientId`, target, `egressIp`, время) как диагностику и защиту от расхождений с heartbeat; в панель это не идёт.
 - Через xray-туннель проба ходит `Transport.Proxy = socks5://127.0.0.1:<port target'а>`; через AWG — `tnet.DialContext` netstack-устройства. Тайминги — `httptrace` по research §6.
@@ -109,9 +112,9 @@ POST /v1/heartbeat
   "client": {"version": "0.1.0", "xrayVersion": "26.3.27", "uptimeMs": 86400000, "configError": null},
   "cycles": [
     {"seq": 1441, "ts": 1757721600000, "unverified": false, "results": [
-      {"inboundKind": "xray", "inboundId": 12, "path": "proxy", "ok": true,
+      {"inboundKind": "xray", "inboundId": 12, "path": "edge:ams-1", "ok": true,
        "connectMs": 3, "tlsMs": 47, "ttfbMs": 39, "handshakeMs": null, "egressIp": "203.0.113.10", "reason": null, "detail": null},
-      {"inboundKind": "awg", "inboundId": 0, "path": "proxy", "ok": false,
+      {"inboundKind": "awg", "inboundId": 0, "path": "edge:ams-1", "ok": false,
        "connectMs": null, "tlsMs": null, "ttfbMs": null, "handshakeMs": null, "egressIp": null,
        "reason": "awg_no_handshake", "detail": "last_handshake_time=0 after 20000ms"}
     ]}
@@ -120,7 +123,7 @@ POST /v1/heartbeat
 → 200 {"configRevision": "3a91c0de77b1f2e4", "serverTs": 1757721620000, "ackSeq": 1441}
 ```
 
-- `client.rejectedTargets` — `[{"target": "<kind>:<inboundId>:<path>", "error": "<первая строка, ≤ 256>"}]`: targets применённой ревизии, которые mon-client отверг при применении (§4.3) и не пробует. Поле отсутствует или пусто — применено всё. `configError` остаётся для ошибок ревизии целиком и упавшего xray. Пример: `"rejectedTargets": [{"target": "awg:3:direct", "error": "[Interface] has an unknown key \"Foo\""}]`.
+- `client.rejectedTargets` — `[{"target": "<kind>:<inboundId>:<path>", "error": "<первая строка, ≤ 256>"}]`: targets применённой ревизии, которые mon-client отверг при применении (§4.3) и не пробует. Поле отсутствует или пусто — применено всё. `configError` остаётся для ошибок ревизии целиком и упавшего xray. Ключ делится на 3 части (§5.2). Пример: `"rejectedTargets": [{"target": "awg:3:direct", "error": "[Interface] has an unknown key \"Foo\""}]`.
 - `reason` — словарь диагностики контракта панели §4.6 (`tcp_refused` `tcp_timeout` `tls_timeout` `reality_real_cert` `awg_no_handshake` `http_error` …); `detail` — ≤ 256 символов, последняя строка xray-лога с тем же session-id или текст ошибки; в панель `detail` не уходит.
 - Латентность для xray — фаза TLS (`tlsMs`), `ttfbMs` — RTT, `handshakeMs` — только AWG (`last_handshake_time − t(dial)`); в 5-мин бакет панели mon-server кладёт `min/avg/max` по `tlsMs` и `handshakeMs` последнего успешного цикла бакета.
 - **Время**: mon-server ставит своё время приёма для состояния target'ов и heartbeat; `ts` цикла используется только для раскладки по 5-мин бакетам и клампится к времени приёма при расхождении > 5 мин.
