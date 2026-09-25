@@ -97,6 +97,41 @@ window.mon = (function () {
     return String(name || '').toLowerCase().replace(/[^a-z0-9_.-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 64);
   }
 
+  /* The paths picker of the Approve and Edit modals (spec §9.2, §9.3)
+   * edits a paths vocabulary (spec §5.1) as {direct, hops, named}: the two
+   * checkboxes, and — only while hops is unchecked — the hops chosen by
+   * name. picker turns a stored list into that state, pickedPaths back into
+   * the list the API takes (hops covers every named hop, so they are
+   * dropped with it), and hopOptions lists what can be named: the probed
+   * hops of the last GET /state plus any stored name the chain no longer
+   * probes, so an Edit never drops one the administrator did not touch. */
+  function picker(paths) {
+    paths = paths || ['direct', 'hops'];
+    return {
+      direct: paths.indexOf('direct') >= 0,
+      hops: paths.indexOf('hops') >= 0,
+      named: paths.filter(function (p) { return p !== 'direct' && p !== 'hops'; })
+    };
+  }
+  function pickedPaths(p) {
+    var out = [];
+    if (p.direct) { out.push('direct'); }
+    if (p.hops) { out.push('hops'); } else { out = out.concat(p.named); }
+    return out;
+  }
+  function hopOptions(chain, named) {
+    var hops = (chain && chain.hops) || [];
+    var out = hops.map(function (h) {
+      return { value: h.path, label: h.path + (h.active ? ' (active)' : ''), probed: true };
+    });
+    (named || []).forEach(function (p) {
+      if (!hops.some(function (h) { return h.path === p; })) {
+        out.push({ value: p, label: p + ' (not probed now)', probed: false });
+      }
+    });
+    return out;
+  }
+
   function shortRev(rev) { return rev ? String(rev).slice(0, 8) : '—'; }
   function spaced(code) { return code ? String(code).slice(0, 3) + ' ' + String(code).slice(3) : ''; }
 
@@ -146,6 +181,7 @@ window.mon = (function () {
   return {
     api: api, start: start, shell: shell, themeConfig: themeConfig,
     ago: ago, mmss: mmss, dur: dur, slug: slug, shortRev: shortRev, spaced: spaced,
+    picker: picker, pickedPaths: pickedPaths, hopOptions: hopOptions,
     notifyOk: function (msg) { if (msg) { antd.message.success(msg); } },
     notifyErr: function (msg) { antd.message.error(msg || 'Something went wrong.'); }
   };

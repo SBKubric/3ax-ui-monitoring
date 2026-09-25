@@ -118,9 +118,11 @@ func (h *Handler) listRequests(c *gin.Context) {
 		})
 	}
 
+	mat, have := h.material()
 	ok(c, gin.H{
 		"pending": views,
 		"clients": picker,
+		"chain":   chainView(mat, have),
 		"now":     clock.Ms(h.deps.Clock.Now()),
 		"limits": gin.H{
 			"perIpPerMin":   limitPerIPPerMin,

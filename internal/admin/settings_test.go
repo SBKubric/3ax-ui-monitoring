@@ -668,3 +668,62 @@ func TestSettings_GetStatusContractError(t *testing.T) {
 		t.Fatalf("panel status = %+v, want contractError %q", p, h.mat.contract)
 	}
 }
+
+// TestSettings_CheckReadsEveryProbedHop is Check on a chained panel (spec
+// §9.4): besides direct it reads every probed hop by ?hop= and counts the
+// links per path, and never asks for proxy, which such a panel does not
+// serve.
+func TestSettings_CheckReadsEveryProbedHop(t *testing.T) {
+	h := newHarness(t)
+	h.login()
+
+	stub := paneltest.NewStub(t)
+	sub := "sub-1"
+	stub.SetProbeSubID(&sub)
+	stub.SetOverride(true, "a.example.net")
+	stub.SetChain("edge-a", []paneltest.Hop{
+		{Name: "core-1", Role: "inner", Host: "10.0.0.7", State: "joined"},
+		{Name: "edge-a", Role: "edge", Host: "a.example.net", State: "joined"},
+		{Name: "edge-x", Role: "edge", Host: "x.example.net", State: "pending"},
+	})
+	stub.SetItems("direct", []panel.ProbeItem{{Kind: store.InboundKindXray, InboundId: 12, Link: "vless://direct"}})
+	stub.SetItems("inner:core-1", []panel.ProbeItem{{Kind: store.InboundKindXray, InboundId: 12, Link: "vless://core"}})
+	stub.SetItems("edge:edge-a", []panel.ProbeItem{
+		{Kind: store.InboundKindXray, InboundId: 12, Link: "vless://a"},
+		paneltest.AwgItem("ams-1", "[Peer]"),
+	})
+
+	w := h.do(http.MethodPost, "/admin/api/settings/check", map[string]any{
+		"panelUrl": stub.URL(), "monToken": stub.Token(), "realHost": "real.example.net",
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d, body %s", w.Code, w.Body.String())
+	}
+	o := obj(t, w)
+	items := o["probeItems"].(map[string]any)
+	if items["direct"] != float64(1) || items["inner:core-1"] != float64(1) || items["edge:edge-a"] != float64(2) || len(items) != 3 {
+		t.Fatalf("probeItems = %+v, want direct 1, inner:core-1 1, edge:edge-a 2 and nothing else", items)
+	}
+	if chain := o["chain"].(map[string]any); chain["activeEdge"] != "edge-a" || len(chain["hops"].([]any)) != 2 {
+		t.Fatalf("chain = %+v, want the two probed hops with edge-a active", chain)
+	}
+	for _, r := range stub.Requests() {
+		if strings.HasSuffix(r.Path, "/probe/configs") && r.Query.Get("host") == "" && r.Query.Get("hop") == "" {
+			t.Fatal("Check asked a chained panel for the proxy path")
+		}
+	}
+}
+
+// TestSettings_GetStatusChain: the status line and the read-only proxy
+// front block get the chain of the last material (spec §9.4).
+func TestSettings_GetStatusChain(t *testing.T) {
+	h := newHarness(t)
+	h.login()
+	h.withChain()
+
+	o := obj(t, h.do(http.MethodGet, "/admin/api/settings", nil))
+	chain := o["panel"].(map[string]any)["chain"].(map[string]any)
+	if chain["chained"] != true || chain["activeEdge"] != "edge-a" || len(chain["hops"].([]any)) != 3 {
+		t.Fatalf("panel.chain = %+v", chain)
+	}
+}
